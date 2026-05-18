@@ -1,0 +1,22 @@
+# Pinned Z3 component commits for reproducible simulator runs.
+#
+# These commits are agreed at project kickoff with the Zcash Foundation.
+# Update this file only via a coordinated team decision — all findings
+# in the final report reference these exact commits.
+#
+# See docs/integration/pinned-commits.md for the rationale and update process.
+
+zebra:
+  repo: https://github.com/ZcashFoundation/zebra
+  commit: TBD
+  notes: "To be confirmed at kickoff"
+
+zaino:
+  repo: https://github.com/zingolabs/zaino
+  commit: TBD
+  notes: "To be confirmed at kickoff"
+
+zallet:
+  repo: TBD
+  commit: TBD
+  notes: "Repository URL to be confirmed; see docs/integration/zallet.md"

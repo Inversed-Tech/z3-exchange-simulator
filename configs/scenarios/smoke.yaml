@@ -1,0 +1,24 @@
+name: smoke
+description: "Minimal smoke scenario for early simulator development and CI sanity checks."
+seed: 42
+
+accounts:
+  count: 10
+  active_fraction: 0.5
+
+load:
+  duration_seconds: 60
+  target_tps: 1
+
+flows:
+  transparent_to_transparent: 1.0
+  transparent_to_shielded: 0.0
+  shielded_to_transparent: 0.0
+  shielded_to_shielded: 0.0
+
+confirmations:
+  deposit_required: 3
+
+observability:
+  record_rpc_calls: true
+  record_component_logs: true

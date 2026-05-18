@@ -1,0 +1,20 @@
+[package]
+name = "z3-exchange-simulator"
+version = "0.1.0"
+edition = "2021"
+description = "Exchange-scale load simulator for the Z3 Zcash stack (Zebra, Zaino, Zallet)"
+license-file = "LICENSE"
+readme = "README.md"
+# repository = ""  # TBD: set when the GitHub repository is created
+
+[lib]
+name = "z3_exchange_simulator"
+path = "src/lib.rs"
+
+[[bin]]
+name = "z3sim"
+path = "src/main.rs"
+
+[dependencies]
+
+[dev-dependencies]

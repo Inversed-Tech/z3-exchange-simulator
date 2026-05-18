@@ -1,0 +1,26 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Rust build output
+target/
+
+# Experiment run outputs (generated data, not source)
+experiments/runs/*/
+!experiments/runs/.gitkeep
+
+# Local environment overrides
+configs/local/local.yaml
+.env
+.env.local
+
+# Generated synthetic data
+data/generated/
