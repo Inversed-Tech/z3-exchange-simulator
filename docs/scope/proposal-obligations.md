@@ -207,4 +207,4 @@ As specified in the proposal:
 |---|---|---|
 | Oded Goffer | Project lead | oded@inversed.tech |
 | Charlotte Léonard | Research and development engineer | charlotte@inversed.tech |
-| Aurel Nicolas | Technical advisor and continuity backup | — |
+| Aurel Nicolas | Technical advisor and continuity backup | aurel@inversed.tech |
