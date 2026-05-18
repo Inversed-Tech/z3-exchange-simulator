@@ -5,7 +5,7 @@ edition = "2021"
 description = "Exchange-scale load simulator for the Z3 Zcash stack (Zebra, Zaino, Zallet)"
 license-file = "LICENSE"
 readme = "README.md"
-# repository = ""  # TBD: set when the GitHub repository is created
+repository = "https://github.com/Inversed-Tech/z3-exchange-simulator"
 
 [lib]
 name = "z3_exchange_simulator"
