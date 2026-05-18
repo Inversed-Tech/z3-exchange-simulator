@@ -1,38 +1,203 @@
 # Observability Plan
 
-> Status: Draft — to be fully populated in Week 1 (Task T7).
+Defines what the simulator measures, how it records results, what each output file
+contains, and how a contributor can interpret a completed run.
 
-Defines what the simulator measures, how it records results, and what the
-experiment output directory structure looks like.
+---
 
-## Metrics collected
+## What we measure
 
-TBD
+Every simulator run produces five categories of observation:
 
-## Per-RPC call logging
+| Category | Purpose | Output file |
+|---|---|---|
+| **RPC call log** | Per-call latency, success/failure, method, component | `rpc_calls.jsonl` |
+| **Metric samples** | Time-series: throughput, mempool size, confirmation times | `metrics.jsonl` |
+| **Component logs** | Stdout/stderr from Zebra, Zaino, and Zallet processes | `component_logs/` |
+| **Run manifest** | Exact commits, scenario, and timestamps for reproducibility | `manifest.json` |
+| **Run summary** | Human-readable narrative of results and key findings | `summary.md` |
 
-TBD
+---
 
-## Component logs
+## Run manifest (`manifest.json`)
 
-TBD
+Written at the start of every run. Links results to the exact software versions and
+scenario configuration used. Required for any finding to be reportable.
 
-## Run manifest
+```json
+{
+  "run_id": "20260602T140000Z-smoke",
+  "run_started_at": "2026-06-02T14:00:00Z",
+  "run_completed_at": "2026-06-02T14:01:03Z",
+  "simulator_commit": "<git SHA of this repository>",
+  "zebra_commit": "<SHA from z3-commits.lock>",
+  "zaino_commit": "<SHA from z3-commits.lock>",
+  "zallet_commit": "<SHA from z3-commits.lock>",
+  "scenario_name": "smoke",
+  "scenario_config_hash": "sha256:<hash of scenario YAML content>"
+}
+```
 
-TBD
+**Run ID format:** `<YYYYMMDDTHHMMSSZ>-<scenario-name>`. Sortable, human-readable, and
+unique per run (assuming no two runs of the same scenario start in the same second).
+
+---
+
+## RPC call log (`rpc_calls.jsonl`)
+
+One JSON object per line, one line per RPC call. Written incrementally during the run
+so partial data is preserved if a run crashes.
+
+```json
+{"call_id":"a1b2c3","run_id":"20260602T140000Z-smoke","method":"getblockchaininfo","component":"Zebra","request_at":"2026-06-02T14:00:01.000Z","response_at":"2026-06-02T14:00:01.012Z","latency_ms":12,"success":true,"error_code":null,"error_message":null}
+{"call_id":"d4e5f6","run_id":"20260602T140000Z-smoke","method":"z_sendmany","component":"Zallet","request_at":"2026-06-02T14:00:02.000Z","response_at":"2026-06-02T14:00:02.008Z","latency_ms":8,"success":true,"error_code":null,"error_message":null}
+{"call_id":"g7h8i9","run_id":"20260602T140000Z-smoke","method":"getnewaddress","component":"Zallet","request_at":"2026-06-02T14:00:03.000Z","response_at":null,"latency_ms":null,"success":false,"error_code":-32601,"error_message":"Method not found"}
+```
+
+This file is the primary input for:
+- latency histograms (P50/P95/P99 per method),
+- success/failure rates per method and component,
+- the RPC compatibility matrix (which methods worked, which errored, and how).
+
+---
+
+## Metric samples (`metrics.jsonl`)
+
+One JSON object per line, written at regular intervals during the run. Captures the
+state of the simulator and the Z3 stack over time.
+
+```json
+{"run_id":"20260602T140000Z-smoke","timestamp":"2026-06-02T14:00:05Z","metric_name":"mempool_tx_count","value":3.0,"labels":{"component":"Zaino"}}
+{"run_id":"20260602T140000Z-smoke","timestamp":"2026-06-02T14:00:05Z","metric_name":"confirmed_txs_total","value":1.0,"labels":{"flow_type":"t_to_t"}}
+{"run_id":"20260602T140000Z-smoke","timestamp":"2026-06-02T14:00:05Z","metric_name":"rpc_latency_ms","value":12.0,"labels":{"method":"getblockchaininfo","component":"Zebra","percentile":"p99"}}
+{"run_id":"20260602T140000Z-smoke","timestamp":"2026-06-02T14:00:05Z","metric_name":"active_accounts","value":5.0,"labels":{}}
+```
+
+### Planned metric names
+
+| Metric | Labels | Description |
+|---|---|---|
+| `rpc_call_total` | `method`, `component`, `success` | Running count of RPC calls |
+| `rpc_latency_ms` | `method`, `component`, `percentile` | Latency percentiles (p50, p95, p99) |
+| `mempool_tx_count` | `component` | Number of transactions in the mempool |
+| `confirmed_txs_total` | `flow_type` | Cumulative confirmed transactions |
+| `failed_txs_total` | `flow_type`, `reason` | Cumulative failed transactions |
+| `deposit_confirmation_time_ms` | — | Time from deposit detection to credit |
+| `proving_time_ms` | — | ZK proof generation time for shielded txs |
+| `active_accounts` | — | Accounts actively transacting at sample time |
+| `block_height` | `component` | Current chain height as seen by each component |
+| `tps_achieved` | — | Observed transactions per second vs. target |
+
+Metric sampling interval: TBD — likely every 5 seconds during a run.
+
+---
+
+## Component logs (`component_logs/`)
+
+Captured stdout and stderr from each Z3 process during the run. Preserved verbatim for
+post-run debugging.
+
+```
+component_logs/
+  zebra.log
+  zaino.log
+  zallet.log
+```
+
+Log capture mechanism (process piping, tee, or log file redirect) will be determined
+during integration in Weeks 2–4 and documented in the relevant integration notes.
+
+Log verbosity level should be set high enough to capture RPC request/response traces
+during development, and reduced for large-scale runs where log volume becomes a bottleneck.
+
+---
+
+## Run summary (`summary.md`)
+
+A human-readable narrative generated at the end of each run. Intended for sharing with
+the Foundation and component teams without requiring them to parse JSONL files.
+
+### Planned contents
+
+```markdown
+# Run Summary: <run-id>
+
+## Run metadata
+- Scenario: <name>
+- Started: <timestamp>
+- Duration: <seconds>
+- Simulator commit: <sha>
+- Z3 commits: Zebra <sha>, Zaino <sha>, Zallet <sha>
+
+## Load results
+- Target TPS: <n>
+- Achieved TPS: <n>
+- Total transactions attempted: <n>
+- Confirmed: <n> (<pct>%)
+- Failed: <n> (<pct>%)
+
+## RPC latency (P50 / P95 / P99)
+| Method | Component | P50 ms | P95 ms | P99 ms | Errors |
+|---|---|---|---|---|---|
+| ...     | ...       | ...    | ...    | ...    | ...    |
+
+## Mempool
+- Peak mempool size: <n> transactions
+- Mempool saturation events: <n>
+
+## Notable errors and findings
+- ...
+
+## Shielded transaction proving times
+- P50: <ms>, P95: <ms>, P99: <ms>
+```
+
+---
 
 ## Experiment output directory structure
 
 ```
-experiments/runs/<run-id>/
-  manifest.json
-  scenario.yaml
-  rpc_calls.jsonl
-  metrics.jsonl
-  component_logs/
-  summary.md
+experiments/runs/
+  <run-id>/
+    manifest.json          Run metadata and commit pins
+    scenario.yaml          Exact scenario config snapshot
+    rpc_calls.jsonl        Per-call log (one JSON object per line)
+    metrics.jsonl          Time-series metric samples
+    component_logs/
+      zebra.log
+      zaino.log
+      zallet.log
+    summary.md             Human-readable run summary
 ```
+
+Run directories are gitignored. Store significant results externally (e.g. an
+`experiments/results/` directory outside the repo, or a shared storage location agreed
+with the Foundation).
+
+---
+
+## Resource profiling (CPU and memory)
+
+CPU and memory usage of the Zebra, Zaino, and Zallet processes will be sampled during
+runs to identify resource bottlenecks at scale.
+
+Tooling is TBD — candidates include:
+- OS-level polling via `/proc` (Linux) or `ps`/`top` (macOS)
+- `perf` or `cargo-flamegraph` for CPU profiling at specific points
+- Structured output from the processes themselves if they expose metrics endpoints
+
+Resource samples will be written to `metrics.jsonl` using metric names like
+`process_cpu_percent` and `process_memory_mb` with a `process` label.
+
+---
 
 ## Open questions
 
-TBD
+| Question | When to resolve |
+|---|---|
+| What metric sampling interval is appropriate for load runs? | Week 7 (observability harness) |
+| Will Z3 components expose their own metrics endpoints (e.g. Prometheus)? | Weeks 2–4 |
+| What is the mechanism for capturing component logs (pipe, tee, log file)? | Weeks 2–4 |
+| What is the mempool notification mechanism — and can we hook into it for real-time signals? | Week 3 |
+| Should resource profiling be always-on or opt-in per scenario? | Week 7 |
+| Where should significant run outputs be archived between team members? | Week 1 / kickoff |
