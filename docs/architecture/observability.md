@@ -87,6 +87,7 @@ state of the simulator and the Z3 stack over time.
 | `active_accounts` | — | Accounts actively transacting at sample time |
 | `block_height` | `component` | Current chain height as seen by each component |
 | `tps_achieved` | — | Observed transactions per second vs. target |
+| `mempool_saturation_event` | `threshold` | Recorded once when mempool depth crosses the saturation threshold; value is the observed depth at crossing |
 
 Metric sampling interval: **5 seconds** by default, configurable per-scenario via
 `observability.metric_sampling_interval_secs` in the scenario YAML. Use 1s for burst

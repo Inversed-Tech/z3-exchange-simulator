@@ -24,6 +24,8 @@ Scenarios are YAML files in `configs/scenarios/` and are the primary CLI input.
 | `confirmations.deposit_required` | integer | Block depth required to credit a deposit |
 | `observability.record_rpc_calls` | bool | Whether to write a per-call RPC log |
 | `observability.record_component_logs` | bool | Whether to capture Z3 component process logs |
+| `observability.metric_sampling_interval_secs` | integer | Metric snapshot interval in seconds (default: 5) |
+| `observability.mempool_saturation_threshold` | integer | Pending tx count that triggers a saturation event in the log (default: 500) |
 
 Flow fractions must sum to 1.0.
 
@@ -50,5 +52,4 @@ Each run records the scenario config hash in its manifest. A run is reproducible
 
 - What is the minimum target TPS for the steady-state scenario?
 - At what account count does the simulator itself become the bottleneck rather than Z3?
-- Should scenarios include explicit mempool saturation phases?
 - Should confirmation depth be configurable per scenario or globally?
