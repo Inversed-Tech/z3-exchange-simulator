@@ -127,7 +127,7 @@ An account is created first (`z_getnewaccount`), then addresses are derived from
 | Method | Component | Required by RFP? | zcashd equiv? | T/Z | Implemented? | Tested? | Parity | Notes |
 |---|---|---|---|---|---|---|---|---|
 | `validateaddress` | Zebra / Zaino / Zallet | TBD | Yes | T | No | No | TBD | Zaino proxies to Zebra. Present in all three components. |
-| `z_validateaddress` | Zebra / Zaino | TBD | Yes | Z | No | No | TBD | Zaino proxies to Zebra. Not confirmed in Zallet at pinned commit. |
+| `z_validateaddress` | Zebra / Zaino | TBD | Yes | Z | No | No | TBD | Zaino proxies to Zebra. Not present in Zallet at pinned commit. |
 
 ### Transaction creation
 
@@ -192,5 +192,4 @@ These methods existed in zcashd but are not present in Z3 at the pinned commits.
 ## Open questions
 
 1. What is the complete RFP method list from the Foundation? See [`docs/rpc/proposed-method-scope.md`](proposed-method-scope.md).
-2. Is `z_validateaddress` present in Zallet at the pinned commit?
-4. Which zcashd methods have no Z3 equivalent beyond those already listed above?
+2. Which zcashd methods have no Z3 equivalent beyond those already listed above?
