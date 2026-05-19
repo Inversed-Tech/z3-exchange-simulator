@@ -3,17 +3,18 @@
 Tracks which RPC methods the simulator exercises, which Z3 component serves each method,
 zcashd behavioral parity, and test status. Updated continuously through the engagement.
 
+Method names and component assignments are verified against the pinned commits:
+- Zebra `d4cd662` — source: `zebra-rpc/src/methods.rs`
+- Zaino `4ddbfd2` — source: `zaino-serve/src/rpc/jsonrpc/service.rs`
+- Zallet `05926f3` — source: Zallet JSON-RPC method registrations
+
 ---
 
 ## Critical caveat
 
-**The authoritative RFP method list has not yet been received.** The methods listed below
-are drawn from the known zcashd RPC surface and the expected needs of exchange-like
-operation. All "Required by RFP?" cells are TBD until the Foundation provides the list.
-
-Component routing (which of Zebra, Zaino, or Zallet serves each method) is also
-unverified until integration testing in Weeks 2–4. Do not treat the Component column as
-confirmed until marked otherwise.
+**The "Required by RFP?" column is pending Foundation confirmation.** A proposed method
+list has been prepared for Foundation review at
+[`docs/rpc/proposed-method-scope.md`](proposed-method-scope.md).
 
 ---
 
@@ -21,11 +22,10 @@ confirmed until marked otherwise.
 
 | Column | Meaning |
 |---|---|
-| **Method** | RPC method name. Based on zcashd convention; actual Z3 method names may differ. |
-| **Category** | Functional grouping — see category list below. |
-| **Component** | Expected Z3 component that serves this method. TBD until verified. |
-| **Required by RFP?** | Whether this method appears in the Foundation's RFP requirements. TBD until RFP list is received. |
-| **zcashd equivalent?** | Whether an equivalent method existed in zcashd. |
+| **Method** | RPC method name — verified against pinned commit source code. |
+| **Component** | Z3 component that serves this method. |
+| **Required by RFP?** | Whether this method appears in the Foundation's RFP requirements. Pending confirmation. |
+| **zcashd equiv?** | Whether an equivalent method existed in zcashd. |
 | **T/Z** | Which address pool: T = transparent, Z = shielded, Both, N/A. |
 | **Implemented?** | Whether the simulator's RPC client can call this method yet. |
 | **Tested?** | Whether the simulator has successfully called this method against a live Z3 stack. |
@@ -42,7 +42,7 @@ confirmed until marked otherwise.
 | Yes / No | Confirmed fact |
 | Confirmed | Behavior matches zcashd |
 | Deviation | Behavior differs from zcashd — see Notes |
-| No-equiv | No zcashd equivalent exists |
+| No-equiv | No zcashd equivalent exists (new in Z3, or method name changed entirely) |
 
 ---
 
@@ -50,125 +50,148 @@ confirmed until marked otherwise.
 
 ### Chain info
 
-| Method | Category | Component | Required by RFP? | zcashd equiv? | T/Z | Implemented? | Tested? | Parity | Notes |
-|---|---|---|---|---|---|---|---|---|---|
-| `getblockchaininfo` | chain info | TBD (Zebra/Zaino) | TBD | Yes | N/A | No | No | TBD | Returns chain name, sync status, current height. Key smoke-test method. |
-| `getblockcount` | chain info | TBD (Zebra/Zaino) | TBD | Yes | N/A | No | No | TBD | Returns current block height. |
-| `getbestblockhash` | chain info | TBD (Zebra/Zaino) | TBD | Yes | N/A | No | No | TBD | Returns hash of the tip block. |
+| Method | Component | Required by RFP? | zcashd equiv? | T/Z | Implemented? | Tested? | Parity | Notes |
+|---|---|---|---|---|---|---|---|---|
+| `getblockchaininfo` | Zebra / Zaino | TBD | Yes | N/A | No | No | TBD | Present in both components. Key smoke-test method. |
+| `getblockcount` | Zebra / Zaino | TBD | Yes | N/A | No | No | TBD | Current block height. |
+| `getbestblockhash` | Zebra / Zaino | TBD | Yes | N/A | No | No | TBD | Hash of the chain tip. |
+| `getbestblockheightandhash` | Zebra | TBD | No | N/A | No | No | No-equiv | Returns height and hash together in one call. Zebra-specific; not in zcashd or Zaino. |
 
 ### Block lookup
 
-| Method | Category | Component | Required by RFP? | zcashd equiv? | T/Z | Implemented? | Tested? | Parity | Notes |
-|---|---|---|---|---|---|---|---|---|---|
-| `getblock` | block lookup | TBD (Zebra/Zaino) | TBD | Yes | N/A | No | No | TBD | Fetch block by hash or height. Verbosity parameter behavior may differ. |
-| `getblockhash` | block lookup | TBD (Zebra/Zaino) | TBD | Yes | N/A | No | No | TBD | Returns block hash at a given height. |
-| `getblockheader` | block lookup | TBD (Zebra/Zaino) | TBD | Yes | N/A | No | No | TBD | Returns block header data without full transaction list. |
+| Method | Component | Required by RFP? | zcashd equiv? | T/Z | Implemented? | Tested? | Parity | Notes |
+|---|---|---|---|---|---|---|---|---|
+| `getblock` | Zebra / Zaino | TBD | Yes | N/A | No | No | TBD | Fetch block by hash or height. |
+| `getblockhash` | Zebra | TBD | Yes | N/A | No | No | TBD | Not confirmed in Zaino at pinned commit. |
+| `getblockheader` | Zebra / Zaino | TBD | Yes | N/A | No | No | TBD | Block header without the full transaction list. |
 
 ### Transaction lookup
 
-| Method | Category | Component | Required by RFP? | zcashd equiv? | T/Z | Implemented? | Tested? | Parity | Notes |
-|---|---|---|---|---|---|---|---|---|---|
-| `getrawtransaction` | tx lookup | TBD (Zebra/Zaino) | TBD | Yes | Both | No | No | TBD | Fetch raw transaction by txid. Verbose mode returns decoded fields. |
-| `gettransaction` | tx lookup | TBD (Zallet) | TBD | Yes | Both | No | No | TBD | Wallet-aware tx lookup including confirmations and watch-only status. |
-| `decoderawtransaction` | tx lookup | TBD (Zebra/Zaino) | TBD | Yes | Both | No | No | TBD | Decode a raw transaction hex without broadcasting. |
+| Method | Component | Required by RFP? | zcashd equiv? | T/Z | Implemented? | Tested? | Parity | Notes |
+|---|---|---|---|---|---|---|---|---|
+| `getrawtransaction` | Zebra / Zaino / Zallet | TBD | Yes | Both | No | No | TBD | Present in all three components. |
+| `decoderawtransaction` | Zallet | TBD | Yes | Both | No | No | TBD | Only in Zallet; not exposed by Zebra or Zaino at pinned commits. |
+| `gettxout` | Zebra / Zaino | TBD | Yes | T | No | No | TBD | Unspent output lookup by txid and output index. |
+
+### Address-indexed lookup
+
+These methods query chain state by transparent address, without wallet context.
+Useful for monitoring deposit addresses independently of the wallet.
+
+| Method | Component | Required by RFP? | zcashd equiv? | T/Z | Implemented? | Tested? | Parity | Notes |
+|---|---|---|---|---|---|---|---|---|
+| `getaddressbalance` | Zebra / Zaino | TBD | Yes | T | No | No | TBD | Balance for one or more transparent addresses. |
+| `getaddresstxids` | Zebra / Zaino | TBD | Yes | T | No | No | TBD | Transaction IDs involving a transparent address. |
+| `getaddressutxos` | Zebra / Zaino | TBD | Yes | T | No | No | TBD | Unspent outputs for a transparent address. |
 
 ### Mempool
 
-| Method | Category | Component | Required by RFP? | zcashd equiv? | T/Z | Implemented? | Tested? | Parity | Notes |
-|---|---|---|---|---|---|---|---|---|---|
-| `getrawmempool` | mempool | TBD (Zebra/Zaino) | TBD | Yes | Both | No | No | TBD | Returns txids of all mempool transactions. Core signal for mempool saturation. |
-| `getmempoolinfo` | mempool | TBD (Zebra/Zaino) | TBD | Yes | N/A | No | No | TBD | Returns mempool size, bytes, and fee information. |
-| `getmempoolentry` | mempool | TBD (Zebra/Zaino) | TBD | Yes | Both | No | No | TBD | Returns mempool data for a specific txid. |
+| Method | Component | Required by RFP? | zcashd equiv? | T/Z | Implemented? | Tested? | Parity | Notes |
+|---|---|---|---|---|---|---|---|---|
+| `getrawmempool` | Zebra / Zaino | TBD | Yes | Both | No | No | TBD | All pending transaction IDs. Core signal for mempool saturation. |
+| `getmempoolinfo` | Zebra / Zaino | TBD | Yes | N/A | No | No | TBD | Mempool size, byte count, and fee statistics. |
 
 ### Mempool notifications
 
 The proposal explicitly requires testing RPC client notifications for mempool changes.
 The notification mechanism in Z3 is unconfirmed (zcashd used ZMQ; Z3 may differ).
 
-| Method / Mechanism | Category | Component | Required by RFP? | zcashd equiv? | T/Z | Implemented? | Tested? | Parity | Notes |
-|---|---|---|---|---|---|---|---|---|---|
-| Mempool change notifications | notifications | TBD | TBD | Yes (ZMQ in zcashd) | Both | No | No | TBD | Mechanism in Z3 is unconfirmed. May be ZMQ, gRPC streaming, or another protocol. Must verify during Week 3–4. |
-| `getzmqnotifications` | notifications | TBD | TBD | Yes | N/A | No | No | TBD | Returns active ZMQ notification endpoints. Only relevant if Z3 uses ZMQ. |
+| Method / Mechanism | Component | Required by RFP? | zcashd equiv? | T/Z | Implemented? | Tested? | Parity | Notes |
+|---|---|---|---|---|---|---|---|---|
+| Mempool change notifications | TBD | TBD | Yes (ZMQ in zcashd) | Both | No | No | TBD | Mechanism in Z3 unconfirmed. May be ZMQ, gRPC streaming, or another protocol. |
 
-### Wallet — address generation
+### Wallet — accounts and addresses
 
-| Method | Category | Component | Required by RFP? | zcashd equiv? | T/Z | Implemented? | Tested? | Parity | Notes |
-|---|---|---|---|---|---|---|---|---|---|
-| `getnewaddress` | wallet/address | Zallet | TBD | Yes | T | No | No | TBD | Generate a new transparent address. |
-| `z_getnewaddress` | wallet/address | Zallet | TBD | Yes | Z | No | No | TBD | Generate a new shielded address. Address type (Orchard/Sapling) TBD — verify from Zallet. |
-| `validateaddress` | wallet/address | TBD (Zallet/Zaino) | TBD | Yes | T | No | No | TBD | Validate a transparent address. |
-| `z_validateaddress` | wallet/address | TBD (Zallet/Zaino) | TBD | Yes | Z | No | No | TBD | Validate a shielded address. |
+Zallet uses an account model that replaces the per-address generation in zcashd.
+An account is created first (`z_getnewaccount`), then addresses are derived from it
+(`z_getaddressforaccount`). `getnewaddress` and `z_getnewaddress` do not exist in Zallet.
+
+| Method | Component | Required by RFP? | zcashd equiv? | T/Z | Implemented? | Tested? | Parity | Notes |
+|---|---|---|---|---|---|---|---|---|
+| `z_getnewaccount` | Zallet | TBD | No | Both | No | No | No-equiv | Replaces `getnewaddress` + `z_getnewaddress`. Creates a named account; derive addresses from it with `z_getaddressforaccount`. |
+| `z_getaddressforaccount` | Zallet | TBD | No | Both | No | No | No-equiv | Derives a Unified Address (Orchard + transparent receivers) from an account. |
+| `z_listaccounts` | Zallet | TBD | No | Both | No | No | No-equiv | Lists all accounts in the wallet. |
+| `z_getaccount` | Zallet | TBD | No | Both | No | No | No-equiv | Returns details for a specific account. |
+| `listaddresses` | Zallet | TBD | No | Both | No | No | No-equiv | Lists all wallet addresses grouped by source. |
 
 ### Wallet — balance
 
-| Method | Category | Component | Required by RFP? | zcashd equiv? | T/Z | Implemented? | Tested? | Parity | Notes |
-|---|---|---|---|---|---|---|---|---|---|
-| `getbalance` | wallet/balance | Zallet | TBD | Yes | T | No | No | TBD | Query transparent balance for the wallet or a specific address. |
-| `z_getbalance` | wallet/balance | Zallet | TBD | Yes | Z | No | No | TBD | Query shielded balance for a specific z-address. |
-| `z_gettotalbalance` | wallet/balance | Zallet | TBD | Yes | Both | No | No | TBD | Returns transparent, private, and total balance in one call. |
+| Method | Component | Required by RFP? | zcashd equiv? | T/Z | Implemented? | Tested? | Parity | Notes |
+|---|---|---|---|---|---|---|---|---|
+| `z_getbalances` | Zallet | TBD | No | Both | No | No | No-equiv | Replaces `getbalance` + `z_getbalance`. Returns balances for all spending authorities. |
+| `z_gettotalbalance` | Zallet | TBD | Yes | Both | No | No | TBD | Transparent + shielded total. Same name as zcashd. |
+
+### Wallet — address validation
+
+| Method | Component | Required by RFP? | zcashd equiv? | T/Z | Implemented? | Tested? | Parity | Notes |
+|---|---|---|---|---|---|---|---|---|
+| `validateaddress` | Zebra / Zaino / Zallet | TBD | Yes | T | No | No | TBD | Present in all three components. |
+| `z_validateaddress` | Zebra / Zaino | TBD | Yes | Z | No | No | TBD | Not confirmed in Zallet at pinned commit. |
 
 ### Transaction creation
 
-| Method | Category | Component | Required by RFP? | zcashd equiv? | T/Z | Implemented? | Tested? | Parity | Notes |
-|---|---|---|---|---|---|---|---|---|---|
-| `sendtoaddress` | tx creation | Zallet | TBD | Yes | T | No | No | TBD | Create and broadcast a transparent-to-transparent transaction. |
-| `z_sendmany` | tx creation | Zallet | TBD | Yes | Both | No | No | TBD | Create a transaction with multiple outputs, supports transparent and shielded. Primary method for mixed flows. |
-| `createrawtransaction` | tx creation | TBD (Zebra/Zaino) | TBD | Yes | T | No | No | TBD | Construct a raw unsigned transaction. |
-| `signrawtransaction` | tx creation | TBD (Zallet) | TBD | Yes | T | No | No | TBD | Sign a raw transaction with wallet keys. |
+| Method | Component | Required by RFP? | zcashd equiv? | T/Z | Implemented? | Tested? | Parity | Notes |
+|---|---|---|---|---|---|---|---|---|
+| `z_sendmany` | Zallet | TBD | Yes | Both | No | No | Deviation | `fee` parameter must be `null`; fee is always computed automatically via ZIP 317. Supports transparent and shielded outputs in one call. Returns an operation ID immediately (async). |
 
 ### Async operations
 
-Shielded transactions in Zcash require proving time (zero-knowledge proof generation).
-zcashd handled this by returning an operation ID immediately and making the result
-available asynchronously. Whether Zallet uses the same pattern must be verified.
+Shielded transactions require ZK proof generation, which takes time. Zallet handles this
+asynchronously: `z_sendmany` returns an operation ID immediately, and these methods
+are used to track it through to completion.
 
-| Method | Category | Component | Required by RFP? | zcashd equiv? | T/Z | Implemented? | Tested? | Parity | Notes |
-|---|---|---|---|---|---|---|---|---|---|
-| `z_getoperationstatus` | async ops | Zallet | TBD | Yes | Z | No | No | TBD | Returns current status of one or more async operations by ID. |
-| `z_getoperationresult` | async ops | Zallet | TBD | Yes | Z | No | No | TBD | Returns and removes result of completed async operations. |
-| `z_listoperationids` | async ops | Zallet | TBD | Yes | Z | No | No | TBD | Lists all known async operation IDs. |
+| Method | Component | Required by RFP? | zcashd equiv? | T/Z | Implemented? | Tested? | Parity | Notes |
+|---|---|---|---|---|---|---|---|---|
+| `z_getoperationstatus` | Zallet | TBD | Yes | Z | No | No | TBD | Returns current status of one or more async operations by ID. |
+| `z_getoperationresult` | Zallet | TBD | Yes | Z | No | No | TBD | Returns and removes result of completed async operations. |
+| `z_listoperationids` | Zallet | TBD | Yes | Z | No | No | TBD | Lists all known operation IDs, optionally filtered by status. |
 
 ### Transaction broadcast
 
-| Method | Category | Component | Required by RFP? | zcashd equiv? | T/Z | Implemented? | Tested? | Parity | Notes |
-|---|---|---|---|---|---|---|---|---|---|
-| `sendrawtransaction` | tx broadcast | TBD (Zebra/Zaino) | TBD | Yes | Both | No | No | TBD | Broadcast a signed raw transaction to the network. |
+| Method | Component | Required by RFP? | zcashd equiv? | T/Z | Implemented? | Tested? | Parity | Notes |
+|---|---|---|---|---|---|---|---|---|
+| `sendrawtransaction` | Zebra / Zaino | TBD | Yes | Both | No | No | TBD | Broadcast a signed raw transaction to the network. |
 
-### Regtest-specific
+### Wallet — transaction history
 
-These methods are only available or meaningful in regtest mode. Required for the
-simulator to control block production and chain state during test scenarios.
+| Method | Component | Required by RFP? | zcashd equiv? | T/Z | Implemented? | Tested? | Parity | Notes |
+|---|---|---|---|---|---|---|---|---|
+| `z_listunspent` | Zallet | TBD | Yes | Z | No | No | Deviation | Lists unspent shielded notes. Response format changed from zcashd: `amount` renamed to `value`; new fields added. |
+| `z_listtransactions` | Zallet | TBD | No | Both | No | No | No-equiv | Lists transactions filterable by account and block range. Not in zcashd. |
 
-| Method | Category | Component | Required by RFP? | zcashd equiv? | T/Z | Implemented? | Tested? | Parity | Notes |
-|---|---|---|---|---|---|---|---|---|---|
-| `generate` | regtest | TBD (Zebra) | TBD | Yes | N/A | No | No | TBD | Mine N blocks immediately. Required for advancing the chain and confirming transactions in regtest. Exact method name in Z3 TBD — may be `generatetoaddress` or a Zebra-specific command. |
+### Regtest
+
+These methods are only meaningful in regtest mode. Required for controlling block
+production and chain state during test scenarios.
+
+| Method | Component | Required by RFP? | zcashd equiv? | T/Z | Implemented? | Tested? | Parity | Notes |
+|---|---|---|---|---|---|---|---|---|
+| `generate` | Zebra | TBD | Yes | N/A | No | No | TBD | Mine N blocks immediately. Confirmed present in Zebra at pinned commit. |
 
 ---
 
-## Categories
+## Removed or replaced from zcashd
 
-| Category | Description |
-|---|---|
-| chain info | Current blockchain state: height, hash, sync status |
-| block lookup | Fetching block data by hash or height |
-| tx lookup | Fetching transaction data by txid |
-| mempool | Mempool state and transaction inspection |
-| notifications | RPC client push notifications for chain/mempool events |
-| wallet/address | Address generation and validation |
-| wallet/balance | Balance queries by address or total |
-| tx creation | Transaction construction, signing, and async shielded operations |
-| async ops | Async operation tracking for shielded proving |
-| tx broadcast | Submitting signed transactions |
-| regtest | Block generation and chain control (regtest only) |
+These methods existed in zcashd but are not present in Z3 at the pinned commits.
+
+| Old method | Status in Z3 | Replacement |
+|---|---|---|
+| `getnewaddress` | Removed | `z_getnewaccount` + `z_getaddressforaccount` |
+| `z_getnewaddress` | Removed | `z_getnewaccount` + `z_getaddressforaccount` |
+| `getbalance` | Removed | `z_getbalances` |
+| `z_getbalance` | Removed | `z_getbalances` |
+| `gettransaction` | Not found in Z3 | None identified |
+| `getmempoolentry` | Not found in Z3 | None identified |
+| `sendtoaddress` | Not found in Z3 | Use `z_sendmany` with a single recipient |
+| `createrawtransaction` | Not in Zallet | PCZT support planned for future release |
+| `signrawtransaction` | Not in Zallet | PCZT support planned for future release |
 
 ---
 
 ## Open questions
 
-1. What is the complete RFP method list? This is the critical input for this matrix.
-2. Which component serves each method (Zebra, Zaino, or Zallet)?
-3. What is the mempool notification mechanism in Z3 (ZMQ, gRPC, other)?
-4. Does Zallet use the async operation pattern for shielded transactions?
-5. Which shielded address pool does `z_getnewaddress` use (Orchard, Sapling)?
-6. Does `generate` (or equivalent) work in Zebra regtest? What is the exact method name?
-7. Which zcashd methods have no Z3 equivalent in the target commit?
+1. What is the complete RFP method list from the Foundation? See [`docs/rpc/proposed-method-scope.md`](proposed-method-scope.md).
+2. What is the mempool notification mechanism in Z3 — ZMQ, gRPC streaming, or something else?
+3. Is `z_validateaddress` present in Zallet at the pinned commit?
+4. Is `getblockhash` present in Zaino at the pinned commit?
+5. Which zcashd methods have no Z3 equivalent beyond those already listed above?

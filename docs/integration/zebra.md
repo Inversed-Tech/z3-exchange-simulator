@@ -13,8 +13,9 @@ For a plain-English explanation of what Zebra is and its role in the stack, see
 | Field | Value |
 |---|---|
 | Repository | https://github.com/ZcashFoundation/zebra |
-| Pinned commit | TBD — to be confirmed at kickoff. See [`z3-commits.lock`](../../z3-commits.lock) |
+| Pinned commit | `d4cd662c716382f6397d2a730148025a1ca79fec` (main, 2026-05-07) — see [`z3-commits.lock`](../../z3-commits.lock) |
 | Language | Rust |
+| Binary name | Likely `zebrad` — verify from build output |
 
 ---
 
@@ -47,8 +48,7 @@ git checkout <pinned-commit>
 cargo build --release
 ```
 
-The release binary will be under `external/zebra/target/release/`. The binary name is
-TBD — verify from the repository (likely `zebrad` based on convention, but do not assume).
+The binary will be at `external/zebra/target/release/zebrad` (verify from build output).
 
 ---
 
@@ -97,9 +97,23 @@ during integration.
 
 ---
 
+## RPC methods (confirmed at pinned commit)
+
+Source: `zebra-rpc/src/methods.rs`
+
+Simulator-relevant methods: `getblockchaininfo`, `getblockcount`, `getbestblockhash`,
+`getbestblockheightandhash`, `getblock`, `getblockhash`, `getblockheader`,
+`getrawtransaction`, `gettxout`, `getaddressbalance`, `getaddresstxids`,
+`getaddressutxos`, `getrawmempool`, `getmempoolinfo`, `sendrawtransaction`,
+`validateaddress`, `z_validateaddress`, `generate`.
+
+Full detail in [`docs/rpc/rpc-coverage-matrix.md`](../rpc/rpc-coverage-matrix.md).
+
+---
+
 ## Known blockers
 
-- Pinned commit not yet confirmed (kickoff dependency).
+None currently. Pinned commit is set; integration work can begin.
 
 ---
 

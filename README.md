@@ -197,6 +197,7 @@ archived manually.
 | [`docs/integration/zallet.md`](docs/integration/zallet.md) | Zallet integration notes |
 | [`docs/integration/pinned-commits.md`](docs/integration/pinned-commits.md) | Commit pinning rationale and update process |
 | [`docs/rpc/rpc-coverage-matrix.md`](docs/rpc/rpc-coverage-matrix.md) | RPC coverage and zcashd parity matrix |
+| [`docs/rpc/proposed-method-scope.md`](docs/rpc/proposed-method-scope.md) | Proposed method list for Foundation confirmation |
 | [`docs/scenarios/scenario-design.md`](docs/scenarios/scenario-design.md) | Scenario library design |
 
 ---

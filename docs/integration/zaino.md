@@ -14,8 +14,9 @@ For a plain-English explanation of what Zaino is and its role in the stack, see
 | Field | Value |
 |---|---|
 | Repository | https://github.com/zingolabs/zaino |
-| Pinned commit | TBD — to be confirmed at kickoff. See [`z3-commits.lock`](../../z3-commits.lock) |
+| Pinned commit | `4ddbfd29c9f0e74f20b4d5bf81f51042aae4302a` (dev, 2026-05-12) — see [`z3-commits.lock`](../../z3-commits.lock) |
 | Language | Rust |
+| Binary name | TBD — verify from build output |
 
 ---
 
@@ -45,8 +46,8 @@ git checkout <pinned-commit>
 cargo build --release
 ```
 
-The release binary will be under `external/zaino/target/release/`. Binary name TBD —
-verify from the repository.
+The release binary will be under `external/zaino/target/release/`. Verify the binary
+name from the repository (TBD).
 
 ---
 
@@ -115,10 +116,25 @@ The recommended startup sequence for local development is expected to be:
 
 ---
 
+## RPC methods (confirmed at pinned commit)
+
+Source: `zaino-serve/src/rpc/jsonrpc/service.rs`
+
+Simulator-relevant methods: `getblockchaininfo`, `getblockcount`, `getbestblockhash`,
+`getblock`, `getblockheader`, `getrawtransaction`, `gettxout`, `getaddressbalance`,
+`getaddresstxids`, `getaddressutxos`, `getrawmempool`, `getmempoolinfo`,
+`sendrawtransaction`, `validateaddress`, `z_validateaddress`.
+
+Note: `getblockhash` is present in Zebra but not confirmed in Zaino at the pinned commit.
+
+Full detail in [`docs/rpc/rpc-coverage-matrix.md`](../rpc/rpc-coverage-matrix.md).
+
+---
+
 ## Known blockers
 
-- Pinned commit not yet confirmed (kickoff dependency).
-- Zebra integration (Week 2) must be complete before Zaino integration can begin.
+- Zebra integration must be complete before Zaino integration can begin.
+- Pinned commit is on the `dev` branch — confirm with Foundation that this is the intended branch.
 
 ---
 

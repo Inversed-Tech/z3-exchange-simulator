@@ -15,38 +15,30 @@ For a plain-English explanation of what Zallet is and its role in the stack, see
 |---|---|
 | Repository | https://github.com/zcash/wallet |
 | Pinned commit | `05926f3f3ec1b1d90348ae899628cc0e28547ef3` — see [`z3-commits.lock`](../../z3-commits.lock) |
-| Language | Rust (expected, based on the broader Z3 stack) |
+| Language | Rust (Edition 2024, MSRV 1.85) |
+| Binary name | `zallet` |
 
 ---
 
 ## Prerequisites
 
-> TBD — verify once the repository URL is confirmed.
-
-Expected requirements (based on the Rust-based Z3 stack):
-
-- Rust toolchain (`rustup`, stable — verify minimum version from the repository)
-- A running Zebra or Zaino instance (the exact connection dependency is TBD)
-- Any additional system dependencies TBD
+- Rust toolchain (`rustup`, stable channel, minimum version 1.85)
+- A running Zebra or Zaino instance (the exact connection dependency is TBD — see
+  [Connection to other Z3 components](#connection-to-other-z3-components) below)
+- Any additional system dependencies TBD — verify from the repository README
 
 ---
 
 ## Build instructions
 
-> TBD — verify from the Zallet repository README once the URL is confirmed.
-
-Expected approach:
-
 ```sh
 git clone https://github.com/zcash/wallet external/zallet
 cd external/zallet
 git checkout 05926f3f3ec1b1d90348ae899628cc0e28547ef3
-
-# Build
 cargo build --release
 ```
 
-Binary name and path TBD.
+Binary: `external/zallet/target/release/zallet`
 
 ---
 
@@ -86,61 +78,69 @@ Items to confirm:
 
 ## RPC methods
 
-> TBD — the complete list of Zallet RPC methods must be verified from the repository.
-> Do not rely on the table below being accurate until confirmed.
+Verified against pinned commit `05926f3`. Full detail in
+[`docs/rpc/rpc-coverage-matrix.md`](../rpc/rpc-coverage-matrix.md).
 
-Expected wallet operations (based on zcashd equivalents — subject to change):
+**Account and address management**
 
-| Operation | Expected method | Transparent | Shielded | Status |
-|---|---|---|---|---|
-| Generate new address | TBD | Yes | Yes | TBD |
-| Query balance | TBD | Yes | Yes | TBD |
-| Create and send transaction | TBD | Yes | Yes | TBD |
-| Check async operation status | TBD | — | Yes | TBD |
-| List unspent outputs | TBD | Yes | TBD | TBD |
-| Import address / viewing key | TBD | TBD | TBD | TBD |
+Zallet uses an account model — not the per-address model from zcashd. `getnewaddress`
+and `z_getnewaddress` do not exist. The workflow is:
+1. Create an account: `z_getnewaccount`
+2. Derive an address from it: `z_getaddressforaccount`
 
-The RPC coverage matrix at [`docs/rpc/rpc-coverage-matrix.md`](../rpc/rpc-coverage-matrix.md)
-will be the authoritative record once method names are verified.
+| Method | What it does |
+|---|---|
+| `z_getnewaccount` | Create a new wallet account |
+| `z_getaddressforaccount` | Derive a Unified Address from an account |
+| `z_listaccounts` | List all accounts |
+| `z_getaccount` | Details for a specific account |
+| `listaddresses` | List all addresses grouped by source |
+
+**Balances**
+
+`getbalance` and `z_getbalance` do not exist. Replacements:
+
+| Method | What it does |
+|---|---|
+| `z_getbalances` | Balances for all spending authorities |
+| `z_gettotalbalance` | Transparent + shielded total |
+
+**Transaction creation and tracking**
+
+| Method | What it does |
+|---|---|
+| `z_sendmany` | Send a transaction (transparent and/or shielded outputs). Fee auto-computed via ZIP 317 — `fee` must be `null`. Returns an operation ID. |
+| `z_getoperationstatus` | Check status of a pending async operation |
+| `z_getoperationresult` | Retrieve result of a completed operation |
+| `z_listoperationids` | List all operation IDs |
+
+**Transaction inspection**
+
+| Method | What it does |
+|---|---|
+| `getrawtransaction` | Fetch a raw transaction by ID |
+| `decoderawtransaction` | Decode a raw transaction hex |
+| `z_listunspent` | List unspent shielded notes |
+| `z_listtransactions` | List transactions, filterable by account |
+| `validateaddress` | Validate a transparent address |
 
 ---
 
-## Transparent wallet operations
+## Shielded transaction support
 
-> TBD — verify once the Zallet repository is accessible.
+Shielded transactions are **fully implemented** in the pinned commit. Both the Sapling
+and Orchard value pools are supported. `z_sendmany` handles all flow types:
+T→T, T→Z, Z→T, Z→Z.
 
-Transparent operations use standard Zcash transparent addresses (t-addresses), which
-behave similarly to Bitcoin addresses. The simulator needs:
-
-- Address generation for synthetic deposit accounts
-- Balance queries per address
-- Transaction creation (T→T transfers)
-- Transaction broadcast
-
-Whether Zallet exposes these as separate RPC methods or through a unified interface is TBD.
-
----
-
-## Shielded wallet operations
-
-> TBD — verify once the Zallet repository is accessible.
-
-Shielded operations use Zcash shielded addresses (z-addresses / Orchard/Sapling pools).
-The simulator needs:
-
-- Shielded address generation
-- Shielded balance queries
-- Shielded transaction creation (T→Z, Z→T, Z→Z)
-- Async operation tracking (shielded transactions typically require proving time)
-
-Key question: does the target pinned commit fully support shielded operations, or is
-transparent-only a realistic Week 4 baseline? Confirm at kickoff.
+ZK proof generation happens asynchronously — `z_sendmany` returns an operation ID
+immediately, and the result is retrieved via `z_getoperationresult` once proving
+completes. The proving time must be measured and recorded per run.
 
 ---
 
 ## Configuration notes
 
-> TBD — verify config format from the repository once URL is confirmed.
+> TBD — verify config format from the repository README.
 
 Expected items to configure:
 
@@ -160,7 +160,7 @@ Based on the expected stack topology:
 3. **Start Zallet**, connected to Zaino/Zebra
 4. Initialize wallet
 
-Verify this sequence during Week 4 integration.
+Verify this sequence during integration.
 
 ---
 
