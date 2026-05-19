@@ -189,6 +189,7 @@ archived manually.
 
 | Document | Purpose |
 |---|---|
+| [`docs/scope.md`](docs/scope.md) | Project objectives, scope, deliverables, timeline, and constraints |
 | [`docs/architecture/z3-overview.md`](docs/architecture/z3-overview.md) | Plain-English Z3 stack overview for new contributors |
 | [`docs/architecture/data-model.md`](docs/architecture/data-model.md) | Core data model: accounts, transactions, metrics |
 | [`docs/architecture/observability.md`](docs/architecture/observability.md) | Observability plan: metrics, latency, output format |
