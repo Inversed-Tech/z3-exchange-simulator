@@ -27,15 +27,15 @@ ensures that:
 All pins live in [`z3-commits.lock`](../../z3-commits.lock) at the repository root.
 This file is the authoritative source; the table below is a human-readable summary.
 
-| Component | Repository | Pinned commit | Status |
+| Component | Repository | Pinned commit | Branch |
 |---|---|---|---|
-| Zebra | https://github.com/ZcashFoundation/zebra | TBD | Pending kickoff |
-| Zaino | https://github.com/zingolabs/zaino | TBD | Pending kickoff |
-| Zallet | TBD | TBD | Repo URL also pending |
+| Zebra | https://github.com/ZcashFoundation/zebra | `d4cd662c716382f6397d2a730148025a1ca79fec` | main |
+| Zaino | https://github.com/zingolabs/zaino | `4ddbfd29c9f0e74f20b4d5bf81f51042aae4302a` | dev |
+| Zallet | https://github.com/zcash/wallet | `05926f3f3ec1b1d90348ae899628cc0e28547ef3` | main |
 
-Commits will be agreed with the Zcash Foundation at the kickoff call and written into
-`z3-commits.lock` immediately after. The `scripts/dev/clone-z3.sh` script will then be
-updated to clone each component at its pinned commit.
+These are the latest commits as of project start. They will be reviewed with the Zcash
+Foundation at the kickoff call. The `scripts/dev/clone-z3.sh` script will be updated to
+clone each component at its pinned commit.
 
 ---
 

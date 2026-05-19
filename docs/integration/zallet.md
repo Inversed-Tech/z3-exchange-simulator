@@ -13,13 +13,9 @@ For a plain-English explanation of what Zallet is and its role in the stack, see
 
 | Field | Value |
 |---|---|
-| Repository | **TBD** — must be confirmed with the Zcash Foundation before Week 4 |
-| Reference | The proposal links Zallet to the zcashd deprecation notice at https://z.cash/support/zcashd-deprecation/ but does not provide a direct GitHub URL |
-| Pinned commit | TBD — to be confirmed at kickoff. See [`z3-commits.lock`](../../z3-commits.lock) |
+| Repository | https://github.com/zcash/wallet |
+| Pinned commit | `05926f3f3ec1b1d90348ae899628cc0e28547ef3` — see [`z3-commits.lock`](../../z3-commits.lock) |
 | Language | Rust (expected, based on the broader Z3 stack) |
-
-> **Blocker:** The repository URL must be confirmed before any integration work can begin.
-> This is the most time-sensitive open question for Phase 1. Raise at kickoff.
 
 ---
 
@@ -42,10 +38,9 @@ Expected requirements (based on the Rust-based Z3 stack):
 Expected approach:
 
 ```sh
-# Clone at the pinned commit (once repo URL and z3-commits.lock are confirmed)
-git clone <zallet-repo-url> external/zallet
+git clone https://github.com/zcash/wallet external/zallet
 cd external/zallet
-git checkout <pinned-commit>
+git checkout 05926f3f3ec1b1d90348ae899628cc0e28547ef3
 
 # Build
 cargo build --release
@@ -171,17 +166,13 @@ Verify this sequence during Week 4 integration.
 
 ## Known blockers
 
-- **Repository URL not confirmed.** This is the primary blocker. No other integration
-  work can proceed until this is resolved.
-- Pinned commit not yet confirmed (kickoff dependency).
-- Zebra (Week 2) and Zaino (Week 3) integrations must be complete first.
+- Zebra and Zaino integrations must be complete before Zallet integration begins.
+- Pinned commit set to the latest main as of 2026-05-18; to be reviewed with the Foundation at kickoff.
 
 ---
 
 ## Questions for the Zallet team / Foundation
 
-- What is the Zallet GitHub repository URL?
-- What is the recommended pinned commit for this engagement?
 - Does Zallet connect to Zaino, Zebra, or both — and via what protocol?
 - Which RPC methods are available in the target commit?
 - Is shielded transaction support complete in the target commit, or should we plan for

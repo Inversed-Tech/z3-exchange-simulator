@@ -8,15 +8,18 @@
 
 zebra:
   repo: https://github.com/ZcashFoundation/zebra
-  commit: TBD
-  notes: "To be confirmed at kickoff"
+  commit: d4cd662c716382f6397d2a730148025a1ca79fec
+  branch: main
+  date: "2026-05-07"
 
 zaino:
   repo: https://github.com/zingolabs/zaino
-  commit: TBD
-  notes: "To be confirmed at kickoff"
+  commit: 4ddbfd29c9f0e74f20b4d5bf81f51042aae4302a
+  branch: dev
+  date: "2026-05-12"
 
 zallet:
-  repo: TBD
-  commit: TBD
-  notes: "Repository URL to be confirmed; see docs/integration/zallet.md"
+  repo: https://github.com/zcash/wallet
+  commit: 05926f3f3ec1b1d90348ae899628cc0e28547ef3
+  branch: main
+  date: "2026-05-18"

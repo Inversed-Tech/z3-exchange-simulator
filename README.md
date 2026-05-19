@@ -41,7 +41,7 @@ stack:
 |---|---|---|
 | **Zebra** | Zcash full node — validates and maintains the local chain state | https://github.com/ZcashFoundation/zebra |
 | **Zaino** | Blockchain data access, indexing, and RPC passthrough layer | https://github.com/zingolabs/zaino |
-| **Zallet** | Wallet — address generation, signing, transaction broadcasting | TBD |
+| **Zallet** | Wallet — address generation, signing, transaction broadcasting | https://github.com/zcash/wallet |
 
 See [`docs/architecture/z3-overview.md`](docs/architecture/z3-overview.md) for a plain-English
 explanation of how these fit together and how the simulator interacts with them.
@@ -124,9 +124,9 @@ in the report are only valid for these specific component versions.
 
 | Component | Pinned commit |
 |---|---|
-| Zebra | TBD — confirmed at project kickoff |
-| Zaino | TBD — confirmed at project kickoff |
-| Zallet | TBD — confirmed at project kickoff |
+| Zebra | `d4cd662c716382f6397d2a730148025a1ca79fec` |
+| Zaino | `4ddbfd29c9f0e74f20b4d5bf81f51042aae4302a` |
+| Zallet | `05926f3f3ec1b1d90348ae899628cc0e28547ef3` |
 
 ## Development commands
 

@@ -86,8 +86,7 @@ designed to replace the wallet functionality that was previously bundled inside 
 synthetic deposit addresses, querying balances, constructing and signing transactions
 (both transparent and shielded), and broadcasting them.
 
-**Repository:** TBD — the Zallet repository URL has not yet been confirmed. See
-[`docs/integration/zallet.md`](../integration/zallet.md).
+**Repository:** https://github.com/zcash/wallet
 
 ---
 
@@ -222,4 +221,3 @@ routing or method support as provisional.
 - Which methods does Zallet expose, and does it talk to Zaino, Zebra, or both?
 - What is the startup order for the three components?
 - Are there regtest-specific limitations in any component vs. mainnet?
-- What is the Zallet repository URL?
