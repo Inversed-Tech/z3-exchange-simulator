@@ -198,6 +198,9 @@ resource usage is measured via OS-level polling.
 CPU and memory usage of all three Z3 processes are sampled during runs to identify
 resource bottlenecks at scale.
 
+**Always-on.** Resource profiling runs on every scenario — the polling overhead is
+negligible and resource behavior under load is a core project deliverable.
+
 Approach:
 - **Zebra**: OS-level polling supplemented by Prometheus endpoint scraping where enabled
 - **Zaino / Zallet**: OS-level polling via `/proc/<pid>/stat` (Linux) or `ps` (macOS)
@@ -210,4 +213,3 @@ Resource samples are written to `metrics.jsonl` using metric names like
 ## Open questions
 
 - What is the mempool notification mechanism — and can we hook into it for real-time signals?
-- Should resource profiling be always-on or opt-in per scenario?
