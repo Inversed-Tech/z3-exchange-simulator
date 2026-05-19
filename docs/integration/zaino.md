@@ -16,7 +16,8 @@ For a plain-English explanation of what Zaino is and its role in the stack, see
 | Repository | https://github.com/zingolabs/zaino |
 | Pinned commit | `4ddbfd29c9f0e74f20b4d5bf81f51042aae4302a` (dev, 2026-05-12) — see [`z3-commits.lock`](../../z3-commits.lock) |
 | Language | Rust |
-| Binary name | TBD — verify from build output |
+| Binary name | `zainod` |
+| MSRV | 1.95.0 |
 
 ---
 
@@ -24,82 +25,91 @@ For a plain-English explanation of what Zaino is and its role in the stack, see
 
 Zaino is a Rust project. Building it requires:
 
-- Rust toolchain (`rustup`, stable channel — verify minimum version from the repository)
+- Rust toolchain (`rustup`, stable channel, minimum version **1.95.0**)
 - A running Zebra instance (Zaino connects to Zebra; see [`zebra.md`](zebra.md))
-- Any additional system dependencies TBD — verify from the Zaino repository README
+- No additional system dependencies beyond the Rust toolchain
 
 ---
 
 ## Build instructions
 
-> TBD — verify exact steps from the Zaino repository README.
-
-Expected approach (standard for a Rust binary project):
-
 ```sh
-# Clone at the pinned commit (once z3-commits.lock is populated)
 git clone https://github.com/zingolabs/zaino external/zaino
 cd external/zaino
-git checkout <pinned-commit>
-
-# Build
+git checkout 4ddbfd29c9f0e74f20b4d5bf81f51042aae4302a
 cargo build --release
 ```
 
-The release binary will be under `external/zaino/target/release/`. Verify the binary
-name from the repository (TBD).
+The release binary is at `external/zaino/target/release/zainod`.
 
 ---
 
 ## How Zaino connects to Zebra
 
-> TBD — verify the connection mechanism and required configuration before integration.
+Zaino connects to Zebra via **JSON-RPC** (standard HTTP POST). No special Zebra
+configuration is required — Zaino uses Zebra's standard RPC endpoint.
 
-Zaino is expected to connect to a running Zebra node to read chain state. Items to
-identify:
-
-| Item | Status |
+| Item | Value |
 |---|---|
-| Connection protocol (gRPC, HTTP, socket?) | TBD |
-| Zebra endpoint that Zaino connects to | TBD |
-| Zaino config fields for pointing at Zebra | TBD |
-| Whether Zebra needs special config to accept Zaino | TBD |
+| Connection protocol | JSON-RPC over HTTP |
+| Zebra endpoint | Zebra's RPC `listen_addr` (default `127.0.0.1:18232` for regtest) |
+| Zaino config field | `validator_jsonrpc_listen_address` |
+| Authentication | `validator_cookie_path` (recommended) or `validator_user` / `validator_password` |
+| Zebra special config needed? | No — standard RPC endpoint is sufficient |
 
-**How to verify:** Check the Zaino repository README, `docs/`, and example config files.
-Look at Zaino's CI setup to see how it starts Zebra as a dependency.
+Zaino config snippet pointing at Zebra:
+
+```toml
+[validator_settings]
+validator_jsonrpc_listen_address = "127.0.0.1:18232"
+validator_cookie_path = "/path/to/zebra/cookie"
+```
+
+Note: sensitive fields (`password`, `cookie`, `secret`) cannot be set via environment
+variables — they must be in the config file.
 
 ---
 
 ## RPC and data access
 
-> TBD — the exact division of RPC methods between Zaino and Zebra must be verified
-> during integration.
+Zaino exposes two interfaces to clients:
 
-Key questions for the coverage matrix:
+| Interface | Default address | Purpose |
+|---|---|---|
+| JSON-RPC | Configured via `json_server_settings` | Zcash JSON-RPC compatibility layer |
+| gRPC (LightWallet protocol) | `127.0.0.1:8137` | Compact block and transaction streaming |
 
-| Question | Status |
-|---|---|
-| Which RPC methods does Zaino expose to clients? | TBD |
-| Which methods does Zaino originate (handles itself)? | TBD |
-| Which methods does Zaino forward to Zebra? | TBD |
-| Does Zaino expose a gRPC interface in addition to JSON-RPC? | TBD |
-| Default RPC/gRPC ports | TBD |
+The JSON-RPC interface provides backwards-compatible Zcash RPC methods. The gRPC
+interface implements the LightWallet protocol (`CompactTxStreamer`) for light clients.
 
-**How to verify:** Review Zaino's source (look for an RPC handler module) and its
-documentation. Cross-reference with the Zebra RPC method list to map the routing.
+For the simulator, we use Zaino's **JSON-RPC interface**. The method list served by
+Zaino is in the [RPC coverage matrix](../rpc/rpc-coverage-matrix.md).
 
 ---
 
 ## Configuration notes
 
-> TBD — verify config format and required fields from the repository.
+Zaino uses a **TOML** config file (`zainod.toml`). Key fields:
 
-Expected items to configure:
+```toml
+network = "Regtest"            # or "Mainnet" / "Testnet"
 
-- Zebra connection endpoint
-- Zaino RPC listener address and port
-- Log level
-- Chain data / cache directory (if applicable)
+[validator_settings]
+validator_jsonrpc_listen_address = "127.0.0.1:18232"   # Zebra RPC endpoint
+validator_cookie_path = "/path/to/zebra/cookie"        # Zebra auth cookie
+
+[json_server_settings]
+# JSON-RPC listener config (port TBD — verify from example config)
+
+[grpc_settings]
+listen_address = "127.0.0.1:8137"   # Zaino's own gRPC port
+```
+
+Log level is set via the `RUST_LOG` environment variable (e.g. `RUST_LOG=zaino=info,zainod=info`).
+
+Config can also be overridden via environment variables with prefix `ZAINO__` and double
+underscore separators for nesting — except sensitive fields (password, cookie) which must
+be in the config file.
 
 ---
 
@@ -140,10 +150,7 @@ Full detail in [`docs/rpc/rpc-coverage-matrix.md`](../rpc/rpc-coverage-matrix.md
 
 ## Questions for the Zaino team
 
-- What is the minimum Rust toolchain version for the pinned commit?
-- What is the connection mechanism between Zaino and Zebra (protocol, endpoint)?
+- What is the exact JSON-RPC listener port in the default regtest config?
 - Which RPC methods does Zaino handle natively vs. forward to Zebra?
-- Does Zaino expose a gRPC interface as well as JSON-RPC?
-- What is the recommended regtest configuration?
 - Are there known limitations or differences in regtest vs. mainnet behavior?
-- Are there example setups in the repository's CI or test suite we can reference?
+- Are there example regtest configs in the repository's CI or test suite we can reference?
