@@ -180,8 +180,7 @@ experiments/runs/<run-id>/
   summary.md           Human-readable run summary
 ```
 
-Run directories are gitignored. Significant results should be published externally or
-archived manually.
+Run directories are gitignored and are not tracked by version control.
 
 ---
 

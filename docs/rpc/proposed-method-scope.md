@@ -3,8 +3,6 @@
 **Prepared by Inversed for Zcash Foundation review.**
 
 This document lists the RPC methods we propose to exercise during the engagement.
-Please confirm, add, or remove methods so we can finalise the coverage matrix before
-implementation begins.
 
 ---
 

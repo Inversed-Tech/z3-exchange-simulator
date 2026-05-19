@@ -170,9 +170,7 @@ experiments/runs/
     summary.md             Human-readable run summary
 ```
 
-Run directories are gitignored. Store significant results externally (e.g. an
-`experiments/results/` directory outside the repo, or a shared storage location agreed
-with the Foundation).
+Run directories are gitignored and are not tracked by version control.
 
 ---
 
@@ -198,4 +196,3 @@ Resource samples will be written to `metrics.jsonl` using metric names like
 - What is the mechanism for capturing component logs (pipe, tee, log file)?
 - What is the mempool notification mechanism — and can we hook into it for real-time signals?
 - Should resource profiling be always-on or opt-in per scenario?
-- Where should significant run outputs be archived between team members?

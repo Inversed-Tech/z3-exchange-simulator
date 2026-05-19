@@ -227,7 +227,7 @@ Three 4-week phases, with a midpoint checkpoint at Week 8.
 
 | Risk | Mitigation |
 |---|---|
-| Z3 codebase evolves during the engagement | Commit-pinning at kickoff; findings anchored to explicit hashes; any rebase is a deliberate coordinated decision |
+| Z3 codebase evolves during the engagement | Commits are pinned at engagement start and fixed for its duration; findings are anchored to these specific versions |
 | Assumed load profile turns out to be unrepresentative | The harness is fully parameterised — the Foundation and component teams can re-run with any profile after handover |
 | Scope pressure towards security review | Security auditing is explicitly excluded; any such request is treated as a separate engagement |
 | RPC incompatibilities surface late | The compatibility matrix is front-loaded in Weeks 3 and 4, not held for end-of-project analysis |
@@ -269,7 +269,7 @@ actual fee from the transaction result after the fact.
 
 | Assumption | Status |
 |---|---|
-| Pinned commit hashes confirmed with Foundation | Initial pins set; pending kickoff confirmation |
+| Pinned commit hashes confirmed with Foundation | Confirmed |
 | Specific TPS and account count targets for load scenarios | TBD at kickoff |
 | Complete RFP method list from Foundation | Pending — proposed list drafted in [`docs/rpc/proposed-method-scope.md`](rpc/proposed-method-scope.md) |
 | Repository license: MIT or Apache 2.0 | Pending Foundation preference |
