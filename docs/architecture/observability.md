@@ -106,8 +106,11 @@ component_logs/
   zallet.log
 ```
 
-Log capture mechanism (process piping, tee, or log file redirect) will be determined
-during integration in Weeks 2–4 and documented in the relevant integration notes.
+**Capture mechanism: pipe.** The simulator starts each Z3 process with stdout and stderr
+piped into the simulator, reads them in background tasks, and writes the bytes to the
+log files above. This gives the simulator full ownership of the output stream, which
+enables health-check detection (e.g. watching for "RPC server ready" before marking a
+component healthy) without relying on platform-specific tools like `tee`.
 
 Log verbosity level should be set high enough to capture RPC request/response traces
 during development, and reduced for large-scale runs where log volume becomes a bottleneck.
@@ -206,6 +209,5 @@ Resource samples are written to `metrics.jsonl` using metric names like
 
 ## Open questions
 
-- What is the mechanism for capturing component logs (pipe, tee, log file)?
 - What is the mempool notification mechanism — and can we hook into it for real-time signals?
 - Should resource profiling be always-on or opt-in per scenario?
