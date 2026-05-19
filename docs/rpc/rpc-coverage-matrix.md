@@ -98,7 +98,8 @@ The notification mechanism in Z3 is unconfirmed (zcashd used ZMQ; Z3 may differ)
 
 | Method / Mechanism | Component | Required by RFP? | zcashd equiv? | T/Z | Implemented? | Tested? | Parity | Notes |
 |---|---|---|---|---|---|---|---|---|
-| Mempool change notifications | TBD | TBD | Yes (ZMQ in zcashd) | Both | No | No | TBD | Mechanism in Z3 unconfirmed. May be ZMQ, gRPC streaming, or another protocol. |
+| `Indexer.mempool_change()` (Zebra gRPC) | Zebra | TBD | No | Both | No | No | No-equiv | gRPC server-streaming, not ZMQ. Pushes ADDED/INVALIDATED/MINED events per tx. Requires `--features indexer` build and `indexer_listen_addr` config. |
+| `GetMempoolStream` (Zaino gRPC) | Zaino | TBD | No | Both | No | No | No-equiv | Streams all mempool transactions until next block. LightWallet gRPC protocol. |
 
 ### Wallet — accounts and addresses
 
@@ -191,6 +192,5 @@ These methods existed in zcashd but are not present in Z3 at the pinned commits.
 ## Open questions
 
 1. What is the complete RFP method list from the Foundation? See [`docs/rpc/proposed-method-scope.md`](proposed-method-scope.md).
-2. What is the mempool notification mechanism in Z3 — ZMQ, gRPC streaming, or something else?
-3. Is `z_validateaddress` present in Zallet at the pinned commit?
+2. Is `z_validateaddress` present in Zallet at the pinned commit?
 4. Which zcashd methods have no Z3 equivalent beyond those already listed above?

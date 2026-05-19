@@ -39,10 +39,13 @@ Run `make setup` to check that your local Rust toolchain is installed.
 git clone https://github.com/ZcashFoundation/zebra external/zebra
 cd external/zebra
 git checkout d4cd662c716382f6397d2a730148025a1ca79fec
-cargo build --release
+cargo build --release --features indexer
 ```
 
 The release binary is at `external/zebra/target/release/zebrad`.
+
+The `indexer` feature enables the gRPC `Indexer` service used for mempool change
+notifications. Build without it only if the gRPC stream is not needed.
 
 ---
 
@@ -57,6 +60,7 @@ network = "Testnet"
 
 [rpc]
 listen_addr = "127.0.0.1:18232"
+indexer_listen_addr = "127.0.0.1:8230"   # gRPC indexer for mempool notifications
 # Cookie auth is enabled by default; see "RPC authentication" below
 
 [state]

@@ -210,6 +210,13 @@ Resource samples are written to `metrics.jsonl` using metric names like
 
 ---
 
-## Open questions
+## Mempool notification mechanism
 
-- What is the mempool notification mechanism — and can we hook into it for real-time signals?
+ZMQ is not used anywhere in Z3. Both Zebra and Zaino provide gRPC-based streaming instead.
+
+| Component | Mechanism | Details |
+|---|---|---|
+| **Zebra** | `Indexer.mempool_change()` gRPC stream | Pushes `MempoolChangeMessage` with `change_type` (ADDED / INVALIDATED / MINED) and `tx_hash`. Requires `--features indexer` build flag and `[rpc] indexer_listen_addr = "127.0.0.1:8230"` in config. |
+| **Zaino** | `GetMempoolTx` / `GetMempoolStream` gRPC streams | `GetMempoolStream` streams all mempool transactions until the next block is mined. `GetMempoolTx` streams compact transactions with optional txid filtering. |
+
+**For the simulator:** Use Zebra's `Indexer.mempool_change()` for event-driven deposit detection — it tells you exactly when a transaction is added, invalidated, or mined. Use Zaino's `GetMempoolStream` as a secondary signal for mempool saturation measurement. Polling `getrawmempool` remains a fallback if gRPC is not configured.
