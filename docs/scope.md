@@ -161,8 +161,7 @@ transparent/shielded ratio are all configurable. See
 ## Deliverables
 
 **1. Open-source GitHub repository**
-Released under a permissive license (MIT or Apache 2.0 — pending Foundation
-preference). Contains:
+Released under the **MIT License**. Contains:
 - Simulator source code (Rust)
 - Deployment and setup scripts
 - Scenario library (YAML configs)
@@ -272,6 +271,6 @@ actual fee from the transaction result after the fact.
 | Pinned commit hashes confirmed with Foundation | Confirmed |
 | Specific TPS and account count targets for load scenarios | TBD at kickoff |
 | Complete RFP method list from Foundation | Pending — proposed list drafted in [`docs/rpc/proposed-method-scope.md`](rpc/proposed-method-scope.md) |
-| Repository license: MIT or Apache 2.0 | Pending Foundation preference |
+| Repository license | Confirmed: MIT |
 | Mempool notification mechanism in Z3 | TBD — was ZMQ in zcashd; Z3 equivalent unconfirmed |
 | Zaino pinned commit is on `dev` branch — confirm this is the intended branch | Pending |

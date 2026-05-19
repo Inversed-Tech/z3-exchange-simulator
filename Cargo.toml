@@ -3,7 +3,7 @@ name = "z3-exchange-simulator"
 version = "0.1.0"
 edition = "2021"
 description = "Exchange-scale load simulator for the Z3 Zcash stack (Zebra, Zaino, Zallet)"
-license-file = "LICENSE"
+license = "MIT"
 readme = "README.md"
 repository = "https://github.com/Inversed-Tech/z3-exchange-simulator"
 

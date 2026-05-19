@@ -52,26 +52,26 @@ list has been prepared for Foundation review at
 
 | Method | Component | Required by RFP? | zcashd equiv? | T/Z | Implemented? | Tested? | Parity | Notes |
 |---|---|---|---|---|---|---|---|---|
-| `getblockchaininfo` | Zebra / Zaino | TBD | Yes | N/A | No | No | TBD | Present in both components. Key smoke-test method. |
-| `getblockcount` | Zebra / Zaino | TBD | Yes | N/A | No | No | TBD | Current block height. |
-| `getbestblockhash` | Zebra / Zaino | TBD | Yes | N/A | No | No | TBD | Hash of the chain tip. |
+| `getblockchaininfo` | Zebra / Zaino | TBD | Yes | N/A | No | No | TBD | Zaino proxies to Zebra. Key smoke-test method. |
+| `getblockcount` | Zebra / Zaino | TBD | Yes | N/A | No | No | TBD | Zaino proxies to Zebra. |
+| `getbestblockhash` | Zebra / Zaino | TBD | Yes | N/A | No | No | TBD | Zaino proxies to Zebra. |
 | `getbestblockheightandhash` | Zebra | TBD | No | N/A | No | No | No-equiv | Returns height and hash together in one call. Zebra-specific; not in zcashd or Zaino. |
 
 ### Block lookup
 
 | Method | Component | Required by RFP? | zcashd equiv? | T/Z | Implemented? | Tested? | Parity | Notes |
 |---|---|---|---|---|---|---|---|---|
-| `getblock` | Zebra / Zaino | TBD | Yes | N/A | No | No | TBD | Fetch block by hash or height. |
-| `getblockhash` | Zebra | TBD | Yes | N/A | No | No | TBD | Not confirmed in Zaino at pinned commit. |
-| `getblockheader` | Zebra / Zaino | TBD | Yes | N/A | No | No | TBD | Block header without the full transaction list. |
+| `getblock` | Zebra / Zaino | TBD | Yes | N/A | No | No | TBD | Zaino proxies to Zebra. |
+| `getblockhash` | Zebra | TBD | Yes | N/A | No | No | TBD | Not present in Zaino at pinned commit — call Zebra directly. |
+| `getblockheader` | Zebra / Zaino | TBD | Yes | N/A | No | No | TBD | Zaino proxies to Zebra. |
 
 ### Transaction lookup
 
 | Method | Component | Required by RFP? | zcashd equiv? | T/Z | Implemented? | Tested? | Parity | Notes |
 |---|---|---|---|---|---|---|---|---|
-| `getrawtransaction` | Zebra / Zaino / Zallet | TBD | Yes | Both | No | No | TBD | Present in all three components. |
+| `getrawtransaction` | Zebra / Zaino / Zallet | TBD | Yes | Both | No | No | TBD | Zaino handles natively from its indexer. Present in all three components. |
 | `decoderawtransaction` | Zallet | TBD | Yes | Both | No | No | TBD | Only in Zallet; not exposed by Zebra or Zaino at pinned commits. |
-| `gettxout` | Zebra / Zaino | TBD | Yes | T | No | No | TBD | Unspent output lookup by txid and output index. |
+| `gettxout` | Zebra / Zaino | TBD | Yes | T | No | No | TBD | Zaino proxies to Zebra. |
 
 ### Address-indexed lookup
 
@@ -80,16 +80,16 @@ Useful for monitoring deposit addresses independently of the wallet.
 
 | Method | Component | Required by RFP? | zcashd equiv? | T/Z | Implemented? | Tested? | Parity | Notes |
 |---|---|---|---|---|---|---|---|---|
-| `getaddressbalance` | Zebra / Zaino | TBD | Yes | T | No | No | TBD | Balance for one or more transparent addresses. |
-| `getaddresstxids` | Zebra / Zaino | TBD | Yes | T | No | No | TBD | Transaction IDs involving a transparent address. |
-| `getaddressutxos` | Zebra / Zaino | TBD | Yes | T | No | No | TBD | Unspent outputs for a transparent address. |
+| `getaddressbalance` | Zebra / Zaino | TBD | Yes | T | No | No | TBD | Zaino handles natively from its indexer. |
+| `getaddresstxids` | Zebra / Zaino | TBD | Yes | T | No | No | TBD | Zaino handles natively from its indexer. |
+| `getaddressutxos` | Zebra / Zaino | TBD | Yes | T | No | No | TBD | Zaino handles natively from its indexer. |
 
 ### Mempool
 
 | Method | Component | Required by RFP? | zcashd equiv? | T/Z | Implemented? | Tested? | Parity | Notes |
 |---|---|---|---|---|---|---|---|---|
-| `getrawmempool` | Zebra / Zaino | TBD | Yes | Both | No | No | TBD | All pending transaction IDs. Core signal for mempool saturation. |
-| `getmempoolinfo` | Zebra / Zaino | TBD | Yes | N/A | No | No | TBD | Mempool size, byte count, and fee statistics. |
+| `getrawmempool` | Zebra / Zaino | TBD | Yes | Both | No | No | TBD | Zaino handles natively from its indexer. Core signal for mempool saturation. |
+| `getmempoolinfo` | Zebra / Zaino | TBD | Yes | N/A | No | No | TBD | Zaino handles natively from its indexer. |
 
 ### Mempool notifications
 
@@ -125,8 +125,8 @@ An account is created first (`z_getnewaccount`), then addresses are derived from
 
 | Method | Component | Required by RFP? | zcashd equiv? | T/Z | Implemented? | Tested? | Parity | Notes |
 |---|---|---|---|---|---|---|---|---|
-| `validateaddress` | Zebra / Zaino / Zallet | TBD | Yes | T | No | No | TBD | Present in all three components. |
-| `z_validateaddress` | Zebra / Zaino | TBD | Yes | Z | No | No | TBD | Not confirmed in Zallet at pinned commit. |
+| `validateaddress` | Zebra / Zaino / Zallet | TBD | Yes | T | No | No | TBD | Zaino proxies to Zebra. Present in all three components. |
+| `z_validateaddress` | Zebra / Zaino | TBD | Yes | Z | No | No | TBD | Zaino proxies to Zebra. Not confirmed in Zallet at pinned commit. |
 
 ### Transaction creation
 
@@ -150,7 +150,7 @@ are used to track it through to completion.
 
 | Method | Component | Required by RFP? | zcashd equiv? | T/Z | Implemented? | Tested? | Parity | Notes |
 |---|---|---|---|---|---|---|---|---|
-| `sendrawtransaction` | Zebra / Zaino | TBD | Yes | Both | No | No | TBD | Broadcast a signed raw transaction to the network. |
+| `sendrawtransaction` | Zebra / Zaino | TBD | Yes | Both | No | No | TBD | Zaino proxies to Zebra. |
 
 ### Wallet — transaction history
 
@@ -193,5 +193,4 @@ These methods existed in zcashd but are not present in Z3 at the pinned commits.
 1. What is the complete RFP method list from the Foundation? See [`docs/rpc/proposed-method-scope.md`](proposed-method-scope.md).
 2. What is the mempool notification mechanism in Z3 — ZMQ, gRPC streaming, or something else?
 3. Is `z_validateaddress` present in Zallet at the pinned commit?
-4. Is `getblockhash` present in Zaino at the pinned commit?
-5. Which zcashd methods have no Z3 equivalent beyond those already listed above?
+4. Which zcashd methods have no Z3 equivalent beyond those already listed above?

@@ -57,11 +57,12 @@ configuration is required — Zaino uses Zebra's standard RPC endpoint.
 | Authentication | `validator_cookie_path` (recommended) or `validator_user` / `validator_password` |
 | Zebra special config needed? | No — standard RPC endpoint is sufficient |
 
-Zaino config snippet pointing at Zebra:
+Zaino config snippet pointing at Zebra (example config uses port 18231 — this is the
+port Zebra is configured to listen on, not a fixed default):
 
 ```toml
 [validator_settings]
-validator_jsonrpc_listen_address = "127.0.0.1:18232"
+validator_jsonrpc_listen_address = "127.0.0.1:18231"
 validator_cookie_path = "/path/to/zebra/cookie"
 ```
 
@@ -82,8 +83,40 @@ Zaino exposes two interfaces to clients:
 The JSON-RPC interface provides backwards-compatible Zcash RPC methods. The gRPC
 interface implements the LightWallet protocol (`CompactTxStreamer`) for light clients.
 
-For the simulator, we use Zaino's **JSON-RPC interface**. The method list served by
-Zaino is in the [RPC coverage matrix](../rpc/rpc-coverage-matrix.md).
+For the simulator, we use Zaino's **JSON-RPC interface**.
+
+### Method routing
+
+Zaino handles two classes of methods differently:
+
+**Natively indexed** (Zaino computes these itself from its chain index):
+
+| Method |
+|---|
+| `getrawtransaction` |
+| `getaddressbalance` |
+| `getaddresstxids` |
+| `getaddressutxos` |
+| `getrawmempool` |
+| `getmempoolinfo` |
+
+**Proxied to Zebra** (Zaino forwards these calls to Zebra's JSON-RPC and returns the result):
+
+| Method |
+|---|
+| `getblockchaininfo` |
+| `getblockcount` |
+| `getbestblockhash` |
+| `getblock` |
+| `getblockheader` |
+| `gettxout` |
+| `sendrawtransaction` |
+| `validateaddress` |
+| `z_validateaddress` |
+
+`getblockhash` is not present in Zaino at the pinned commit — route directly to Zebra.
+
+Full detail in the [RPC coverage matrix](../rpc/rpc-coverage-matrix.md).
 
 ---
 
