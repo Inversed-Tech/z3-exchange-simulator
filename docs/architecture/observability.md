@@ -176,24 +176,36 @@ Run directories are gitignored and are not tracked by version control.
 
 ---
 
+## Component metrics endpoints
+
+| Component | Metrics endpoint | Details |
+|---|---|---|
+| **Zebra** | Yes — Prometheus | `http://localhost:9999/metrics`, disabled by default. Enable via `[metrics] endpoint_addr = "0.0.0.0:9999"` in `zebrad.toml`. Exposes chain sync, block/tx verification times, peer connections, and more. |
+| **Zaino** | No | Uses `tracing` crate for structured logging only. No HTTP metrics endpoint at pinned commit. |
+| **Zallet** | No | Uses `tracing` crate for structured logging only. No HTTP metrics endpoint at pinned commit. |
+
+The simulator should enable Zebra's Prometheus endpoint in the regtest config and
+optionally scrape it during runs for richer chain-level metrics. Zaino and Zallet
+resource usage is measured via OS-level polling.
+
+---
+
 ## Resource profiling (CPU and memory)
 
-CPU and memory usage of the Zebra, Zaino, and Zallet processes will be sampled during
-runs to identify resource bottlenecks at scale.
+CPU and memory usage of all three Z3 processes are sampled during runs to identify
+resource bottlenecks at scale.
 
-Tooling is TBD — candidates include:
-- OS-level polling via `/proc` (Linux) or `ps`/`top` (macOS)
-- `perf` or `cargo-flamegraph` for CPU profiling at specific points
-- Structured output from the processes themselves if they expose metrics endpoints
+Approach:
+- **Zebra**: OS-level polling supplemented by Prometheus endpoint scraping where enabled
+- **Zaino / Zallet**: OS-level polling via `/proc/<pid>/stat` (Linux) or `ps` (macOS)
 
-Resource samples will be written to `metrics.jsonl` using metric names like
+Resource samples are written to `metrics.jsonl` using metric names like
 `process_cpu_percent` and `process_memory_mb` with a `process` label.
 
 ---
 
 ## Open questions
 
-- Will Z3 components expose their own metrics endpoints (e.g. Prometheus)?
 - What is the mechanism for capturing component logs (pipe, tee, log file)?
 - What is the mempool notification mechanism — and can we hook into it for real-time signals?
 - Should resource profiling be always-on or opt-in per scenario?
