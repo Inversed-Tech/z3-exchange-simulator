@@ -22,3 +22,4 @@ confirmations:
 observability:
   record_rpc_calls: true
   record_component_logs: true
+  metric_sampling_interval_secs: 5

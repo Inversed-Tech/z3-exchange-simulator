@@ -88,7 +88,9 @@ state of the simulator and the Z3 stack over time.
 | `block_height` | `component` | Current chain height as seen by each component |
 | `tps_achieved` | — | Observed transactions per second vs. target |
 
-Metric sampling interval: TBD — likely every 5 seconds during a run.
+Metric sampling interval: **5 seconds** by default, configurable per-scenario via
+`observability.metric_sampling_interval_secs` in the scenario YAML. Use 1s for burst
+scenarios where fine-grained mempool data is needed; 15s for long steady-state runs.
 
 ---
 
@@ -191,7 +193,6 @@ Resource samples will be written to `metrics.jsonl` using metric names like
 
 ## Open questions
 
-- What metric sampling interval is appropriate for load runs?
 - Will Z3 components expose their own metrics endpoints (e.g. Prometheus)?
 - What is the mechanism for capturing component logs (pipe, tee, log file)?
 - What is the mempool notification mechanism — and can we hook into it for real-time signals?
