@@ -1,7 +1,7 @@
 # Zebra Integration Notes
 
 Integration reference for the Zebra full node. Covers build, regtest setup, RPC
-configuration, and open questions to resolve during Week 2.
+configuration, and open questions to resolve during integration.
 
 For a plain-English explanation of what Zebra is and its role in the stack, see
 [`docs/architecture/z3-overview.md`](../architecture/z3-overview.md).
@@ -33,7 +33,7 @@ Run `make setup` to check that your local Rust toolchain is installed.
 
 ## Build instructions
 
-> TBD — verify exact steps from the Zebra repository README before Week 2.
+> TBD — verify exact steps from the Zebra repository README.
 
 Expected approach (standard for a Rust binary project):
 
@@ -57,7 +57,7 @@ TBD — verify from the repository (likely `zebrad` based on convention, but do 
 > TBD — verify the exact config and flags from the Zebra repository documentation.
 
 Zebra is configured via a TOML file (verify format and required fields from the
-repository). Key settings to identify before Week 2:
+repository). Key settings to identify:
 
 - How to set the network to `regtest`
 - RPC listener address and port
@@ -93,23 +93,7 @@ In the expected topology, Zaino connects to Zebra to retrieve chain data. Zallet
 also connect to Zebra directly for some operations (TBD).
 
 Expected startup order: **Zebra first**, then Zaino, then Zallet. Verify this assumption
-during Week 2 integration.
-
----
-
-## Week 2 preparation tasks
-
-Before starting the Zebra regtest harness, resolve the following:
-
-- [ ] Pinned commit confirmed and written into `z3-commits.lock`
-- [ ] Zebra cloned at pinned commit into `external/zebra/`
-- [ ] Build succeeds (`cargo build --release`)
-- [ ] Minimum Rust version identified and documented here
-- [ ] Regtest config file created and stored in `configs/local/` (gitignored)
-- [ ] Zebra starts successfully in regtest mode
-- [ ] RPC endpoint reachable locally
-- [ ] `getblockchaininfo` RPC call returns `"chain": "regtest"`
-- [ ] Binary name and path documented in this file
+during integration.
 
 ---
 

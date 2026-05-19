@@ -2,7 +2,7 @@
 
 Integration reference for the Zallet wallet component. Covers build, wallet
 initialization, RPC surface, transparent and shielded operations, and open questions to
-resolve during Week 4.
+resolve during integration.
 
 For a plain-English explanation of what Zallet is and its role in the stack, see
 [`docs/architecture/z3-overview.md`](../architecture/z3-overview.md).
@@ -166,23 +166,6 @@ Based on the expected stack topology:
 4. Initialize wallet
 
 Verify this sequence during Week 4 integration.
-
----
-
-## Week 4 preparation tasks
-
-Before beginning Zallet integration, resolve the following:
-
-- [ ] Zallet repository URL confirmed and written into `z3-commits.lock`
-- [ ] Pinned commit confirmed
-- [ ] Zallet cloned at pinned commit into `external/zallet/`
-- [ ] Build succeeds
-- [ ] Wallet initialized successfully in regtest
-- [ ] Transparent address generation works
-- [ ] Balance query returns correct result for a funded regtest address
-- [ ] At least one transparent transaction created and broadcast end-to-end
-- [ ] Shielded support level assessed and documented here
-- [ ] RPC method names confirmed and written into the coverage matrix
 
 ---
 

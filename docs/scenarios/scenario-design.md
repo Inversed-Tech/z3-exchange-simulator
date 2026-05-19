@@ -1,7 +1,5 @@
 # Scenario Library Design
 
-> Status: Draft — design will be refined during Phase 2 (Weeks 5–8).
-
 ## Purpose
 
 A scenario defines a complete, reproducible workload for the simulator: account count,
@@ -33,14 +31,13 @@ Flow fractions must sum to 1.0.
 
 | Name | Load shape | Accounts | Transaction mix | Notes |
 |---|---|---|---|---|
-| `smoke` | Minimal (1 TPS, 60 s) | 10 | 100% transparent | CI sanity check; implemented in Week 1 |
-| `steady-state` | Constant TPS | TBD | TBD | Baseline exchange behavior; Week 6 |
-| `ramp` | Linearly increasing TPS | TBD | TBD | Find inflection point; Week 6 |
-| `burst` | Spike then recovery | TBD | TBD | Model sudden volume events; Week 6 |
-| `mixed` | Steady with shielded mix | TBD | TBD | Exercise full shielded RPC surface; Week 6 |
+| `smoke` | Minimal (1 TPS, 60 s) | 10 | 100% transparent | CI sanity check |
+| `steady-state` | Constant TPS | TBD | TBD | Baseline exchange behavior |
+| `ramp` | Linearly increasing TPS | TBD | TBD | Find inflection point |
+| `burst` | Spike then recovery | TBD | TBD | Model sudden volume events |
+| `mixed` | Steady with shielded mix | TBD | TBD | Exercise full shielded RPC surface |
 
-Exact account counts and TPS targets will be calibrated in Phase 2 (Weeks 5–8) based on
-Phase 1 findings.
+Exact account counts and TPS targets will be calibrated based on Phase 1 findings.
 
 ## Reproducibility
 

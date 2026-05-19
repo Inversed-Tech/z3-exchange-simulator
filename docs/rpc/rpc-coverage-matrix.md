@@ -165,12 +165,10 @@ simulator to control block production and chain state during test scenarios.
 
 ## Open questions
 
-| # | Question | When to resolve |
-|---|---|---|
-| 1 | What is the complete RFP method list? | At/after kickoff — this is the critical input for this matrix |
-| 2 | Which component serves each method (Zebra, Zaino, or Zallet)? | Weeks 2–4 during integration |
-| 3 | What is the mempool notification mechanism in Z3 (ZMQ, gRPC, other)? | Week 3 (Zaino integration) |
-| 4 | Does Zallet use the async operation pattern for shielded transactions? | Week 4 (Zallet integration) |
-| 5 | Which shielded address pool does `z_getnewaddress` use (Orchard, Sapling)? | Week 4 |
-| 6 | Does `generate` (or equivalent) work in Zebra regtest? What is the exact method name? | Week 2 |
-| 7 | Which zcashd methods have no Z3 equivalent in the target commit? | Weeks 3–4 |
+1. What is the complete RFP method list? This is the critical input for this matrix.
+2. Which component serves each method (Zebra, Zaino, or Zallet)?
+3. What is the mempool notification mechanism in Z3 (ZMQ, gRPC, other)?
+4. Does Zallet use the async operation pattern for shielded transactions?
+5. Which shielded address pool does `z_getnewaddress` use (Orchard, Sapling)?
+6. Does `generate` (or equivalent) work in Zebra regtest? What is the exact method name?
+7. Which zcashd methods have no Z3 equivalent in the target commit?

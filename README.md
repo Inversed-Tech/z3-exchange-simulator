@@ -32,15 +32,6 @@ pinned commits of each component.
 | **Not a real exchange** | All accounts, addresses, and transaction data are synthetically generated. No real user data. |
 | **Not a production deployment** | This is a load-testing and measurement tool. |
 
-## Project status
-
-**Week 1 — Foundation.** Repository skeleton established. Regtest harness and simulator
-implementation begin in Week 2.
-
-See [`docs/reports/week1-status.md`](docs/reports/week1-status.md) for the current status memo.
-
----
-
 ## Z3 components
 
 The simulator drives three components that together make up the next-generation Zcash wallet
@@ -68,12 +59,10 @@ z3-exchange-simulator/
   LICENSE
 
   docs/
-    scope/proposal-obligations.md    Deliverables and constraints from the proposal
     architecture/
       z3-overview.md                 Plain-English Z3 stack overview
       data-model.md                  Simulator data model
       observability.md               Metrics and experiment output structure
-    decisions/                       Architecture decision records (ADRs)
     integration/
       zebra.md                       Zebra build, run, and config notes
       zaino.md                       Zaino build, run, and config notes
@@ -81,7 +70,6 @@ z3-exchange-simulator/
       pinned-commits.md              Commit pinning rationale and process
     rpc/rpc-coverage-matrix.md       RPC method coverage and zcashd parity matrix
     scenarios/scenario-design.md     Scenario library design
-    reports/                         Weekly status memos
 
   configs/
     scenarios/                       Scenario YAML files
@@ -116,7 +104,7 @@ z3-exchange-simulator/
 ## Quickstart
 
 > The simulator is not yet fully implemented. These commands will work once the regtest
-> harness and RPC client are in place (Weeks 2–4).
+> harness and RPC client are in place.
 
 ```sh
 # Clone pinned Z3 component repositories
@@ -201,18 +189,15 @@ archived manually.
 
 | Document | Purpose |
 |---|---|
-| [`docs/scope/proposal-obligations.md`](docs/scope/proposal-obligations.md) | Deliverables and constraints from the engagement proposal |
 | [`docs/architecture/z3-overview.md`](docs/architecture/z3-overview.md) | Plain-English Z3 stack overview for new contributors |
 | [`docs/architecture/data-model.md`](docs/architecture/data-model.md) | Core data model: accounts, transactions, metrics |
 | [`docs/architecture/observability.md`](docs/architecture/observability.md) | Observability plan: metrics, latency, output format |
-| [`docs/decisions/`](docs/decisions/) | Architecture decision records (ADRs) |
 | [`docs/integration/zebra.md`](docs/integration/zebra.md) | Zebra integration notes |
 | [`docs/integration/zaino.md`](docs/integration/zaino.md) | Zaino integration notes |
 | [`docs/integration/zallet.md`](docs/integration/zallet.md) | Zallet integration notes |
 | [`docs/integration/pinned-commits.md`](docs/integration/pinned-commits.md) | Commit pinning rationale and update process |
 | [`docs/rpc/rpc-coverage-matrix.md`](docs/rpc/rpc-coverage-matrix.md) | RPC coverage and zcashd parity matrix |
 | [`docs/scenarios/scenario-design.md`](docs/scenarios/scenario-design.md) | Scenario library design |
-| [`docs/reports/week1-status.md`](docs/reports/week1-status.md) | Week 1 status memo |
 
 ---
 

@@ -2,7 +2,7 @@
 
 Integration reference for the Zaino blockchain data and indexing layer. Covers build,
 configuration, connection to Zebra, RPC surface, and open questions to resolve during
-Week 3.
+integration.
 
 For a plain-English explanation of what Zaino is and its role in the stack, see
 [`docs/architecture/z3-overview.md`](../architecture/z3-overview.md).
@@ -31,7 +31,7 @@ Zaino is a Rust project. Building it requires:
 
 ## Build instructions
 
-> TBD — verify exact steps from the Zaino repository README before Week 3.
+> TBD — verify exact steps from the Zaino repository README.
 
 Expected approach (standard for a Rust binary project):
 
@@ -52,7 +52,7 @@ verify from the repository.
 
 ## How Zaino connects to Zebra
 
-> TBD — verify the connection mechanism and required configuration before Week 3.
+> TBD — verify the connection mechanism and required configuration before integration.
 
 Zaino is expected to connect to a running Zebra node to read chain state. Items to
 identify:
@@ -72,7 +72,7 @@ Look at Zaino's CI setup to see how it starts Zebra as a dependency.
 ## RPC and data access
 
 > TBD — the exact division of RPC methods between Zaino and Zebra must be verified
-> during Week 3 integration.
+> during integration.
 
 Key questions for the coverage matrix:
 
@@ -91,7 +91,7 @@ documentation. Cross-reference with the Zebra RPC method list to map the routing
 
 ## Configuration notes
 
-> TBD — verify config format and required fields from the repository before Week 3.
+> TBD — verify config format and required fields from the repository.
 
 Expected items to configure:
 
@@ -105,29 +105,13 @@ Expected items to configure:
 ## Startup order
 
 Expected: **Zebra must be running before Zaino starts.** Zaino likely fails or exits if
-it cannot connect to Zebra at startup. Verify this assumption during Week 3.
+it cannot connect to Zebra at startup. Verify this assumption during integration.
 
 The recommended startup sequence for local development is expected to be:
 1. Start Zebra in regtest mode
 2. Wait for Zebra RPC to be ready
 3. Start Zaino, pointing it at Zebra
 4. Start Zallet (see [`zallet.md`](zallet.md))
-
----
-
-## Week 3 preparation tasks
-
-Before beginning Zaino integration, resolve the following:
-
-- [ ] Pinned commit confirmed and written into `z3-commits.lock`
-- [ ] Zaino cloned at pinned commit into `external/zaino/`
-- [ ] Build succeeds
-- [ ] Zaino starts successfully with a running Zebra instance
-- [ ] Connection mechanism between Zaino and Zebra documented in this file
-- [ ] At least one RPC call through Zaino returns a correct result
-- [ ] RPC method routing table (Zaino-native vs. Zebra-forwarded) drafted in
-  [`docs/rpc/rpc-coverage-matrix.md`](../rpc/rpc-coverage-matrix.md)
-- [ ] Binary name and config format documented in this file
 
 ---
 

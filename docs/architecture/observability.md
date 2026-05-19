@@ -193,11 +193,9 @@ Resource samples will be written to `metrics.jsonl` using metric names like
 
 ## Open questions
 
-| Question | When to resolve |
-|---|---|
-| What metric sampling interval is appropriate for load runs? | Week 7 (observability harness) |
-| Will Z3 components expose their own metrics endpoints (e.g. Prometheus)? | Weeks 2–4 |
-| What is the mechanism for capturing component logs (pipe, tee, log file)? | Weeks 2–4 |
-| What is the mempool notification mechanism — and can we hook into it for real-time signals? | Week 3 |
-| Should resource profiling be always-on or opt-in per scenario? | Week 7 |
-| Where should significant run outputs be archived between team members? | Week 1 / kickoff |
+- What metric sampling interval is appropriate for load runs?
+- Will Z3 components expose their own metrics endpoints (e.g. Prometheus)?
+- What is the mechanism for capturing component logs (pipe, tee, log file)?
+- What is the mempool notification mechanism — and can we hook into it for real-time signals?
+- Should resource profiling be always-on or opt-in per scenario?
+- Where should significant run outputs be archived between team members?

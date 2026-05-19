@@ -68,7 +68,7 @@ having to talk directly to the full node for every data request.
 
 **Role in this project:** The simulator is expected to use Zaino for chain data retrieval
 and some RPC calls. Which methods Zaino handles vs. forwards to Zebra must be confirmed
-during integration (Week 3).
+during integration.
 
 **Repository:** https://github.com/zingolabs/zaino
 
@@ -190,7 +190,7 @@ level:
 **Important:** The exact routing between these components — which methods go to Zallet,
 which to Zaino, which directly to Zebra — is not yet verified. The diagram above reflects
 the expected topology based on each component's stated role. Actual routing will be
-confirmed and corrected during integration testing in Weeks 3 and 4.
+confirmed and corrected during integration testing.
 
 ---
 
@@ -214,14 +214,12 @@ there are behavioral differences.
 
 ## Open architecture questions
 
-These must be answered during integration testing (Weeks 2–4). Until then, treat any
-claim about routing or method support as provisional.
+These must be answered during integration testing. Until then, treat any claim about
+routing or method support as provisional.
 
-| Question | Relevant week |
-|---|---|
-| Which RPC methods does Zebra expose directly in regtest? | Week 2 |
-| Which methods does Zaino handle vs. forward to Zebra? | Week 3 |
-| Which methods does Zallet expose, and does it talk to Zaino, Zebra, or both? | Week 4 |
-| What is the startup order for the three components? | Week 2 |
-| Are there regtest-specific limitations in any component vs. mainnet? | Week 2–3 |
-| What is the Zallet repository URL? | Kickoff / Week 1 |
+- Which RPC methods does Zebra expose directly in regtest?
+- Which methods does Zaino handle vs. forward to Zebra?
+- Which methods does Zallet expose, and does it talk to Zaino, Zebra, or both?
+- What is the startup order for the three components?
+- Are there regtest-specific limitations in any component vs. mainnet?
+- What is the Zallet repository URL?
