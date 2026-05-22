@@ -16,5 +16,12 @@ name = "z3sim"
 path = "src/main.rs"
 
 [dependencies]
+chrono = { version = "0.4", features = ["serde"] }
+reqwest = { version = "0.12", features = ["json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
 
 [dev-dependencies]
+tempfile = "3"
+wiremock = "0.6"

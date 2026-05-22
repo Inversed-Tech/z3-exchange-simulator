@@ -488,7 +488,8 @@ and assert on the output files.
   `Deposit.status` reaches `credited`
 - `test_withdrawal_flow`: fund an account; execute a withdrawal; assert txid is recorded
   and confirmed on-chain
-- `test_rpc_coverage`: call every method in the proposed method list; record pass/fail;
+- `test_rpc_coverage`: call every method in the confirmed method list (see
+  [`docs/rpc/method-scope.md`](../docs/rpc/method-scope.md)); record pass/fail;
   this is the basis of the compatibility matrix
 
 *CI:*
@@ -543,7 +544,7 @@ RPC surface. Once T2 and T3 are stable, Engineer A moves to T8 and helps with T7
 **Sequence:**
 1. T2 (start immediately): Get the Z3 Docker Compose stack running in regtest; verify
    one `getblockchaininfo` call succeeds through the RPC Router at `:8181`
-2. T3 (after Contract A + B agreed): Implement all Zebra/Zaino methods first (simpler);
+2. T3 (after Contract A + B agreed): Implement all Zebra methods first (simpler);
    then Zallet methods
 3. T9 integration scaffolding: Z3 test fixture once T2 is stable
 4. T7 + T8: final assembly once T5 is functional

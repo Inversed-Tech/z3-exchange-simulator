@@ -1,5 +1,9 @@
 //! Metrics collection, aggregation, and output.
-//!
-//! Records per-RPC-call latency, success/failure counts, mempool saturation
-//! signals, and time-series metric samples. Writes structured output to
-//! the experiment run directory for post-run analysis.
+
+use crate::data_model::{MetricSample, RpcCall};
+
+/// Contract C — implemented here in T6, consumed by T2 (resource sampling) and T3 (RPC calls).
+pub trait MetricsRecorder: Send + Sync {
+    fn record_rpc_call(&self, call: RpcCall);
+    fn record_metric(&self, sample: MetricSample);
+}
