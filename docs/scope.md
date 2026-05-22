@@ -1,10 +1,5 @@
 # Project Scope — Z3 Exchange Simulator
 
-Reference document for anyone building or planning work on this project. Synthesises
-the original engagement proposal with everything confirmed during project setup.
-
----
-
 ## Objective
 
 The Z3 stack (Zebra, Zaino, Zallet) is the Zcash Foundation's replacement for the
@@ -32,19 +27,16 @@ The engagement produces two things:
 
 ## Engagement priorities
 
-Four priorities shape all decisions on this project:
-
 **Realistic exchange-scale load.** The simulation models account populations in the
 thousands. The design ceiling is Binance-scale usage: tens of thousands of ZEC-holding
-users. Specific TPS and account count targets will be confirmed at kickoff.
+users.
 
-**Open source and reusable.** The output is not a one-off consulting report. It must
-be runnable by the Foundation, by the Zebra, Zaino, and Zallet teams, and by ecosystem
-developers in their own pipelines after handover.
+**Open source and reusable.** The output is a testing framework runnable by the
+Foundation, by the Zebra, Zaino, and Zallet teams, and by ecosystem developers in
+their own pipelines.
 
-**Findings tied to a specific commit.** Every result in the findings report references
-the pinned commits of each Z3 component agreed at kickoff. This makes findings
-reproducible and verifiable.
+**Findings tied to specific commits.** Every result in the findings report references
+the pinned commits of each Z3 component, making results reproducible and verifiable.
 
 **Regtest-focused, isolated environments.** All testing runs in regtest mode against
 controlled local networks. No mainnet usage, no real funds, no real user data.
@@ -121,9 +113,9 @@ transparent/shielded ratio are all configurable. See
   Deviations are characterised and documented — they are not automatically treated as
   bugs, since Z3 intentionally changes some behaviours.
 
-- **RPC client notifications for mempool changes** are tested explicitly, per the RFP.
-  The notification mechanism in Z3 is not yet confirmed (ZMQ in zcashd; Z3 equivalent
-  TBD — must verify at kickoff).
+- **Mempool change notifications** are tested using Z3's gRPC streaming interfaces:
+  Zebra's `Indexer.mempool_change()` and Zaino's `GetMempoolStream`, which replace the
+  ZMQ mechanism used in zcashd.
 
 - **All account and transaction data is synthetic.** Generated inside the harness,
   seeded deterministically, never sourced from real users. Safe to ship in the public
@@ -199,8 +191,8 @@ Three 4-week phases, with a midpoint checkpoint at Week 8.
 
 **Phase 1 — Foundation**
 
-- **Week 1** Kickoff call; commit hashes confirmed; development and regtest environments
-  provisioned; repository skeleton in place. *(Completed — see current repo state.)*
+- **Week 1** Kickoff; commit hashes confirmed; development and regtest environments
+  provisioned; repository skeleton in place.
 - **Week 2** Load-generator skeleton; Zebra regtest harness online; first `getblockchaininfo`
   call succeeds.
 - **Week 3** Zaino integration; initial transparent RPC coverage verified end-to-end.
@@ -236,43 +228,36 @@ Three 4-week phases, with a midpoint checkpoint at Week 8.
 
 ---
 
-## Confirmed facts (post-proposal discoveries)
+## Z3 component notes
 
-The following were unknown at proposal time and have since been verified against the
-pinned commits.
+**Zallet repository:** https://github.com/zcash/wallet
 
-**Zallet repository:** https://github.com/zcash/wallet (not yet public at proposal time)
-
-**Zallet account model has changed from zcashd.** `getnewaddress` and `z_getnewaddress`
-no longer exist. The new flow is:
+**Zallet account model differs from zcashd.** `getnewaddress` and `z_getnewaddress`
+do not exist. The workflow is:
 1. Create an account: `z_getnewaccount`
 2. Derive an address from it: `z_getaddressforaccount`
 
-This affects how the load generator provisions synthetic users — each user maps to a
-Zallet account, not a raw address.
+Each synthetic exchange user maps to one Zallet account.
 
-**Several expected method names do not exist in Z3:**
+**Several zcashd methods do not exist in Z3:**
 `getbalance`, `z_getbalance`, `sendtoaddress`, `gettransaction`, `getmempoolentry`,
 `createrawtransaction`, `signrawtransaction`. See the "Removed or replaced from zcashd"
 section in [`docs/rpc/rpc-coverage-matrix.md`](rpc/rpc-coverage-matrix.md).
 
-**Shielded transactions are fully implemented** in the pinned Zallet commit. Both
-Sapling and Orchard pools are supported. No need to plan for transparent-only as a
-fallback. `z_sendmany` handles all four flow types: T→T, T→Z, Z→T, Z→Z.
+**Shielded transactions are fully implemented** at the pinned Zallet commit. Both
+Sapling and Orchard pools are supported. `z_sendmany` handles all four flow types:
+T→T, T→Z, Z→T, Z→Z.
 
-**Fee model change:** `z_sendmany`'s `fee` parameter must be `null`. The fee is always
-auto-computed via ZIP 317. The simulator cannot pre-specify fees; it must read the
-actual fee from the transaction result after the fact.
+**Fee computation:** `z_sendmany`'s `fee` parameter must be `null`. The fee is always
+auto-computed via ZIP 317. The simulator reads the actual fee from the transaction
+result after the fact.
 
 ---
 
-## Open assumptions pending kickoff confirmation
+## Open items
 
-| Assumption | Status |
+| Item | Status |
 |---|---|
-| Pinned commit hashes confirmed with Foundation | Confirmed |
-| Specific TPS and account count targets for load scenarios | TBD at kickoff |
-| Complete RFP method list from Foundation | Pending — proposed list drafted in [`docs/rpc/proposed-method-scope.md`](rpc/proposed-method-scope.md) |
-| Repository license | Confirmed: MIT |
-| Mempool notification mechanism in Z3 | TBD — was ZMQ in zcashd; Z3 equivalent unconfirmed |
-| Zaino pinned commit is on `dev` branch — confirm this is the intended branch | Pending |
+| Specific TPS and account count targets for load scenarios | TBD — calibrated from initial load runs |
+| Z3 pinned commit | TBD — pending Foundation confirmation |
+| Zaino gRPC scope: direct testing of `GetMempoolStream` / `GetMempoolTx` | TBD — pending Foundation confirmation |

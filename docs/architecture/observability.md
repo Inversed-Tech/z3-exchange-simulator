@@ -1,11 +1,6 @@
 # Observability Plan
 
-Defines what the simulator measures, how it records results, what each output file
-contains, and how a contributor can interpret a completed run.
-
----
-
-## What we measure
+## What is measured
 
 Every simulator run produces five categories of observation:
 
@@ -80,7 +75,7 @@ latency is folded into Zallet method response times implicitly.
 The `backend` label (Zebra or Zallet) is available for grouping if needed, derived from
 the method's routing table.
 
-### Planned metric names
+### Metric names
 
 | Metric | Labels | Description |
 |---|---|---|
@@ -122,8 +117,8 @@ log files above. This gives the simulator full ownership of the output stream, w
 enables health-check detection (e.g. watching for "RPC server ready" before marking a
 component healthy) without relying on platform-specific tools like `tee`.
 
-Log verbosity level should be set high enough to capture RPC request/response traces
-during development, and reduced for large-scale runs where log volume becomes a bottleneck.
+Log verbosity should be tuned per run: higher for debugging, lower for large-scale
+runs where log volume becomes a bottleneck.
 
 ---
 
@@ -132,7 +127,7 @@ during development, and reduced for large-scale runs where log volume becomes a 
 A human-readable narrative generated at the end of each run. Intended for sharing with
 the Foundation and component teams without requiring them to parse JSONL files.
 
-### Planned contents
+### Contents
 
 ```markdown
 # Run Summary: <run-id>

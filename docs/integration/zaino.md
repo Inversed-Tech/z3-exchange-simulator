@@ -41,7 +41,7 @@ Zaino also runs as a separate Docker container exposing the LightWallet gRPC int
 (`CompactTxStreamer`) on port 8137 for light wallet clients (e.g. Zingo). The simulator
 does not call this interface during normal operation.
 
-Whether to test Zaino's gRPC interface directly is pending Foundation confirmation.
+Whether to test Zaino's gRPC interface directly is TBD.
 
 ---
 
@@ -49,7 +49,7 @@ Whether to test Zaino's gRPC interface directly is pending Foundation confirmati
 
 | Interface | Port | Protocol | Used by simulator? |
 |---|---|---|---|
-| LightWallet gRPC | 8137 | gRPC | No (pending Foundation confirmation) |
+| LightWallet gRPC | 8137 | gRPC | No (TBD) |
 | JSON-RPC | Configured via `json_server_settings` | JSON-RPC | No — Zaino is not in the JSON-RPC routing path |
 
 ---
@@ -87,6 +87,6 @@ Note: sensitive fields (`password`, `cookie`) must be in the config file, not en
 
 ---
 
-## Open questions
+## Open items
 
-- Foundation confirmation on whether Zaino's gRPC interface should be tested directly
+- Whether to test Zaino's `GetMempoolStream` / `GetMempoolTx` gRPC interface directly: TBD

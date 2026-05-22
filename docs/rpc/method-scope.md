@@ -1,7 +1,6 @@
 # RPC Method Scope — Z3 Exchange Simulator
 
-Confirmed method list for the engagement, organised by test category. Provisionally
-approved by the Foundation; final team sign-off pending.
+RPC method list organised by test category.
 
 ---
 

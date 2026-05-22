@@ -5,8 +5,8 @@
 > integration reference. This document covers Zebra's standalone configuration for
 > reference and for cases where building from source is needed.
 
-Integration reference for the Zebra full node. Covers build, regtest setup, RPC
-configuration, and open questions.
+Integration reference for the Zebra full node. Covers build, regtest setup, and RPC
+configuration.
 
 For a plain-English explanation of what Zebra is and its role in the stack, see
 [`docs/architecture/z3-overview.md`](../architecture/z3-overview.md).
@@ -98,11 +98,8 @@ For the method list served by Zebra, see the [RPC coverage matrix](../rpc/rpc-co
 
 ## Connection to other components
 
-In the expected topology, Zaino connects to Zebra to retrieve chain data. Zallet may
-also connect to Zebra directly for some operations (TBD).
-
-Expected startup order: **Zebra first**, then Zaino, then Zallet. Verify this assumption
-during integration.
+Zaino connects to Zebra to retrieve chain data. Startup order: Zebra first, then
+Zaino, then Zallet.
 
 ---
 
@@ -120,14 +117,6 @@ Full detail in [`docs/rpc/rpc-coverage-matrix.md`](../rpc/rpc-coverage-matrix.md
 
 ---
 
-## Known blockers
+## Open items
 
-None currently. Pinned commit is set; integration work can begin.
-
----
-
-## Questions for the Zebra team
-
-- What are the exact `[network.testnet_parameters]` fields required to activate regtest mode?
-- Are there known regtest limitations compared to mainnet that affect RPC behavior?
-- Are there example regtest configs in the repository's CI or test suite we can reference?
+- Exact `[network.testnet_parameters]` fields required to activate regtest mode: TBD — verify from Zebra's CI configs.

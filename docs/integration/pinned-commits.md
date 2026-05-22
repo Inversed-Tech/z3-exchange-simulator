@@ -1,25 +1,8 @@
 # Pinned Z3 Commits
 
-Reference for why commit pinning matters, how the current pins are managed, and how
-each simulator run records the exact versions it ran against.
-
----
-
-## Why pinning matters
-
-A finding is only meaningful if it is reproducible. Without pinning, a bug reported
-against "the current Z3" cannot be verified a week later if the stack has since changed.
-
-Pinning ensures that:
-
-- every benchmark run produces results comparable to every other run,
-- the Foundation and component teams can reproduce any finding exactly,
-- the findings report has a clear, verifiable scope.
-
-The pinned commits are fixed for the duration of the engagement. All findings in the
-report are anchored to these specific versions.
-
----
+All findings in the report are anchored to specific, fixed commits of each Z3 component.
+This makes every result reproducible: anyone with the same commits can re-run any
+scenario and verify any finding.
 
 ## What is pinned
 

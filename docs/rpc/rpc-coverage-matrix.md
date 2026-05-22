@@ -86,8 +86,8 @@ RPC Router via their respective gRPC endpoints.
 
 | Mechanism | Backend | Test category | zcashd equiv? | T/Z | Implemented? | Tested? | Parity | Notes |
 |---|---|---|---|---|---|---|---|---|
-| `Indexer.mempool_change()` | Zebra | — | No | Both | No | No | No-equiv | gRPC server-streaming. Pushes ADDED/INVALIDATED/MINED events per tx. Requires `--features indexer` build and `indexer_listen_addr` config. Scope TBD pending Foundation confirmation. |
-| `GetMempoolStream` | Zaino | — | No | Both | No | No | No-equiv | Zaino LightWallet gRPC. Scope TBD pending Foundation confirmation. |
+| `Indexer.mempool_change()` | Zebra | — | No | Both | No | No | No-equiv | gRPC server-streaming. Pushes ADDED/INVALIDATED/MINED events per tx. Requires `--features indexer` build and `indexer_listen_addr` config. |
+| `GetMempoolStream` | Zaino | — | No | Both | No | No | No-equiv | Zaino LightWallet gRPC. Whether to test directly: TBD. |
 
 ### Mining and block production
 
@@ -219,7 +219,6 @@ Zallet uses an account model that replaces zcashd's per-address generation.
 
 ---
 
-## Open questions
+## Open items
 
-1. Which zcashd methods have no Z3 equivalent beyond those already listed above?
-2. Zaino gRPC scope: should the simulator test `GetMempoolStream` / `GetMempoolTx` directly? Pending Foundation confirmation.
+- Zaino gRPC scope: whether to test `GetMempoolStream` / `GetMempoolTx` directly: TBD.

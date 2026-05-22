@@ -39,7 +39,8 @@ Flow fractions must sum to 1.0.
 | `burst` | Spike then recovery | TBD | TBD | Model sudden volume events |
 | `mixed` | Steady with shielded mix | TBD | TBD | Exercise full shielded RPC surface |
 
-Exact account counts and TPS targets will be calibrated based on Phase 1 findings.
+Account counts and TPS targets for non-smoke scenarios are calibrated after initial
+load runs establish baseline performance.
 
 ## Reproducibility
 
@@ -48,7 +49,3 @@ Each run records the scenario config hash in its manifest. A run is reproducible
 - the simulator commit is unchanged,
 - the Z3 component commits in `z3-commits.lock` are unchanged.
 
-## Open questions
-
-- What is the minimum target TPS for the steady-state scenario?
-- At what account count does the simulator itself become the bottleneck rather than Z3?

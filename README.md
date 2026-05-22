@@ -107,9 +107,6 @@ z3-exchange-simulator/
 
 ## Quickstart
 
-> The simulator is not yet fully implemented. These commands will work once the regtest
-> harness and RPC client are in place.
-
 ```sh
 # Clone the Z3 Docker Compose stack at the pinned commit
 make clone-z3

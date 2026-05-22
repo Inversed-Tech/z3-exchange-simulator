@@ -1,16 +1,6 @@
 # Z3 Stack Overview
 
-Plain-English overview of the Z3 stack for technical contributors who are new to Zcash.
-No prior blockchain knowledge assumed.
-
----
-
-## Purpose of this document
-
-This document explains what each Z3 component is, how they fit together, what the Z3
-meta-repository is, what regtest and RPC mean in practice, and where the simulator sits
-in relation to the stack. It is a starting point for contributors, not a complete
-reference.
+Plain-English overview of the Z3 stack. No prior blockchain knowledge assumed.
 
 For integration-level detail (how to run the stack, ports, config), see
 [`docs/integration/z3.md`](../integration/z3.md).

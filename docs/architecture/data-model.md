@@ -61,8 +61,8 @@ Represents a single Zcash address, either transparent or shielded.
 | `created_at` | `timestamp` | When the address was generated via Zallet | No |
 | `last_used_at` | `Option<timestamp>` | Last time a transaction involved this address | No |
 
-**Note on address types:** Whether Zallet generates Sapling or Orchard shielded addresses
-(or both) depends on the pinned commit. Confirm during Week 4 integration.
+**Note on address types:** Zallet at the pinned commit supports both Sapling and Orchard
+shielded address pools.
 
 ---
 
@@ -178,8 +178,8 @@ single hot-wallet address. Sweeps reduce the number of UTXOs the exchange manage
 | `intent_ids` | `Vec<string>` | One TransactionIntent per source address | No |
 | `created_at` | `timestamp` | When the sweep was triggered | No |
 
-**Note:** Sweep transactions with many inputs may have higher fees. Fee estimation for
-sweeps must be confirmed with the Zallet fee estimation API (TBD).
+**Note:** Sweep transactions with many inputs may have higher fees. The actual fee is
+always auto-computed by Zallet via ZIP 317 and read from the operation result.
 
 ---
 

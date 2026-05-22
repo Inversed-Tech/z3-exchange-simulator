@@ -48,35 +48,19 @@ Binary: `external/zallet/target/release/zallet`
 
 ## Wallet initialization
 
-> TBD — verify the wallet initialization procedure for regtest before Week 4.
+Wallet initialization in regtest is handled by the Z3 Docker Compose stack's
+`./scripts/regtest-init.sh` script (see [`docs/integration/z3.md`](z3.md)).
 
-Items to identify:
-
-| Item | Status |
-|---|---|
-| How to create a new wallet in regtest | TBD |
-| How to seed the wallet deterministically | TBD |
-| How to unlock/decrypt the wallet (if applicable) | TBD |
-| Where wallet data is stored | TBD |
-
-A key requirement for the simulator is **deterministic wallet seeding**: given the same
-seed value, the same set of accounts and addresses must be generated every run. Confirm
-whether Zallet supports this directly or whether the simulator must manage it externally.
+Open items:
+- Whether deterministic seeding (same seed → same accounts/addresses) is supported directly by Zallet, or must be managed externally by the simulator: TBD
 
 ---
 
 ## Connection to other Z3 components
 
-> TBD — the exact connection topology must be verified during Week 4.
-
-Zallet likely connects to Zaino and/or Zebra for chain data and transaction broadcasting.
-Items to confirm:
-
-| Item | Status |
-|---|---|
-| Does Zallet connect to Zaino, Zebra, or both? | TBD |
-| Connection protocol | TBD |
-| Required config fields for pointing Zallet at the rest of the stack | TBD |
+Within the Docker Compose stack, Zallet connects to Zaino (embedded as a library) and
+to Zebra for chain data and transaction broadcasting. Connection config is managed by
+the Z3 repo's `config/regtest/zallet.toml`.
 
 ---
 
@@ -142,44 +126,9 @@ completes. The proving time must be measured and recorded per run.
 
 ---
 
-## Configuration notes
-
-> TBD — verify config format from the repository README.
-
-Expected items to configure:
-
-- Connection to Zaino/Zebra
-- Wallet data directory
-- RPC listener address and port
-- Log level
-
----
-
 ## Startup order
-
-Based on the expected stack topology:
 
 1. Start Zebra in regtest mode
 2. Start Zaino, connected to Zebra
-3. **Start Zallet**, connected to Zaino/Zebra
+3. Start Zallet, connected to Zaino/Zebra
 4. Initialize wallet
-
-Verify this sequence during integration.
-
----
-
-## Known blockers
-
-- Zebra and Zaino integrations must be complete before Zallet integration begins.
-- Pinned commit set to the latest main as of 2026-05-18; to be reviewed with the Foundation at kickoff.
-
----
-
-## Questions for the Zallet team / Foundation
-
-- Does Zallet connect to Zaino, Zebra, or both — and via what protocol?
-- Which RPC methods are available in the target commit?
-- Is shielded transaction support complete in the target commit, or should we plan for
-  transparent-only in Week 4?
-- What is the recommended wallet initialization sequence for regtest?
-- Is deterministic wallet seeding (same seed → same addresses) supported?
