@@ -70,14 +70,16 @@ Models how a typical cryptocurrency exchange would operate on the Z3 stack:
 - Fee estimation (noting: fees are now auto-computed by Zallet via ZIP 317)
 
 ### 3. Z3 integration
-Drives all three Z3 components through their RPC interfaces:
+Drives the Z3 Docker Compose stack through its unified RPC Router endpoint (`:8181`
+in regtest). The router transparently forwards calls to the correct backend:
 - **Zebra** — block processing, chain state, regtest block generation
-- **Zaino** — blockchain data retrieval, address indexing, RPC passthrough
 - **Zallet** — wallet operations: account creation, address derivation, transaction
   construction and signing, balance queries, async shielded transaction tracking
+- **Zaino** — runs as a library inside Zallet (for indexing) and as a standalone gRPC
+  container for light clients; not a direct JSON-RPC target
 
-Every RPC call is recorded (method, component, latency, success/failure) for the
-compatibility matrix and latency histograms.
+Every RPC call is recorded (method, backend, latency, success/failure) for the
+compatibility matrix and per-method latency histograms.
 
 ### 4. Observability
 Captures, during each run:

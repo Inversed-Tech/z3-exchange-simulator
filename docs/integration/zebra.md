@@ -1,7 +1,12 @@
 # Zebra Integration Notes
 
+> **In normal usage, Zebra runs inside the Z3 Docker Compose stack.** The simulator
+> does not start Zebra directly — see [`docs/integration/z3.md`](z3.md) for the primary
+> integration reference. This document covers Zebra's standalone configuration for
+> reference and for cases where building from source is needed.
+
 Integration reference for the Zebra full node. Covers build, regtest setup, RPC
-configuration, and open questions to resolve during integration.
+configuration, and open questions.
 
 For a plain-English explanation of what Zebra is and its role in the stack, see
 [`docs/architecture/z3-overview.md`](../architecture/z3-overview.md).

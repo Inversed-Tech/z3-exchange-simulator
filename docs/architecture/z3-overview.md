@@ -7,12 +7,13 @@ No prior blockchain knowledge assumed.
 
 ## Purpose of this document
 
-This document explains what each Z3 component is, how they fit together, what regtest
-and RPC mean in practice, and where the simulator sits in relation to the stack. It is a
-starting point for contributors, not a complete reference.
+This document explains what each Z3 component is, how they fit together, what the Z3
+meta-repository is, what regtest and RPC mean in practice, and where the simulator sits
+in relation to the stack. It is a starting point for contributors, not a complete
+reference.
 
-For integration-level detail (build instructions, config, known blockers), see the
-per-component notes under [`docs/integration/`](../integration/).
+For integration-level detail (how to run the stack, ports, config), see
+[`docs/integration/z3.md`](../integration/z3.md).
 
 ---
 
@@ -38,20 +39,20 @@ different demands on the Z3 stack.
 ## The Z3 stack
 
 Z3 refers to three components being developed by the Zcash Foundation and its partners
-as the modern replacement for the deprecated `zcashd` reference client.
+as the modern replacement for the deprecated `zcashd` reference client — plus a
+**meta-repository** that ties them together as a deployable stack.
 
 ### Zebra
 
 **What it is:** The Zcash full node.
 
-A full node is a program that maintains a complete, up-to-date copy of the Zcash
-blockchain and participates in the peer-to-peer network. Zebra validates every transaction
-and block according to the Zcash protocol rules and serves as the source of truth for
-chain state.
+A full node maintains a complete, up-to-date copy of the Zcash blockchain and
+participates in the peer-to-peer network. Zebra validates every transaction and block
+and serves as the source of truth for chain state.
 
 **Role in this project:** Zebra is the base layer. Every transaction the simulator sends
-ultimately flows through Zebra for validation and inclusion in the chain. In regtest mode
-(see below), Zebra runs a private local chain that we control entirely.
+ultimately flows through Zebra for validation and inclusion in the chain. In regtest mode,
+Zebra runs a private local chain that we control entirely.
 
 **Repository:** https://github.com/ZcashFoundation/zebra
 
@@ -59,16 +60,22 @@ ultimately flows through Zebra for validation and inclusion in the chain. In reg
 
 ### Zaino
 
-**What it is:** The blockchain data access and indexing layer.
+**What it is:** The blockchain indexing layer.
 
-Zaino sits between clients (like wallets or the simulator) and Zebra. It indexes chain
-data, answers queries about blocks and transactions, and acts as an RPC passthrough for
-certain methods. Think of it as a read-optimised service layer that shields clients from
-having to talk directly to the full node for every data request.
+Zaino provides indexed access to chain data — address balances, transaction history, UTXO
+sets — and exposes the LightWallet gRPC interface (`CompactTxStreamer`) for light wallet
+clients.
 
-**Role in this project:** The simulator is expected to use Zaino for chain data retrieval
-and some RPC calls. Which methods Zaino handles vs. forwards to Zebra must be confirmed
-during integration.
+**Role in this project:** Zaino operates in two modes within the Z3 stack:
+
+1. **As a library inside Zallet** — Zallet embeds Zaino's indexing code directly. When
+   the simulator calls Zallet's wallet methods, Zaino's indexing runs transparently inside
+   the same process.
+2. **As a standalone gRPC container** — Zaino runs separately to serve light wallet
+   clients via the LightWallet gRPC protocol on port 8137.
+
+The simulator does not call Zaino directly via JSON-RPC. Zaino's latency is implicit in
+Zallet method response times.
 
 **Repository:** https://github.com/zingolabs/zaino
 
@@ -80,13 +87,34 @@ during integration.
 
 A wallet manages private keys, derives addresses, tracks balances, constructs
 transactions, and broadcasts them to the network. Zallet is the next-generation wallet
-designed to replace the wallet functionality that was previously bundled inside `zcashd`.
+designed to replace the wallet functionality previously bundled inside `zcashd`.
 
 **Role in this project:** The simulator uses Zallet for all wallet operations: generating
 synthetic deposit addresses, querying balances, constructing and signing transactions
 (both transparent and shielded), and broadcasting them.
 
 **Repository:** https://github.com/zcash/wallet
+
+---
+
+### Z3 meta-repository
+
+**What it is:** A Docker Compose orchestration repository.
+
+The Z3 meta-repository (`https://github.com/ZcashFoundation/z3`) is not a Rust codebase
+— it ties together Zebra, Zaino, and Zallet into a single deployable Docker Compose
+stack. It provides:
+
+- Pre-built Docker images for each component
+- Configuration files for mainnet, testnet, and regtest
+- A regtest initialization script
+- An **RPC Router** (regtest only): a single JSON-RPC endpoint at `:8181` that
+  transparently forwards calls to the correct backend
+
+**The simulator drives the Z3 stack by starting this Docker Compose stack and issuing
+all RPC calls to the RPC Router.** See [`docs/integration/z3.md`](../integration/z3.md).
+
+**Repository:** https://github.com/ZcashFoundation/z3
 
 ---
 
@@ -135,61 +163,62 @@ The response is also JSON:
 }
 ```
 
-This is the same interface style used by `zcashd` and Bitcoin Core. Most Z3 components
-expose an RPC endpoint that the simulator's RPC client module calls directly.
-
-The **RPC coverage matrix** (`docs/rpc/rpc-coverage-matrix.md`) tracks which methods the
-simulator exercises, which component serves each, and how behavior compares to `zcashd`.
-
 ---
 
 ## How the simulator interacts with Z3
 
-The simulator drives the Z3 stack by issuing RPC calls to its components. At a high
-level:
+The simulator drives the Z3 stack by issuing all RPC calls to the **RPC Router** — a
+single endpoint at `:8181` that is part of the Z3 regtest stack. The router handles
+forwarding each call to the correct backend (Zebra or Zallet) transparently.
+
+At a high level:
 
 1. The **scenario runner** reads a scenario config and provisions synthetic accounts.
-2. It uses **Zallet** to generate deposit addresses, create transactions, and query
-   balances.
-3. **Zaino** provides chain data (block heights, transaction status, mempool state).
-4. **Zebra** is the underlying node that validates and records everything on the local
-   regtest chain.
-5. The **metrics module** records latency, success/failure, and resource usage throughout.
+2. It uses **Zallet** (via the router) to generate deposit addresses, create transactions,
+   and query balances.
+3. It uses **Zebra** (via the router) for chain data: block heights, transaction lookup,
+   mempool state, and regtest block production.
+4. The **metrics module** records per-method latency, success/failure, and resource usage
+   throughout.
 
 ---
 
-## Expected local development topology
+## Actual deployment topology
 
 ```
-┌─────────────────────────────────────────┐
-│  z3-exchange-simulator (this project)   │
-│                                         │
-│  ┌──────────┐    ┌───────────────────┐  │
-│  │ Scenario │───▶│   RPC Client      │  │
-│  │ Runner   │    │  (src/rpc/)       │  │
-│  └──────────┘    └────────┬──────────┘  │
-│                           │             │
-└───────────────────────────┼─────────────┘
-                            │ RPC calls
-          ┌─────────────────┼─────────────────┐
-          │                 │                  │
-          ▼                 ▼                  ▼
-      ┌────────┐       ┌─────────┐       ┌──────────┐
-      │ Zallet │       │  Zaino  │       │  Zebra   │
-      │(wallet)│       │(indexer)│       │ (node)   │
-      └────────┘       └────┬────┘       └────┬─────┘
-                            │                 │
-                            └────────▶────────┘
-                                   │
-                         ┌─────────▼──────────┐
-                         │  local regtest chain│
-                         └────────────────────┘
+┌──────────────────────────────────────────────┐
+│  z3-exchange-simulator (this project)        │
+│                                              │
+│  ┌──────────┐    ┌────────────────────────┐  │
+│  │ Scenario │───▶│   RPC Client           │  │
+│  │ Runner   │    │  (src/rpc/)            │  │
+│  └──────────┘    └──────────┬─────────────┘  │
+│                             │                │
+└─────────────────────────────┼────────────────┘
+                              │ JSON-RPC
+                              ▼
+                    ┌─────────────────┐
+                    │   RPC Router    │  :8181
+                    │  (Z3 regtest)   │
+                    └────────┬────────┘
+                             │ routes by method name
+              ┌──────────────┴──────────────┐
+              ▼                             ▼
+        ┌──────────┐                  ┌──────────┐
+        │  Zebra   │ :18232           │  Zallet  │ :28232
+        │(full node│                  │ (wallet) │
+        └──────────┘                  └────┬─────┘
+              │                           │ Zaino embedded
+              │                      ┌────▼──────┐
+              └──────────────────────│   Chain   │
+                                     │  (regtest)│
+                                     └───────────┘
+                                     
+         ┌──────────┐
+         │  Zaino   │ :8137  ← gRPC only, for light clients
+         │  (gRPC)  │            not called by simulator
+         └──────────┘
 ```
-
-**Important:** The exact routing between these components — which methods go to Zallet,
-which to Zaino, which directly to Zebra — is not yet verified. The diagram above reflects
-the expected topology based on each component's stated role. Actual routing will be
-confirmed and corrected during integration testing.
 
 ---
 
@@ -203,21 +232,9 @@ The Z3 stack replaces `zcashd` by splitting those responsibilities:
 | Old (`zcashd`) | New (Z3) |
 |---|---|
 | Full node | Zebra |
-| Blockchain data / indexing | Zaino |
+| Blockchain data / indexing | Zaino (as Zallet library + standalone gRPC) |
 | Wallet | Zallet |
+| Single RPC endpoint | RPC Router (routes to Zebra or Zallet) |
 
 The RPC coverage matrix tracks which `zcashd` RPC methods have Z3 equivalents and where
 there are behavioral differences.
-
----
-
-## Open architecture questions
-
-These must be answered during integration testing. Until then, treat any claim about
-routing or method support as provisional.
-
-- Which RPC methods does Zebra expose directly in regtest?
-- Which methods does Zaino handle vs. forward to Zebra?
-- Which methods does Zallet expose, and does it talk to Zaino, Zebra, or both?
-- What is the startup order for the three components?
-- Are there regtest-specific limitations in any component vs. mainnet?

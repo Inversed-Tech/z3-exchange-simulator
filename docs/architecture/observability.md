@@ -67,27 +67,36 @@ One JSON object per line, written at regular intervals during the run. Captures 
 state of the simulator and the Z3 stack over time.
 
 ```json
-{"run_id":"20260602T140000Z-smoke","timestamp":"2026-06-02T14:00:05Z","metric_name":"mempool_tx_count","value":3.0,"labels":{"component":"Zaino"}}
+{"run_id":"20260602T140000Z-smoke","timestamp":"2026-06-02T14:00:05Z","metric_name":"mempool_tx_count","value":3.0,"labels":{}}
 {"run_id":"20260602T140000Z-smoke","timestamp":"2026-06-02T14:00:05Z","metric_name":"confirmed_txs_total","value":1.0,"labels":{"flow_type":"t_to_t"}}
-{"run_id":"20260602T140000Z-smoke","timestamp":"2026-06-02T14:00:05Z","metric_name":"rpc_latency_ms","value":12.0,"labels":{"method":"getblockchaininfo","component":"Zebra","percentile":"p99"}}
+{"run_id":"20260602T140000Z-smoke","timestamp":"2026-06-02T14:00:05Z","metric_name":"rpc_latency_ms","value":12.0,"labels":{"method":"getblockchaininfo","percentile":"p99"}}
 {"run_id":"20260602T140000Z-smoke","timestamp":"2026-06-02T14:00:05Z","metric_name":"active_accounts","value":5.0,"labels":{}}
 ```
+
+Latency is measured **per method**, not per component. All calls go through the Z3 RPC
+Router, so there is no per-component latency attribution for JSON-RPC calls. Zaino's
+latency is folded into Zallet method response times implicitly.
+
+The `backend` label (Zebra or Zallet) is available for grouping if needed, derived from
+the method's routing table.
 
 ### Planned metric names
 
 | Metric | Labels | Description |
 |---|---|---|
-| `rpc_call_total` | `method`, `component`, `success` | Running count of RPC calls |
-| `rpc_latency_ms` | `method`, `component`, `percentile` | Latency percentiles (p50, p95, p99) |
-| `mempool_tx_count` | `component` | Number of transactions in the mempool |
+| `rpc_call_total` | `method`, `backend`, `success` | Running count of RPC calls |
+| `rpc_latency_ms` | `method`, `backend`, `percentile` | Latency percentiles (p50, p95, p99) |
+| `mempool_tx_count` | — | Number of transactions in the mempool |
 | `confirmed_txs_total` | `flow_type` | Cumulative confirmed transactions |
 | `failed_txs_total` | `flow_type`, `reason` | Cumulative failed transactions |
 | `deposit_confirmation_time_ms` | — | Time from deposit detection to credit |
 | `proving_time_ms` | — | ZK proof generation time for shielded txs |
 | `active_accounts` | — | Accounts actively transacting at sample time |
-| `block_height` | `component` | Current chain height as seen by each component |
+| `block_height` | — | Current chain height |
 | `tps_achieved` | — | Observed transactions per second vs. target |
 | `mempool_saturation_event` | `threshold` | Recorded once when mempool depth crosses the saturation threshold; value is the observed depth at crossing |
+| `process_cpu_percent` | `process` | CPU usage of each Docker container (Zebra, Zaino, Zallet) |
+| `process_memory_mb` | `process` | Memory usage of each Docker container |
 
 Metric sampling interval: **5 seconds** by default, configurable per-scenario via
 `observability.metric_sampling_interval_secs` in the scenario YAML. Use 1s for burst

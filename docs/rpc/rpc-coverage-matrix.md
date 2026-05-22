@@ -1,20 +1,11 @@
 # RPC Coverage Matrix
 
-Tracks which RPC methods the simulator exercises, which Z3 component serves each method,
-zcashd behavioral parity, and test status. Updated continuously through the engagement.
+Tracks which RPC methods the simulator exercises, which Z3 backend serves each method,
+test category, zcashd behavioral parity, and implementation status.
 
-Method names and component assignments are verified against the pinned commits:
-- Zebra `d4cd662` — source: `zebra-rpc/src/methods.rs`
-- Zaino `4ddbfd2` — source: `zaino-serve/src/rpc/jsonrpc/service.rs`
-- Zallet `05926f3` — source: Zallet JSON-RPC method registrations
-
----
-
-## Critical caveat
-
-**The "Required by RFP?" column is pending Foundation confirmation.** A proposed method
-list has been prepared for Foundation review at
-[`docs/rpc/proposed-method-scope.md`](proposed-method-scope.md).
+All calls go through the Z3 RPC Router at `:8181`. The "Backend" column shows which
+component the router forwards each call to — this is for documentation and report
+attribution only. The simulator does not select backends directly.
 
 ---
 
@@ -22,15 +13,15 @@ list has been prepared for Foundation review at
 
 | Column | Meaning |
 |---|---|
-| **Method** | RPC method name — verified against pinned commit source code. |
-| **Component** | Z3 component that serves this method. |
-| **Required by RFP?** | Whether this method appears in the Foundation's RFP requirements. Pending confirmation. |
-| **zcashd equiv?** | Whether an equivalent method existed in zcashd. |
-| **T/Z** | Which address pool: T = transparent, Z = shielded, Both, N/A. |
-| **Implemented?** | Whether the simulator's RPC client can call this method yet. |
-| **Tested?** | Whether the simulator has successfully called this method against a live Z3 stack. |
-| **Parity** | Behavioral parity with zcashd: TBD / Confirmed / Deviation / No-equiv. |
-| **Notes** | Caveats, deviations, or open questions specific to this method. |
+| **Method** | RPC method name |
+| **Backend** | Component the RPC Router forwards this call to: Zebra or Zallet |
+| **Test category** | Stress = exercised under load; Smoke = called once for compatibility |
+| **zcashd equiv?** | Whether an equivalent method existed in zcashd |
+| **T/Z** | Address pool: T = transparent, Z = shielded, Both, N/A |
+| **Implemented?** | Whether the simulator's RPC client can call this method yet |
+| **Tested?** | Whether the simulator has called this method against a live Z3 stack |
+| **Parity** | Behavioral parity with zcashd: TBD / Confirmed / Deviation / No-equiv |
+| **Notes** | Caveats or deviations specific to this method |
 
 ---
 
@@ -42,7 +33,7 @@ list has been prepared for Foundation review at
 | Yes / No | Confirmed fact |
 | Confirmed | Behavior matches zcashd |
 | Deviation | Behavior differs from zcashd — see Notes |
-| No-equiv | No zcashd equivalent exists (new in Z3, or method name changed entirely) |
+| No-equiv | No zcashd equivalent exists |
 
 ---
 
@@ -50,130 +41,169 @@ list has been prepared for Foundation review at
 
 ### Chain info
 
-| Method | Component | Required by RFP? | zcashd equiv? | T/Z | Implemented? | Tested? | Parity | Notes |
+| Method | Backend | Test category | zcashd equiv? | T/Z | Implemented? | Tested? | Parity | Notes |
 |---|---|---|---|---|---|---|---|---|
-| `getblockchaininfo` | Zebra / Zaino | TBD | Yes | N/A | No | No | TBD | Zaino proxies to Zebra. Key smoke-test method. |
-| `getblockcount` | Zebra / Zaino | TBD | Yes | N/A | No | No | TBD | Zaino proxies to Zebra. |
-| `getbestblockhash` | Zebra / Zaino | TBD | Yes | N/A | No | No | TBD | Zaino proxies to Zebra. |
-| `getbestblockheightandhash` | Zebra | TBD | No | N/A | No | No | No-equiv | Returns height and hash together in one call. Zebra-specific; not in zcashd or Zaino. |
+| `getblockchaininfo` | Zebra | Stress | Yes | N/A | No | No | TBD | Primary smoke signal; called at the start of every run. |
+| `getblockcount` | Zebra | Stress | Yes | N/A | No | No | TBD | |
+| `getbestblockhash` | Zebra | Stress | Yes | N/A | No | No | TBD | |
+| `getbestblockheightandhash` | Zebra | — | No | N/A | No | No | No-equiv | Zebra-specific combined call; not in Foundation's confirmed method list. |
 
 ### Block lookup
 
-| Method | Component | Required by RFP? | zcashd equiv? | T/Z | Implemented? | Tested? | Parity | Notes |
+| Method | Backend | Test category | zcashd equiv? | T/Z | Implemented? | Tested? | Parity | Notes |
 |---|---|---|---|---|---|---|---|---|
-| `getblock` | Zebra / Zaino | TBD | Yes | N/A | No | No | TBD | Zaino proxies to Zebra. |
-| `getblockhash` | Zebra | TBD | Yes | N/A | No | No | TBD | Not present in Zaino at pinned commit — call Zebra directly. |
-| `getblockheader` | Zebra / Zaino | TBD | Yes | N/A | No | No | TBD | Zaino proxies to Zebra. |
+| `getblock` | Zebra | Stress | Yes | N/A | No | No | TBD | |
+| `getblockhash` | Zebra | Stress | Yes | N/A | No | No | TBD | |
+| `getblockheader` | Zebra | Stress | Yes | N/A | No | No | TBD | |
 
 ### Transaction lookup
 
-| Method | Component | Required by RFP? | zcashd equiv? | T/Z | Implemented? | Tested? | Parity | Notes |
+| Method | Backend | Test category | zcashd equiv? | T/Z | Implemented? | Tested? | Parity | Notes |
 |---|---|---|---|---|---|---|---|---|
-| `getrawtransaction` | Zebra / Zaino / Zallet | TBD | Yes | Both | No | No | TBD | Zaino handles natively from its indexer. Present in all three components. |
-| `decoderawtransaction` | Zallet | TBD | Yes | Both | No | No | TBD | Only in Zallet; not exposed by Zebra or Zaino at pinned commits. |
-| `gettxout` | Zebra / Zaino | TBD | Yes | T | No | No | TBD | Zaino proxies to Zebra. |
+| `getrawtransaction` | Zebra + Zallet | Stress | Yes | Both | No | No | TBD | Listed under both backends in Foundation's method scope. |
+| `decoderawtransaction` | Zallet | — | Yes | Both | No | No | TBD | Not in Foundation's confirmed list. |
+| `gettxout` | Zebra | Stress | Yes | T | No | No | TBD | |
 
 ### Address-indexed lookup
 
-These methods query chain state by transparent address, without wallet context.
-Useful for monitoring deposit addresses independently of the wallet.
-
-| Method | Component | Required by RFP? | zcashd equiv? | T/Z | Implemented? | Tested? | Parity | Notes |
+| Method | Backend | Test category | zcashd equiv? | T/Z | Implemented? | Tested? | Parity | Notes |
 |---|---|---|---|---|---|---|---|---|
-| `getaddressbalance` | Zebra / Zaino | TBD | Yes | T | No | No | TBD | Zaino handles natively from its indexer. |
-| `getaddresstxids` | Zebra / Zaino | TBD | Yes | T | No | No | TBD | Zaino handles natively from its indexer. |
-| `getaddressutxos` | Zebra / Zaino | TBD | Yes | T | No | No | TBD | Zaino handles natively from its indexer. |
+| `getaddressbalance` | Zebra | Stress | Yes | T | No | No | TBD | |
+| `getaddresstxids` | Zebra | Stress | Yes | T | No | No | TBD | |
+| `getaddressutxos` | Zebra | Stress | Yes | T | No | No | TBD | |
 
 ### Mempool
 
-| Method | Component | Required by RFP? | zcashd equiv? | T/Z | Implemented? | Tested? | Parity | Notes |
+| Method | Backend | Test category | zcashd equiv? | T/Z | Implemented? | Tested? | Parity | Notes |
 |---|---|---|---|---|---|---|---|---|
-| `getrawmempool` | Zebra / Zaino | TBD | Yes | Both | No | No | TBD | Zaino handles natively from its indexer. Core signal for mempool saturation. |
-| `getmempoolinfo` | Zebra / Zaino | TBD | Yes | N/A | No | No | TBD | Zaino handles natively from its indexer. |
+| `getrawmempool` | Zebra | Stress | Yes | Both | No | No | TBD | Core mempool saturation signal. |
+| `getmempoolinfo` | Zebra | Stress | Yes | N/A | No | No | TBD | |
 
-### Mempool notifications
+### Mempool notifications (gRPC)
 
-The proposal explicitly requires testing RPC client notifications for mempool changes.
-The notification mechanism in Z3 is unconfirmed (zcashd used ZMQ; Z3 may differ).
+These are push-based streaming interfaces, not JSON-RPC methods. Accessed outside the
+RPC Router via their respective gRPC endpoints.
 
-| Method / Mechanism | Component | Required by RFP? | zcashd equiv? | T/Z | Implemented? | Tested? | Parity | Notes |
+| Mechanism | Backend | Test category | zcashd equiv? | T/Z | Implemented? | Tested? | Parity | Notes |
 |---|---|---|---|---|---|---|---|---|
-| `Indexer.mempool_change()` (Zebra gRPC) | Zebra | TBD | No | Both | No | No | No-equiv | gRPC server-streaming, not ZMQ. Pushes ADDED/INVALIDATED/MINED events per tx. Requires `--features indexer` build and `indexer_listen_addr` config. |
-| `GetMempoolStream` (Zaino gRPC) | Zaino | TBD | No | Both | No | No | No-equiv | Streams all mempool transactions until next block. LightWallet gRPC protocol. |
+| `Indexer.mempool_change()` | Zebra | — | No | Both | No | No | No-equiv | gRPC server-streaming. Pushes ADDED/INVALIDATED/MINED events per tx. Requires `--features indexer` build and `indexer_listen_addr` config. Scope TBD pending Foundation confirmation. |
+| `GetMempoolStream` | Zaino | — | No | Both | No | No | No-equiv | Zaino LightWallet gRPC. Scope TBD pending Foundation confirmation. |
 
-### Wallet — accounts and addresses
+### Mining and block production
 
-Zallet uses an account model that replaces the per-address generation in zcashd.
-An account is created first (`z_getnewaccount`), then addresses are derived from it
-(`z_getaddressforaccount`). `getnewaddress` and `z_getnewaddress` do not exist in Zallet.
-
-| Method | Component | Required by RFP? | zcashd equiv? | T/Z | Implemented? | Tested? | Parity | Notes |
+| Method | Backend | Test category | zcashd equiv? | T/Z | Implemented? | Tested? | Parity | Notes |
 |---|---|---|---|---|---|---|---|---|
-| `z_getnewaccount` | Zallet | TBD | No | Both | No | No | No-equiv | Replaces `getnewaddress` + `z_getnewaddress`. Creates a named account; derive addresses from it with `z_getaddressforaccount`. |
-| `z_getaddressforaccount` | Zallet | TBD | No | Both | No | No | No-equiv | Derives a Unified Address (Orchard + transparent receivers) from an account. |
-| `z_listaccounts` | Zallet | TBD | No | Both | No | No | No-equiv | Lists all accounts in the wallet. |
-| `z_getaccount` | Zallet | TBD | No | Both | No | No | No-equiv | Returns details for a specific account. |
-| `listaddresses` | Zallet | TBD | No | Both | No | No | No-equiv | Lists all wallet addresses grouped by source. |
+| `getblocktemplate` | Zebra | Stress | Yes | N/A | No | No | TBD | Required to drive regtest block production. |
+| `submitblock` | Zebra | Stress | Yes | N/A | No | No | TBD | Submit a mined block. |
+| `generate` | Zebra | Smoke | Yes | N/A | No | No | TBD | Mine N blocks immediately in regtest. |
+| `getblocksubsidy` | Zebra | Smoke | Yes | N/A | No | No | TBD | |
+| `getdifficulty` | Zebra | Smoke | Yes | N/A | No | No | TBD | |
+| `getmininginfo` | Zebra | Smoke | Yes | N/A | No | No | TBD | |
+| `getnetworkhashps` | Zebra | Smoke | Yes | N/A | No | No | TBD | |
+| `getnetworksolps` | Zebra | Smoke | Yes | N/A | No | No | TBD | |
 
-### Wallet — balance
+### Network and peers
 
-| Method | Component | Required by RFP? | zcashd equiv? | T/Z | Implemented? | Tested? | Parity | Notes |
+| Method | Backend | Test category | zcashd equiv? | T/Z | Implemented? | Tested? | Parity | Notes |
 |---|---|---|---|---|---|---|---|---|
-| `z_getbalances` | Zallet | TBD | No | Both | No | No | No-equiv | Replaces `getbalance` + `z_getbalance`. Returns balances for all spending authorities. |
-| `z_gettotalbalance` | Zallet | TBD | Yes | Both | No | No | TBD | Transparent + shielded total. Same name as zcashd. |
+| `getpeerinfo` | Zebra | Stress | Yes | N/A | No | No | TBD | Verify regtest network state. |
+| `getnetworkinfo` | Zebra | Smoke | Yes | N/A | No | No | TBD | |
+| `getinfo` | Zebra | Smoke | Yes | N/A | No | No | TBD | |
+| `addnode` | Zebra | Smoke | Yes | N/A | No | No | TBD | |
+| `ping` | Zebra | Smoke | Yes | N/A | No | No | TBD | |
 
-### Wallet — address validation
+### Chain control
 
-| Method | Component | Required by RFP? | zcashd equiv? | T/Z | Implemented? | Tested? | Parity | Notes |
+| Method | Backend | Test category | zcashd equiv? | T/Z | Implemented? | Tested? | Parity | Notes |
 |---|---|---|---|---|---|---|---|---|
-| `validateaddress` | Zebra / Zaino / Zallet | TBD | Yes | T | No | No | TBD | Zaino proxies to Zebra. Present in all three components. |
-| `z_validateaddress` | Zebra / Zaino | TBD | Yes | Z | No | No | TBD | Zaino proxies to Zebra. Not present in Zallet at pinned commit. |
+| `invalidateblock` | Zebra | Smoke | Yes | N/A | No | No | TBD | Chain reorganization testing. |
+| `reconsiderblock` | Zebra | Smoke | Yes | N/A | No | No | TBD | Undo a previous `invalidateblock`. |
 
-### Transaction creation
+### Shielded tree state
 
-| Method | Component | Required by RFP? | zcashd equiv? | T/Z | Implemented? | Tested? | Parity | Notes |
+| Method | Backend | Test category | zcashd equiv? | T/Z | Implemented? | Tested? | Parity | Notes |
 |---|---|---|---|---|---|---|---|---|
-| `z_sendmany` | Zallet | TBD | Yes | Both | No | No | Deviation | `fee` parameter must be `null`; fee is always computed automatically via ZIP 317. Supports transparent and shielded outputs in one call. Returns an operation ID immediately (async). |
+| `z_gettreestate` | Zebra | Stress | Yes | Z | No | No | TBD | Sapling and Orchard commitment tree state at a block. |
+| `z_getsubtreesbyindex` | Zebra | Stress | No | Z | No | No | No-equiv | Subtree roots for the note commitment tree — shielded state size signal. |
 
-### Async operations
+### Address validation
 
-Shielded transactions require ZK proof generation, which takes time. Zallet handles this
-asynchronously: `z_sendmany` returns an operation ID immediately, and these methods
-are used to track it through to completion.
-
-| Method | Component | Required by RFP? | zcashd equiv? | T/Z | Implemented? | Tested? | Parity | Notes |
+| Method | Backend | Test category | zcashd equiv? | T/Z | Implemented? | Tested? | Parity | Notes |
 |---|---|---|---|---|---|---|---|---|
-| `z_getoperationstatus` | Zallet | TBD | Yes | Z | No | No | TBD | Returns current status of one or more async operations by ID. |
-| `z_getoperationresult` | Zallet | TBD | Yes | Z | No | No | TBD | Returns and removes result of completed async operations. |
-| `z_listoperationids` | Zallet | TBD | Yes | Z | No | No | TBD | Lists all known operation IDs, optionally filtered by status. |
+| `validateaddress` | Zebra | Smoke | Yes | T | No | No | TBD | |
+| `z_validateaddress` | Zebra | Smoke | Yes | Z | No | No | TBD | Not present in Zallet at pinned commit. |
+| `z_listunifiedreceivers` | Zebra + Zallet | Smoke | No | Both | No | No | No-equiv | Lists individual receivers within a Unified Address. Listed under both backends. |
 
 ### Transaction broadcast
 
-| Method | Component | Required by RFP? | zcashd equiv? | T/Z | Implemented? | Tested? | Parity | Notes |
+| Method | Backend | Test category | zcashd equiv? | T/Z | Implemented? | Tested? | Parity | Notes |
 |---|---|---|---|---|---|---|---|---|
-| `sendrawtransaction` | Zebra / Zaino | TBD | Yes | Both | No | No | TBD | Zaino proxies to Zebra. |
+| `sendrawtransaction` | Zebra | Stress | Yes | Both | No | No | TBD | |
 
-### Wallet — transaction history
+### Node control
 
-| Method | Component | Required by RFP? | zcashd equiv? | T/Z | Implemented? | Tested? | Parity | Notes |
+| Method | Backend | Test category | zcashd equiv? | T/Z | Implemented? | Tested? | Parity | Notes |
 |---|---|---|---|---|---|---|---|---|
-| `z_listunspent` | Zallet | TBD | Yes | Z | No | No | Deviation | Lists unspent shielded notes. Response format changed from zcashd: `amount` renamed to `value`; new fields added. |
-| `z_listtransactions` | Zallet | TBD | No | Both | No | No | No-equiv | Lists transactions filterable by account and block range. Not in zcashd. |
+| `rpc.discover` | Zebra + Zallet | Smoke | No | N/A | No | No | No-equiv | OpenRPC service discovery. |
+| `stop` | Zebra + Zallet | Smoke | Yes | N/A | No | No | TBD | Graceful shutdown — smoke only; not called during load runs. |
 
-### Regtest
+### Wallet — accounts and addresses
 
-These methods are only meaningful in regtest mode. Required for controlling block
-production and chain state during test scenarios.
+Zallet uses an account model that replaces zcashd's per-address generation.
+`getnewaddress` and `z_getnewaddress` do not exist in Zallet.
 
-| Method | Component | Required by RFP? | zcashd equiv? | T/Z | Implemented? | Tested? | Parity | Notes |
+| Method | Backend | Test category | zcashd equiv? | T/Z | Implemented? | Tested? | Parity | Notes |
 |---|---|---|---|---|---|---|---|---|
-| `generate` | Zebra | TBD | Yes | N/A | No | No | TBD | Mine N blocks immediately. Confirmed present in Zebra at pinned commit. |
+| `z_getnewaccount` | Zallet | Stress | No | Both | No | No | No-equiv | Replaces `getnewaddress` + `z_getnewaddress`. |
+| `z_getaddressforaccount` | Zallet | Stress | No | Both | No | No | No-equiv | Derives a Unified Address from an account. |
+| `z_listaccounts` | Zallet | Stress | No | Both | No | No | No-equiv | |
+| `z_getaccount` | Zallet | Stress | No | Both | No | No | No-equiv | |
+| `listaddresses` | Zallet | Stress | No | Both | No | No | No-equiv | |
+
+### Wallet — balance
+
+| Method | Backend | Test category | zcashd equiv? | T/Z | Implemented? | Tested? | Parity | Notes |
+|---|---|---|---|---|---|---|---|---|
+| `z_getbalances` | Zallet | — | No | Both | No | No | No-equiv | Not in Foundation's confirmed list. Replaces `getbalance` + `z_getbalance`. |
+| `z_gettotalbalance` | Zallet | Stress | Yes | Both | No | No | TBD | |
+
+### Transaction creation
+
+| Method | Backend | Test category | zcashd equiv? | T/Z | Implemented? | Tested? | Parity | Notes |
+|---|---|---|---|---|---|---|---|---|
+| `z_sendmany` | Zallet | Stress | Yes | Both | No | No | Deviation | `fee` must be `null`; auto-computed via ZIP 317. Returns operation ID immediately (async). |
+
+### Async operations
+
+| Method | Backend | Test category | zcashd equiv? | T/Z | Implemented? | Tested? | Parity | Notes |
+|---|---|---|---|---|---|---|---|---|
+| `z_getoperationstatus` | Zallet | Stress | Yes | Z | No | No | TBD | |
+| `z_getoperationresult` | Zallet | Stress | Yes | Z | No | No | TBD | |
+| `z_listoperationids` | Zallet | Stress | Yes | Z | No | No | TBD | |
+
+### Wallet — transaction history and notes
+
+| Method | Backend | Test category | zcashd equiv? | T/Z | Implemented? | Tested? | Parity | Notes |
+|---|---|---|---|---|---|---|---|---|
+| `z_listunspent` | Zallet | Stress | Yes | Z | No | No | Deviation | `amount` renamed to `value`; new fields added vs zcashd. |
+| `z_listtransactions` | Zallet | Stress | No | Both | No | No | No-equiv | Not in zcashd. |
+| `z_getnotescount` | Zallet | Stress | No | Z | No | No | No-equiv | Count of unspent notes — shielded state size signal. |
+| `z_viewtransaction` | Zallet | Stress | Yes | Both | No | No | TBD | Decode full wallet transaction details. |
+| `z_recoveraccounts` | Zallet | Stress | No | Both | No | No | No-equiv | Recover accounts from wallet seed. |
+| `getrawtransaction` | Zebra + Zallet | Stress | Yes | Both | No | No | TBD | See Transaction lookup section above. |
+
+### Wallet — management
+
+| Method | Backend | Test category | zcashd equiv? | T/Z | Implemented? | Tested? | Parity | Notes |
+|---|---|---|---|---|---|---|---|---|
+| `getwalletinfo` | Zallet | Smoke | Yes | N/A | No | No | TBD | |
+| `walletlock` | Zallet | Smoke | Yes | N/A | No | No | TBD | |
+| `walletpassphrase` | Zallet | Smoke | Yes | N/A | No | No | TBD | |
+| `help` | Zallet | Smoke | Yes | N/A | No | No | TBD | |
 
 ---
 
 ## Removed or replaced from zcashd
-
-These methods existed in zcashd but are not present in Z3 at the pinned commits.
 
 | Old method | Status in Z3 | Replacement |
 |---|---|---|
@@ -191,5 +221,5 @@ These methods existed in zcashd but are not present in Z3 at the pinned commits.
 
 ## Open questions
 
-1. What is the complete RFP method list from the Foundation? See [`docs/rpc/proposed-method-scope.md`](proposed-method-scope.md).
-2. Which zcashd methods have no Z3 equivalent beyond those already listed above?
+1. Which zcashd methods have no Z3 equivalent beyond those already listed above?
+2. Zaino gRPC scope: should the simulator test `GetMempoolStream` / `GetMempoolTx` directly? Pending Foundation confirmation.

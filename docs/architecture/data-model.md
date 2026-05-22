@@ -193,7 +193,7 @@ recorded, whether it succeeds or fails. Written to `rpc_calls.jsonl` per run.
 | `call_id` | `string` | UUID for this call | No |
 | `run_id` | `string` | Which simulator run | No |
 | `method` | `string` | RPC method name (e.g. `getblockchaininfo`) | No |
-| `component` | `enum(Zebra, Zaino, Zallet, Unknown)` | Which Z3 component was called | Yes — Z3-specific |
+| `backend` | `enum(Zebra, Zallet, Unknown)` | Which backend the RPC Router forwarded this call to — derived from the method's routing table, not from which URL was called | Yes — Z3-specific |
 | `params_hash` | `Option<string>` | SHA-256 of serialised params (omit sensitive values) | No |
 | `request_at` | `timestamp` | When the call was sent | No |
 | `response_at` | `Option<timestamp>` | When the response arrived | No |

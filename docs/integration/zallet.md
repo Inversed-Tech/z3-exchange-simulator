@@ -1,8 +1,12 @@
 # Zallet Integration Notes
 
+> **In normal usage, Zallet runs inside the Z3 Docker Compose stack.** The simulator
+> does not start Zallet directly — see [`docs/integration/z3.md`](z3.md) for the primary
+> integration reference. This document covers Zallet's standalone configuration for
+> reference and for cases where building from source is needed.
+
 Integration reference for the Zallet wallet component. Covers build, wallet
-initialization, RPC surface, transparent and shielded operations, and open questions to
-resolve during integration.
+initialization, RPC surface, transparent and shielded operations, and open questions.
 
 For a plain-English explanation of what Zallet is and its role in the stack, see
 [`docs/architecture/z3-overview.md`](../architecture/z3-overview.md).

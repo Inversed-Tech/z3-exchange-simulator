@@ -34,14 +34,16 @@ pinned commits of each component.
 
 ## Z3 components
 
-The simulator drives three components that together make up the next-generation Zcash wallet
-stack:
+The simulator drives the Z3 Docker Compose stack — a unified deployment of three
+components plus an RPC Router:
 
 | Component | Role | Repository |
 |---|---|---|
+| **Z3 stack** | Docker Compose orchestration — the primary testing target | https://github.com/ZcashFoundation/z3 |
 | **Zebra** | Zcash full node — validates and maintains the local chain state | https://github.com/ZcashFoundation/zebra |
-| **Zaino** | Blockchain data access, indexing, and RPC passthrough layer | https://github.com/zingolabs/zaino |
+| **Zaino** | Blockchain indexing — embedded in Zallet as a library; also standalone gRPC | https://github.com/zingolabs/zaino |
 | **Zallet** | Wallet — address generation, signing, transaction broadcasting | https://github.com/zcash/wallet |
+| **RPC Router** | Single JSON-RPC endpoint (`:8181`) routing calls to Zebra or Zallet | Part of Z3 repo |
 
 See [`docs/architecture/z3-overview.md`](docs/architecture/z3-overview.md) for a plain-English
 explanation of how these fit together and how the simulator interacts with them.
@@ -64,11 +66,13 @@ z3-exchange-simulator/
       data-model.md                  Simulator data model
       observability.md               Metrics and experiment output structure
     integration/
-      zebra.md                       Zebra build, run, and config notes
-      zaino.md                       Zaino build, run, and config notes
-      zallet.md                      Zallet build, run, and config notes
-      pinned-commits.md              Commit pinning rationale and process
+      z3.md                          Z3 Docker Compose stack — primary integration reference
+      zebra.md                       Zebra standalone build and config notes
+      zaino.md                       Zaino role and standalone config notes
+      zallet.md                      Zallet standalone build and config notes
+      pinned-commits.md              Commit pinning rationale
     rpc/rpc-coverage-matrix.md       RPC method coverage and zcashd parity matrix
+    rpc/method-scope.md              Confirmed method list: stress vs smoke split
     scenarios/scenario-design.md     Scenario library design
 
   configs/
@@ -76,7 +80,7 @@ z3-exchange-simulator/
     local/                           Local environment overrides (gitignored)
 
   scripts/
-    dev/clone-z3.sh                  Clone and check out pinned Z3 repositories
+    dev/clone-z3.sh                  Clone the pinned Z3 Docker Compose repository
     experiments/                     Experiment automation scripts
 
   src/                               Simulator source code (Rust)
@@ -107,26 +111,32 @@ z3-exchange-simulator/
 > harness and RPC client are in place.
 
 ```sh
-# Clone pinned Z3 component repositories
+# Clone the Z3 Docker Compose stack at the pinned commit
 make clone-z3
+
+# Start the Z3 regtest stack (one-time init, then up)
+cd external/z3 && ./scripts/regtest-init.sh
+docker compose --env-file .env.regtest up -d
 
 # Build the simulator binary
 make build
 
-# Run the smoke scenario (requires a running Z3 regtest stack)
+# Run the smoke scenario
 ./target/debug/z3sim run --scenario configs/scenarios/smoke.yaml
 ```
 
-## Pinned component commits
+## Pinned commits
 
-All benchmark runs reference the commits in [`z3-commits.lock`](z3-commits.lock). Findings
-in the report are only valid for these specific component versions.
+All benchmark runs reference the commits in [`z3-commits.lock`](z3-commits.lock).
+The primary pin is the Z3 meta-repository; individual component commits are candidates
+pending Foundation confirmation.
 
-| Component | Pinned commit |
-|---|---|
-| Zebra | `d4cd662c716382f6397d2a730148025a1ca79fec` |
-| Zaino | `4ddbfd29c9f0e74f20b4d5bf81f51042aae4302a` |
-| Zallet | `05926f3f3ec1b1d90348ae899628cc0e28547ef3` |
+| Entity | Pinned commit | Status |
+|---|---|---|
+| Z3 stack | TBD | Pending Foundation confirmation |
+| Zebra | `aba329d6dca884f6d42bb4d36bda0010a071c2fc` | Candidate |
+| Zaino | `93a9495336e7ee6f28ab1b02d1959a23b459f035` | Candidate |
+| Zallet | `6fc85f68cf5ebe456160c6518255a83129e7d21c` | Candidate |
 
 ## Development commands
 
@@ -174,7 +184,7 @@ Each simulator run produces a timestamped output directory:
 experiments/runs/<run-id>/
   manifest.json        Simulator commit, Z3 commits, scenario hash, run timestamp
   scenario.yaml        Exact scenario config used
-  rpc_calls.jsonl      Per-call log: method, component, latency_ms, status
+  rpc_calls.jsonl      Per-call log: method, backend, latency_ms, status
   metrics.jsonl        Time-series metric samples
   component_logs/      Captured Zebra, Zaino, and Zallet process logs
   summary.md           Human-readable run summary
@@ -192,11 +202,13 @@ Run directories are gitignored and are not tracked by version control.
 | [`docs/architecture/z3-overview.md`](docs/architecture/z3-overview.md) | Plain-English Z3 stack overview for new contributors |
 | [`docs/architecture/data-model.md`](docs/architecture/data-model.md) | Core data model: accounts, transactions, metrics |
 | [`docs/architecture/observability.md`](docs/architecture/observability.md) | Observability plan: metrics, latency, output format |
-| [`docs/integration/zebra.md`](docs/integration/zebra.md) | Zebra integration notes |
-| [`docs/integration/zaino.md`](docs/integration/zaino.md) | Zaino integration notes |
-| [`docs/integration/zallet.md`](docs/integration/zallet.md) | Zallet integration notes |
-| [`docs/integration/pinned-commits.md`](docs/integration/pinned-commits.md) | Commit pinning rationale and update process |
+| [`docs/integration/z3.md`](docs/integration/z3.md) | Z3 Docker Compose stack — primary integration reference |
+| [`docs/integration/zebra.md`](docs/integration/zebra.md) | Zebra standalone build and config notes |
+| [`docs/integration/zaino.md`](docs/integration/zaino.md) | Zaino role and standalone config notes |
+| [`docs/integration/zallet.md`](docs/integration/zallet.md) | Zallet standalone build and config notes |
+| [`docs/integration/pinned-commits.md`](docs/integration/pinned-commits.md) | Commit pinning rationale |
 | [`docs/rpc/rpc-coverage-matrix.md`](docs/rpc/rpc-coverage-matrix.md) | RPC coverage and zcashd parity matrix |
+| [`docs/rpc/method-scope.md`](docs/rpc/method-scope.md) | Confirmed method list: stress vs smoke split |
 | [`docs/rpc/proposed-method-scope.md`](docs/rpc/proposed-method-scope.md) | Proposed method list for Foundation confirmation |
 | [`docs/scenarios/scenario-design.md`](docs/scenarios/scenario-design.md) | Scenario library design |
 

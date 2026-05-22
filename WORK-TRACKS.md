@@ -11,7 +11,7 @@ agreed before splitting work, and the integration milestones where the streams c
 | Track | Module | Description | Depends on | Can start |
 |---|---|---|---|---|
 | T1 — Data Model | `src/data_model/` | Core Rust types used across all other modules | Nothing | Immediately |
-| T2 — Z3 Process Harness | `src/z3/` | Start, stop, and monitor Zebra / Zaino / Zallet processes | Nothing | Immediately |
+| T2 — Z3 Stack Harness | `src/z3/` | Start, stop, and monitor the Z3 Docker Compose stack | Nothing | Immediately |
 | T3 — RPC Client | `src/rpc/` | Typed Rust API wrapping every Z3 JSON-RPC method | T1 (types) | After T1 interface agreed |
 | T4 — Synthetic Generators | `src/synthetic/` | Deterministic fake accounts, addresses, and transaction intents | T1 | After T1 |
 | T5 — Exchange Emulation | `src/scenarios/exchange/` | Deposit, withdrawal, sweep, and balance-tracking workflows | T1, T3 | After T3 interface agreed |
@@ -49,7 +49,7 @@ implementing exchange emulation against it, the function signatures, error type,
 to unblock B.
 
 Minimum to agree:
-- The `RpcError` type (wraps JSON-RPC error code + message + component)
+- The `RpcError` type (wraps JSON-RPC error code + message + backend)
 - Whether calls return `Result<T, RpcError>` or `Result<T, anyhow::Error>`
 - How `RpcCall` is recorded — does the client write it directly to metrics, or return it
   to the caller?
@@ -96,7 +96,8 @@ with `serde` derive macros for serialisation, and `derive(Debug, Clone)` through
   be consistent
 - Implement all `enum` types: `AccountStatus`, `ActivityProfile`, `AddressType`,
   `AddressPurpose`, `FlowType`, `TransactionStatus`, `DepositStatus`,
-  `WithdrawalStatus`, `SweepStatus`, `Z3Component`
+  `WithdrawalStatus`, `SweepStatus`, `Backend` (replaces `Z3Component` — values are
+  `Zebra`, `Zallet`, `Unknown`; Zaino is not a direct RPC target)
 - Add `impl` helpers only where genuinely needed (e.g. `FlowType::is_shielded()`)
 - Unit tests: serialise/deserialise roundtrip for every type
 
@@ -104,44 +105,41 @@ with `serde` derive macros for serialisation, and `derive(Debug, Clone)` through
 
 ---
 
-## Track 2 — Z3 Process Harness
+## Track 2 — Z3 Stack Harness
 
 **Module:** `src/z3/`
 
-**What it is:** The layer that treats Zebra, Zaino, and Zallet as processes rather than
-RPC endpoints. It spawns them, waits until they are ready, captures their logs, monitors
-their resource usage, and tears them down cleanly. Completely independent of the rest
-of the simulator — it knows nothing about transactions, accounts, or metrics.
+**What it is:** The layer that manages the Z3 Docker Compose stack as a unit. It starts
+the stack, waits until it is ready to serve requests, captures container logs, monitors
+resource usage, and tears it down cleanly. Completely independent of the rest of the
+simulator — it knows nothing about transactions, accounts, or metrics.
 
-**Inputs:** The integration notes for each component:
-[`docs/integration/zebra.md`](docs/integration/zebra.md),
-[`docs/integration/zaino.md`](docs/integration/zaino.md),
-[`docs/integration/zallet.md`](docs/integration/zallet.md).
+**Inputs:** The primary integration reference at
+[`docs/integration/z3.md`](docs/integration/z3.md) and the Z3 Docker Compose repository
+cloned by `make clone-z3` into `external/z3`.
 
-**Output:** A `Z3Stack` type that can be created (starts all three processes in order),
+**Output:** A `Z3Stack` type that can be created (starts the Docker Compose stack),
 polled for health, and dropped (shuts everything down). Integration tests spin up a
 `Z3Stack` as a test fixture.
 
 **Key tasks:**
-- `zebra::Process` — spawn `zebrad` with a regtest TOML config; wait for `getblockchaininfo`
-  to return `"chain": "regtest"` before declaring it ready
-- `zaino::Process` — spawn Zaino binary; wait for its RPC/gRPC port to accept connections
-- `zallet::Process` — spawn `zallet`; initialise the wallet (sequence TBD, see
-  [`docs/integration/zallet.md`](docs/integration/zallet.md)); wait for readiness
-- Startup sequencing: Zebra must be healthy before Zaino starts; Zaino before Zallet
-- Log capture: pipe each process's stdout/stderr to a `component_logs/<name>.log` file
+- Regtest init: check whether the regtest data directory has already been initialised;
+  if not, run `./scripts/regtest-init.sh` in `external/z3` (one-time setup per machine)
+- `Z3Stack::start()` — run `docker compose --env-file .env.regtest up -d` in `external/z3`;
+  poll `getblockchaininfo` on the RPC Router at `:8181` until it returns
+  `"chain": "regtest"` before declaring the stack ready
+- Log capture: stream container logs via `docker compose logs --follow` for each service
+  (`zebra`, `zallet`, `zaino`); write each stream to `component_logs/<service>.log`
   in the run output directory
-- Health checks: implement a periodic `is_alive()` check for each process that fails
-  fast if any component crashes unexpectedly
-- Resource sampling: poll CPU % and memory (MB) for each PID on a configurable interval;
-  write samples to metrics via the metrics recorder
-- Graceful shutdown: SIGTERM then wait, SIGKILL on timeout
-- Regtest config generation: produce the Zebra TOML config programmatically from a
-  struct, so the test environment is fully reproducible
+- Health checks: periodic `getblockchaininfo` call to `:8181`; fail fast if the router
+  stops responding
+- Resource sampling: poll `docker stats --no-stream` for each container on the
+  configured interval; parse CPU % and memory MB; record via the metrics recorder
+- Graceful shutdown: `docker compose down`; wait for containers to exit cleanly
 
 **Can start:** Immediately. No dependency on the data model or any other track.
-Early work (process spawning, log capture) can proceed even before the exact
-Zebra/Zaino/Zallet config formats are confirmed.
+Early work (Docker Compose invocation, log capture) can proceed independently of the
+rest of the simulator.
 
 ---
 
@@ -150,18 +148,18 @@ Zebra/Zaino/Zallet config formats are confirmed.
 **Module:** `src/rpc/`
 
 **What it is:** A typed Rust API wrapping every Z3 JSON-RPC method the simulator calls.
-Each method is one async function. The client automatically records an `RpcCall` entry
-per call (latency, success/failure, method name, component). No business logic here —
-this module only knows how to send a request and parse the response.
+Each method is one async function. All requests go to the unified RPC Router at `:8181`;
+the router forwards each call to Zebra or Zallet transparently. The client records an
+`RpcCall` entry per call (latency, success/failure, method name, `backend`). No business
+logic here — this module only knows how to send a request and parse the response.
 
 **Inputs:** The RPC coverage matrix at
 [`docs/rpc/rpc-coverage-matrix.md`](docs/rpc/rpc-coverage-matrix.md) and the confirmed
-method list in
-[`docs/rpc/proposed-method-scope.md`](docs/rpc/proposed-method-scope.md).
+method list in [`docs/rpc/method-scope.md`](docs/rpc/method-scope.md).
 
-**Output:** An `RpcClient` struct that can be configured with an endpoint URL (separate
-instances for Zebra, Zaino, and Zallet) and exposes one method per RPC call. Every call
-records its own `RpcCall` via the metrics recorder.
+**Output:** An `RpcClient` struct configured with a single base URL (the RPC Router at
+`:8181`) that exposes one method per RPC call. Every call records its own `RpcCall` via
+the metrics recorder.
 
 **Key tasks:**
 
@@ -169,11 +167,15 @@ records its own `RpcCall` via the metrics recorder.
 - HTTP client setup using `reqwest` (async, with configurable timeout and retry)
 - JSON-RPC request/response envelope types (`JsonRpcRequest`, `JsonRpcResponse<T>`,
   `JsonRpcError`)
-- `RpcClient` struct with fields: base URL, component label, metrics recorder handle
+- `RpcClient` struct with fields: base URL (`:8181`), metrics recorder handle
+- Method routing table: a `HashMap<&str, Backend>` mapping each method name to
+  `Backend::Zebra` or `Backend::Zallet` (see coverage matrix); used to populate the
+  `backend` field on `RpcCall` without inspecting the response
 - Automatic `RpcCall` construction and recording on every call (start timestamp,
-  end timestamp, derived `latency_ms`, `success`, `error_code`, `error_message`)
+  end timestamp, derived `latency_ms`, `success`, `error_code`, `error_message`,
+  `backend`)
 
-*Method implementations — Zebra / Zaino:*
+*Method implementations — routed to Zebra:*
 - `get_blockchain_info() -> BlockchainInfo`
 - `get_block_count() -> u64`
 - `get_best_block_hash() -> String`
@@ -189,10 +191,9 @@ records its own `RpcCall` via the metrics recorder.
 - `get_mempool_info() -> MempoolInfo`
 - `send_raw_transaction(tx_hex: &str) -> String`
 - `validate_address(address: &str) -> AddressValidation`
-- `z_validate_address(address: &str) -> AddressValidation`
 - `generate(num_blocks: u32) -> Vec<String>` *(regtest only)*
 
-*Method implementations — Zallet:*
+*Method implementations — routed to Zallet:*
 - `z_get_new_account(name: &str) -> AccountInfo`
 - `z_get_address_for_account(account_uuid: &str) -> UnifiedAddress`
 - `z_list_accounts() -> Vec<AccountInfo>`
@@ -205,8 +206,6 @@ records its own `RpcCall` via the metrics recorder.
 - `z_get_operation_result(op_ids: &[&str]) -> Vec<OperationResult>`
 - `z_list_operation_ids(status: Option<&str>) -> Vec<String>`
 - `z_list_unspent(min_conf: u32, max_conf: u32) -> Vec<UnspentNote>`
-- `get_raw_transaction_zallet(txid: &str, verbose: bool) -> RawTransaction` *(Zallet copy)*
-- `validate_address_zallet(address: &str) -> AddressValidation`
 
 *Error handling:*
 - Distinguish JSON-RPC errors (method not found, invalid params, etc.) from transport
@@ -336,7 +335,7 @@ Plus the `MetricsRecorder` trait (Contract C) consumed by T3 and T5.
 - `MetricSampleWriter`: append-only, opens `metrics.jsonl` at run start
 
 *Latency computation:*
-- Accumulate `latency_ms` values per method+component pair during the run
+- Accumulate `latency_ms` values per method during the run
 - Compute P50, P95, P99 percentiles on demand (use a T-digest or a sorted vec)
 - Emit periodic `rpc_latency_ms` metric samples with `percentile` label
 
@@ -542,8 +541,8 @@ processes, HTTP, Z3 binaries) and benefit from deep familiarity with the actual 
 RPC surface. Once T2 and T3 are stable, Engineer A moves to T8 and helps with T7.
 
 **Sequence:**
-1. T2 (start immediately): Get Zebra running in regtest; verify one `getblockchaininfo`
-   call works
+1. T2 (start immediately): Get the Z3 Docker Compose stack running in regtest; verify
+   one `getblockchaininfo` call succeeds through the RPC Router at `:8181`
 2. T3 (after Contract A + B agreed): Implement all Zebra/Zaino methods first (simpler);
    then Zallet methods
 3. T9 integration scaffolding: Z3 test fixture once T2 is stable
@@ -573,12 +572,12 @@ and verify all logic independently until T3 is ready.
 Three points where the two tracks must converge and be tested together:
 
 ### Milestone 1 — Smoke test (target: end of Week 2)
-**What:** Engineer A's `get_blockchain_info()` call works against a live Zebra instance
-managed by T2. Engineer B's `RpcCallWriter` records the call to `rpc_calls.jsonl`.
+**What:** Engineer A's `get_blockchain_info()` call works against the Z3 Docker Compose
+stack managed by T2. Engineer B's `RpcCallWriter` records the call to `rpc_calls.jsonl`.
 
 **Success criteria:**
-- Zebra starts in regtest via the T2 harness
-- `get_blockchain_info()` returns `chain: "regtest"` and latency_ms is recorded
+- The Z3 Docker Compose stack starts in regtest via the T2 harness
+- `get_blockchain_info()` returns `chain: "regtest"` through the RPC Router at `:8181` and latency_ms is recorded
 - `rpc_calls.jsonl` contains one correct entry
 - Both engineers can reproduce this locally
 
