@@ -2,13 +2,11 @@ name: smoke
 description: "Minimal smoke scenario for early simulator development and CI sanity checks."
 seed: 42
 
-accounts:
-  count: 10
-  active_fraction: 0.5
+accounts_count: 10
+accounts_active_fraction: 0.5
 
-load:
-  duration_seconds: 60
-  target_tps: 1
+load_duration_seconds: 60
+load_target_tps: 1.0
 
 flows:
   transparent_to_transparent: 1.0
@@ -16,11 +14,19 @@ flows:
   shielded_to_transparent: 0.0
   shielded_to_shielded: 0.0
 
-confirmations:
-  deposit_required: 3
+confirmations_deposit_required: 3
 
 observability:
   record_rpc_calls: true
   record_component_logs: true
   metric_sampling_interval_secs: 5
   mempool_saturation_threshold: 500
+
+activity_profiles:
+  low_fraction: 0.50
+  medium_fraction: 0.35
+  high_fraction: 0.15
+
+amounts:
+  min_zatoshis: 10000     # 0.0001 ZEC — minimum realistic transaction size
+  max_zatoshis: 10000000  # 0.1 ZEC   — small amounts suitable for smoke testing
