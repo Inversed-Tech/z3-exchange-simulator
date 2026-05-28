@@ -18,7 +18,7 @@ For a plain-English explanation of what Zallet is and its role in the stack, see
 | Field | Value |
 |---|---|
 | Repository | https://github.com/zcash/wallet |
-| Pinned commit | `05926f3f3ec1b1d90348ae899628cc0e28547ef3` — see [`z3-commits.lock`](../../z3-commits.lock) |
+| Pinned commit | `6fc85f68cf5ebe456160c6518255a83129e7d21c` — see [`z3-commits.lock`](../../z3-commits.lock) |
 | Language | Rust (Edition 2024, MSRV 1.85) |
 | Binary name | `zallet` |
 
@@ -38,7 +38,7 @@ For a plain-English explanation of what Zallet is and its role in the stack, see
 ```sh
 git clone https://github.com/zcash/wallet external/zallet
 cd external/zallet
-git checkout 05926f3f3ec1b1d90348ae899628cc0e28547ef3
+git checkout 6fc85f68cf5ebe456160c6518255a83129e7d21c
 cargo build --release
 ```
 
@@ -66,7 +66,7 @@ the Z3 repo's `config/regtest/zallet.toml`.
 
 ## RPC methods
 
-Verified against pinned commit `05926f3`. Full detail in
+Verified against pinned commit `6fc85f68`. Full detail in
 [`docs/rpc/rpc-coverage-matrix.md`](../rpc/rpc-coverage-matrix.md).
 
 **Account and address management**

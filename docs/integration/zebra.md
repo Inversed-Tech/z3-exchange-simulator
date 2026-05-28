@@ -18,7 +18,7 @@ For a plain-English explanation of what Zebra is and its role in the stack, see
 | Field | Value |
 |---|---|
 | Repository | https://github.com/ZcashFoundation/zebra |
-| Pinned commit | `d4cd662c716382f6397d2a730148025a1ca79fec` (main, 2026-05-07) — see [`z3-commits.lock`](../../z3-commits.lock) |
+| Pinned commit | `aba329d6dca884f6d42bb4d36bda0010a071c2fc` — see [`z3-commits.lock`](../../z3-commits.lock) |
 | Language | Rust |
 | Binary name | `zebrad` |
 | MSRV | 1.85.1 |
@@ -43,7 +43,7 @@ Run `make setup` to check that your local Rust toolchain is installed.
 ```sh
 git clone https://github.com/ZcashFoundation/zebra external/zebra
 cd external/zebra
-git checkout d4cd662c716382f6397d2a730148025a1ca79fec
+git checkout aba329d6dca884f6d42bb4d36bda0010a071c2fc
 cargo build --release --features indexer
 ```
 
