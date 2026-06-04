@@ -150,6 +150,7 @@ pub struct TransactionIntent {
     pub intent_id: String,
     pub run_id: String,
     pub account_id: String,
+    pub recipient_account_id: String,
     pub sender_address: String,
     pub recipient_address: String,
     pub amount_zatoshis: u64,
@@ -246,6 +247,19 @@ pub struct ObservabilityConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActivityProfileConfig {
+    pub low_fraction: f64,
+    pub medium_fraction: f64,
+    pub high_fraction: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AmountRangeConfig {
+    pub min_zatoshis: u64,
+    pub max_zatoshis: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScenarioConfig {
     pub name: String,
     pub description: String,
@@ -255,9 +269,13 @@ pub struct ScenarioConfig {
     pub load_duration_seconds: u64,
     pub load_target_tps: f64,
     pub flows: FlowConfig,
+    pub activity_profiles: ActivityProfileConfig,
+    pub amounts: AmountRangeConfig,
     pub confirmations_deposit_required: u64,
     pub observability: ObservabilityConfig,
+    #[serde(default)]
     pub config_hash: String,
+    #[serde(default)]
     pub source_path: String,
 }
 
@@ -352,6 +370,7 @@ mod tests {
             intent_id: "int-1".into(),
             run_id: "run-1".into(),
             account_id: "acc-1".into(),
+            recipient_account_id: "acc-2".into(),
             sender_address: "t1sender".into(),
             recipient_address: "t1recipient".into(),
             amount_zatoshis: 5_000_000,
@@ -477,6 +496,15 @@ mod tests {
                 transparent_to_shielded: 0.0,
                 shielded_to_transparent: 0.0,
                 shielded_to_shielded: 0.0,
+            },
+            activity_profiles: ActivityProfileConfig {
+                low_fraction: 0.5,
+                medium_fraction: 0.35,
+                high_fraction: 0.15,
+            },
+            amounts: AmountRangeConfig {
+                min_zatoshis: 10_000,
+                max_zatoshis: 10_000_000,
             },
             confirmations_deposit_required: 10,
             observability: ObservabilityConfig {
@@ -864,6 +892,7 @@ mod tests {
             intent_id: "i".into(),
             run_id: "r".into(),
             account_id: "a".into(),
+            recipient_account_id: "acc-2".into(),
             sender_address: "t1s".into(),
             recipient_address: "t1r".into(),
             amount_zatoshis: 1_000,
@@ -917,6 +946,7 @@ mod tests {
             intent_id: "i".into(),
             run_id: "r".into(),
             account_id: "a".into(),
+            recipient_account_id: "acc-2".into(),
             sender_address: "t1s".into(),
             recipient_address: "t1r".into(),
             amount_zatoshis: 1,
@@ -951,6 +981,56 @@ mod tests {
         assert_eq!(back.amount_zatoshis, SUPPLY_CAP);
     }
 
+    // ── ActivityProfileConfig and AmountRangeConfig ───────────────────────────
+
+    #[test]
+    fn activity_profile_config_roundtrip() {
+        let v = ActivityProfileConfig {
+            low_fraction: 0.5,
+            medium_fraction: 0.35,
+            high_fraction: 0.15,
+        };
+        let back = roundtrip(&v);
+        assert_eq!(v.low_fraction, back.low_fraction);
+        assert_eq!(v.medium_fraction, back.medium_fraction);
+        assert_eq!(v.high_fraction, back.high_fraction);
+    }
+
+    #[test]
+    fn activity_profile_config_field_names() {
+        let v = ActivityProfileConfig {
+            low_fraction: 0.1,
+            medium_fraction: 0.2,
+            high_fraction: 0.7,
+        };
+        let json: serde_json::Value = serde_json::to_value(&v).unwrap();
+        assert!(json.get("low_fraction").is_some());
+        assert!(json.get("medium_fraction").is_some());
+        assert!(json.get("high_fraction").is_some());
+    }
+
+    #[test]
+    fn amount_range_config_roundtrip() {
+        let v = AmountRangeConfig {
+            min_zatoshis: 10_000,
+            max_zatoshis: 10_000_000,
+        };
+        let back = roundtrip(&v);
+        assert_eq!(v.min_zatoshis, back.min_zatoshis);
+        assert_eq!(v.max_zatoshis, back.max_zatoshis);
+    }
+
+    #[test]
+    fn amount_range_config_u64_max() {
+        let v = AmountRangeConfig {
+            min_zatoshis: 0,
+            max_zatoshis: u64::MAX,
+        };
+        let back = roundtrip(&v);
+        assert_eq!(back.min_zatoshis, 0);
+        assert_eq!(back.max_zatoshis, u64::MAX);
+    }
+
     // ── ScenarioConfig full nested roundtrip ──────────────────────────────────
 
     #[test]
@@ -968,6 +1048,15 @@ mod tests {
                 transparent_to_shielded: 0.2,
                 shielded_to_transparent: 0.2,
                 shielded_to_shielded: 0.2,
+            },
+            activity_profiles: ActivityProfileConfig {
+                low_fraction: 0.5,
+                medium_fraction: 0.35,
+                high_fraction: 0.15,
+            },
+            amounts: AmountRangeConfig {
+                min_zatoshis: 10_000,
+                max_zatoshis: 10_000_000,
             },
             confirmations_deposit_required: 10,
             observability: ObservabilityConfig {
