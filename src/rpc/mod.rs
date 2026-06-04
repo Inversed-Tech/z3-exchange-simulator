@@ -252,16 +252,17 @@ pub struct OperationResult {
     pub error: Option<OperationError>,
 }
 
-/// One entry from `z_listunspent`. Amounts are in ZEC (f64) as returned by
-/// the RPC — multiply by 1e8 and round to convert to zatoshis.
+/// One entry from `z_listunspent`. Verified against Zallet `v0.1.0-alpha.3`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct UnspentNote {
     pub txid: String,
     pub confirmations: u64,
-    pub spendable: bool,
+    pub address: Option<String>,
+    #[serde(rename = "account_uuid")]
     pub account: String,
-    pub address: String,
-    pub amount: f64,
+    pub value: f64,
+    #[serde(rename = "valueZat")]
+    pub value_zat: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -351,9 +352,10 @@ impl RpcClient {
         base_url: impl Into<String>,
         run_id: impl Into<String>,
         metrics: Option<Arc<dyn MetricsRecorder>>,
+        timeout: Option<Duration>,
     ) -> Self {
         let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(30))
+            .timeout(timeout.unwrap_or(Duration::from_secs(30)))
             .build()
             .expect("failed to build HTTP client");
 
@@ -762,11 +764,11 @@ mod tests {
     }
 
     fn client(url: &str) -> RpcClient {
-        RpcClient::new(url, "test-run", None)
+        RpcClient::new(url, "test-run", None, None)
     }
 
     fn client_with_recorder(url: &str, rec: Arc<MockRecorder>) -> RpcClient {
-        RpcClient::new(url, "test-run", Some(rec as Arc<dyn MetricsRecorder>))
+        RpcClient::new(url, "test-run", Some(rec as Arc<dyn MetricsRecorder>), None)
     }
 
     // ── get_blockchain_info ───────────────────────────────────────────────────
@@ -939,7 +941,7 @@ mod tests {
 
     #[test]
     fn unknown_method_falls_back_to_backend_unknown() {
-        let client = RpcClient::new("http://127.0.0.1:8181", "r", None);
+        let client = RpcClient::new("http://127.0.0.1:8181", "r", None, None);
         let backend = client
             .routing
             .get("made_up_method")
@@ -952,7 +954,7 @@ mod tests {
 
     #[test]
     fn call_counter_increments_per_call() {
-        let client = RpcClient::new("http://127.0.0.1:8181", "r", None);
+        let client = RpcClient::new("http://127.0.0.1:8181", "r", None, None);
         let a = client.call_counter.fetch_add(1, Ordering::Relaxed);
         let b = client.call_counter.fetch_add(1, Ordering::Relaxed);
         assert_ne!(a, b);
@@ -1445,10 +1447,10 @@ mod tests {
                 "result": [{
                     "txid": "abc",
                     "confirmations": 6,
-                    "spendable": true,
-                    "account": "uuid-1",
+                    "account_uuid": "uuid-1",
                     "address": "u1addr",
-                    "amount": 0.5
+                    "value": 0.5,
+                    "valueZat": 50_000_000u64
                 }],
                 "error": null, "id": 1
             })))
@@ -1457,8 +1459,81 @@ mod tests {
         let notes = client(&server.uri()).z_list_unspent(1, None).await.unwrap();
         assert_eq!(notes.len(), 1);
         assert_eq!(notes[0].txid, "abc");
-        assert!(notes[0].spendable);
-        assert!((notes[0].amount - 0.5).abs() < 1e-9);
+        assert_eq!(notes[0].account, "uuid-1");
+        assert_eq!(notes[0].address.as_deref(), Some("u1addr"));
+        assert_eq!(notes[0].value_zat, 50_000_000);
+    }
+
+    #[tokio::test]
+    async fn z_list_unspent_address_may_be_null() {
+        use wiremock::{matchers, Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(matchers::method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [{
+                    "txid": "def",
+                    "confirmations": 1,
+                    "account_uuid": "uuid-2",
+                    "address": null,
+                    "value": 1.0,
+                    "valueZat": 100_000_000u64
+                }],
+                "error": null, "id": 1
+            })))
+            .mount(&server)
+            .await;
+        let notes = client(&server.uri()).z_list_unspent(1, None).await.unwrap();
+        assert!(notes[0].address.is_none());
+    }
+
+    #[tokio::test]
+    async fn z_get_operation_result_parses_successful_operation() {
+        use wiremock::{matchers, Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(matchers::method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [{
+                    "id": "opid-1",
+                    "status": "success",
+                    "result": { "txid": "finaltxid" },
+                    "error": null
+                }],
+                "error": null, "id": 1
+            })))
+            .mount(&server)
+            .await;
+        let ops = client(&server.uri())
+            .z_get_operation_result(&["opid-1"])
+            .await
+            .unwrap();
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].status, "success");
+        assert_eq!(
+            ops[0].result.as_ref().map(|r| r.txid.as_str()),
+            Some("finaltxid")
+        );
+    }
+
+    #[tokio::test]
+    async fn get_tx_out_null_result_records_success_in_rpc_call() {
+        use wiremock::{matchers, Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(matchers::method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": null, "error": null, "id": 1
+            })))
+            .mount(&server)
+            .await;
+        let rec = MockRecorder::new();
+        let out = client_with_recorder(&server.uri(), rec.clone())
+            .get_tx_out("abc", 0)
+            .await
+            .unwrap();
+        assert!(out.is_none());
+        let calls = rec.recorded_calls();
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].success);
+        assert!(calls[0].error_code.is_none());
     }
 
     #[tokio::test]
