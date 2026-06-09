@@ -79,11 +79,26 @@ impl Default for PollingConfig {
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
-// Conservative ZIP-317 fee buffer used when sweeping the full balance.
-// Prevents submitting an output amount that exceeds available inputs minus fee.
-const SWEEP_FEE_BUFFER_ZAT: u64 = 5_000;
+// ZIP 317 fee constants (ZIP-317: Proportional Transaction Fees).
+const MARGINAL_FEE_ZAT: u64 = 5_000;
+const GRACE_ACTIONS: u64 = 2;
 
 // ── Shared utilities ──────────────────────────────────────────────────────────
+
+/// Convert zatoshis to a ZEC f64 using integer arithmetic, avoiding float-division imprecision.
+fn zat_to_zec(zatoshis: u64) -> f64 {
+    let whole = zatoshis / 100_000_000;
+    let frac = zatoshis % 100_000_000;
+    format!("{}.{:08}", whole, frac)
+        .parse()
+        .expect("generated ZEC decimal string is always a valid f64")
+}
+
+/// Compute the ZIP 317 fee for sweeping `note_count` notes to a single output.
+/// `fee = MARGINAL_FEE_ZAT × max(note_count + 1, GRACE_ACTIONS)`
+fn zip317_sweep_fee(note_count: usize) -> u64 {
+    MARGINAL_FEE_ZAT * ((note_count as u64) + 1).max(GRACE_ACTIONS)
+}
 
 /// Poll `z_get_operation_status` until the operation completes or the deadline passes.
 /// Returns the completed status on success; errors on operation failure or timeout.
@@ -248,10 +263,9 @@ pub async fn run_deposit(
     };
 
     // Step 2: send funds from the hot wallet to the deposit address.
-    let amount_zec = amount_zatoshis as f64 / 1e8;
     let recipients = [Recipient {
         address: deposit_address.clone(),
-        amount: amount_zec,
+        amount: zat_to_zec(amount_zatoshis),
         memo: None,
     }];
     let op_id = rpc
@@ -334,10 +348,9 @@ pub async fn run_withdrawal(
         broadcast_at: None,
     };
 
-    let amount_zec = amount_zatoshis as f64 / 1e8;
     let recipients = [Recipient {
         address: destination_address.to_string(),
-        amount: amount_zec,
+        amount: zat_to_zec(amount_zatoshis),
         memo: None,
     }];
 
@@ -437,7 +450,15 @@ pub async fn run_sweep(
     }
 
     let total_zat: u64 = account_notes.iter().map(|n| n.value_zat).sum();
-    let sweep_amount_zat = total_zat.saturating_sub(SWEEP_FEE_BUFFER_ZAT);
+    let sweep_fee_zat = zip317_sweep_fee(account_notes.len());
+    if total_zat <= sweep_fee_zat {
+        return Err(ExchangeError::EmptyResult {
+            context: format!(
+                "account {from_account} balance {total_zat} zat does not cover sweep fee {sweep_fee_zat} zat"
+            ),
+        });
+    }
+    let sweep_amount_zat = total_zat - sweep_fee_zat;
 
     let source_addresses: Vec<String> = account_notes
         .iter()
@@ -451,7 +472,7 @@ pub async fn run_sweep(
         source_addresses,
         destination_address: hot_wallet_address.to_string(),
         total_amount_zatoshis: total_zat,
-        fee_zatoshis: SWEEP_FEE_BUFFER_ZAT,
+        fee_zatoshis: sweep_fee_zat,
         status: SweepStatus::Processing,
         txid: None,
         intent_ids: vec![],
@@ -460,7 +481,7 @@ pub async fn run_sweep(
 
     let recipients = [Recipient {
         address: hot_wallet_address.to_string(),
-        amount: sweep_amount_zat as f64 / 1e8,
+        amount: zat_to_zec(sweep_amount_zat),
         memo: None,
     }];
 
@@ -1387,7 +1408,7 @@ mod tests {
 
         assert_eq!(sweep.status, SweepStatus::Confirmed);
         assert_eq!(sweep.total_amount_zatoshis, 80_000_000);
-        assert_eq!(sweep.fee_zatoshis, SWEEP_FEE_BUFFER_ZAT);
+        assert_eq!(sweep.fee_zatoshis, 15_000); // ZIP 317: 5_000 × max(2+1, 2) = 15_000
         assert_eq!(sweep.txid.as_deref(), Some("sweeptxid"));
         assert_eq!(sweep.destination_address, "u1hotwallet");
         assert_eq!(sweep.source_addresses.len(), 2);
@@ -1539,6 +1560,66 @@ mod tests {
         assert_eq!(sweep.total_amount_zatoshis, 10_000_000);
         assert!(sweep.source_addresses.is_empty());
         assert_eq!(sweep.status, SweepStatus::Confirmed);
+    }
+
+    // ── zat_to_zec ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn zat_to_zec_converts_via_integer_arithmetic() {
+        assert_eq!(zat_to_zec(0), 0.0_f64);
+        assert_eq!(zat_to_zec(100_000_000), 1.0_f64);
+        assert_eq!(zat_to_zec(50_000_000), 0.5_f64);
+        assert_eq!(zat_to_zec(1), 1e-8_f64);
+        assert_eq!(zat_to_zec(100_000_001), 1.00000001_f64);
+        assert_eq!(zat_to_zec(12_345_678), 0.12345678_f64);
+    }
+
+    // ── zip317_sweep_fee ──────────────────────────────────────────────────────
+
+    #[test]
+    fn zip317_sweep_fee_applies_grace_actions_floor() {
+        // 1 note: max(1+1, 2) = 2 → 5_000 × 2 = 10_000
+        assert_eq!(zip317_sweep_fee(1), 10_000);
+        // 2 notes: max(2+1, 2) = 3 → 5_000 × 3 = 15_000
+        assert_eq!(zip317_sweep_fee(2), 15_000);
+        // 10 notes: max(10+1, 2) = 11 → 5_000 × 11 = 55_000
+        assert_eq!(zip317_sweep_fee(10), 55_000);
+    }
+
+    #[tokio::test]
+    async fn run_sweep_returns_err_when_balance_too_small_for_fee() {
+        use wiremock::{matchers, Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+
+        // 1 note of 9_000 zat; ZIP 317 fee = 10_000 → balance insufficient
+        Mock::given(matchers::method("POST"))
+            .and(matchers::body_partial_json(
+                serde_json::json!({ "method": "z_listunspent" }),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [{
+                    "txid": "note1", "confirmations": 3,
+                    "account_uuid": "my-account",
+                    "address": "u1addr", "value": 0.00009, "valueZat": 9_000u64
+                }],
+                "error": null, "id": 1
+            })))
+            .mount(&server)
+            .await;
+
+        let err = run_sweep(
+            &rpc(&server.uri()),
+            "my-account",
+            "u1hotwallet",
+            "run-1",
+            None,
+            &instant_polling(),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(err, ExchangeError::EmptyResult { .. }));
+        assert!(err.to_string().contains("does not cover sweep fee"));
     }
 
     // ── run_mempool_watcher ───────────────────────────────────────────────────
