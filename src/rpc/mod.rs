@@ -202,14 +202,6 @@ pub struct TotalBalance {
     pub total: String,
 }
 
-/// Returned by `z_getbalances`. Per-pool balances in zatoshis.
-#[derive(Debug, Clone, Deserialize)]
-pub struct Balances {
-    pub transparent: u64,
-    pub sapling: u64,
-    pub orchard: u64,
-}
-
 /// The outcome detail inside a completed `OperationStatus` or `OperationResult`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct OperationResultDetail {
@@ -656,12 +648,10 @@ impl RpcClient {
         self.call("listaddresses", serde_json::json!([])).await
     }
 
+    /// `include_watchonly` must be `true` — Zallet alpha requires it (temporary restriction).
     pub async fn z_get_total_balance(&self) -> Result<TotalBalance, RpcError> {
-        self.call("z_gettotalbalance", serde_json::json!([])).await
-    }
-
-    pub async fn z_get_balances(&self) -> Result<Balances, RpcError> {
-        self.call("z_getbalances", serde_json::json!([])).await
+        self.call("z_gettotalbalance", serde_json::json!([null, true]))
+            .await
     }
 
     /// Send funds to one or more recipients. Fee is always `null` (auto-computed
@@ -1270,23 +1260,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn z_get_balances_parses_per_pool_zatoshi_amounts() {
-        use wiremock::{matchers, Mock, MockServer, ResponseTemplate};
-        let server = MockServer::start().await;
-        Mock::given(matchers::method("POST"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "result": { "transparent": 100_000_000u64, "sapling": 0u64, "orchard": 50_000_000u64 },
-                "error": null, "id": 1
-            })))
-            .mount(&server)
-            .await;
-        let bal = client(&server.uri()).z_get_balances().await.unwrap();
-        assert_eq!(bal.transparent, 100_000_000);
-        assert_eq!(bal.orchard, 50_000_000);
-        assert_eq!(bal.sapling, 0);
-    }
-
-    #[tokio::test]
     async fn z_get_total_balance_parses_zec_strings() {
         use wiremock::{matchers, Mock, MockServer, ResponseTemplate};
         let server = MockServer::start().await;
@@ -1304,6 +1277,33 @@ mod tests {
         let bal = client(&server.uri()).z_get_total_balance().await.unwrap();
         assert_eq!(bal.transparent, "0.50000000");
         assert_eq!(bal.total, "1.50000000");
+    }
+
+    #[tokio::test]
+    async fn z_get_total_balance_sends_include_watchonly_true() {
+        // Zallet alpha requires include_watchonly=true; verify the client sends it.
+        // The mock only matches when params are exactly [null, true] — a reverted
+        // call site (empty params) would get no match and return a transport error,
+        // causing the test to fail.
+        use wiremock::{matchers, Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(matchers::method("POST"))
+            .and(matchers::body_partial_json(serde_json::json!({
+                "method": "z_gettotalbalance",
+                "params": [null, true]
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": {
+                    "transparent": "0.00000000",
+                    "private": "0.00000000",
+                    "total": "0.00000000"
+                },
+                "error": null, "id": 1
+            })))
+            .mount(&server)
+            .await;
+        // Would fail if params were wrong (no matching mock → error).
+        client(&server.uri()).z_get_total_balance().await.unwrap();
     }
 
     #[tokio::test]

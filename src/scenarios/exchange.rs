@@ -159,6 +159,28 @@ async fn wait_for_tx_confirmations(
     }
 }
 
+/// Parse a ZEC decimal string (e.g. `"1.75000000"`) to zatoshis.
+///
+/// Zallet formats all ZEC amounts with exactly 8 decimal places. Parsing is
+/// done with pure integer arithmetic to avoid any floating-point rounding.
+fn zec_str_to_zat(s: &str) -> Result<u64, ExchangeError> {
+    let err = || ExchangeError::EmptyResult {
+        context: format!("invalid ZEC amount string: {s:?}"),
+    };
+    let (whole_str, frac_str) = match s.split_once('.') {
+        Some(parts) => parts,
+        None => (s, ""),
+    };
+    let whole: u64 = whole_str.parse().map_err(|_| err())?;
+    // Pad fractional part to exactly 8 digits (truncate if longer).
+    let frac_padded = format!("{:0<8}", &frac_str[..frac_str.len().min(8)]);
+    let frac: u64 = frac_padded.parse().map_err(|_| err())?;
+    whole
+        .checked_mul(100_000_000)
+        .and_then(|w| w.checked_add(frac))
+        .ok_or_else(err)
+}
+
 /// Emit one `MetricSample` if a recorder is present.
 fn emit(
     metrics: &Option<Arc<dyn MetricsRecorder>>,
@@ -191,6 +213,7 @@ fn emit(
 /// mined and the deposit is credited.
 ///
 /// Emits `deposit_confirmation_time_ms` to the metrics recorder.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_deposit(
     rpc: &RpcClient,
     account_id: &str,
@@ -245,33 +268,22 @@ pub async fn run_deposit(
         })?
         .to_string();
 
-    // Step 4: mine blocks to reach the required confirmation depth.
+    // Step 4: record the txid and mark the deposit as detected.
+    deposit.txid = Some(txid.clone());
+    deposit.status = DepositStatus::Detected;
+
+    // Step 5: mine blocks to reach the required confirmation depth.
     // Safe cast: required_confirmations will never approach u32::MAX in regtest.
     rpc.generate(required_confirmations as u32)
         .await
         .map_err(ExchangeError::Rpc)?;
 
-    // Step 5: detect the incoming transaction via address history (`get_address_txids`).
-    // In production an exchange would derive the txid from this scan; here we already
-    // have it from the operation result and use the scan to verify on-chain presence.
-    let address_txids = rpc
-        .get_address_txids(&[deposit_address.as_str()], None)
-        .await
-        .map_err(ExchangeError::Rpc)?;
-
-    if !address_txids.contains(&txid) {
-        return Err(ExchangeError::EmptyResult {
-            context: format!(
-                "txid {txid} not found in address history for {deposit_address} after mining"
-            ),
-        });
-    }
-
-    deposit.txid = Some(txid.clone());
-    deposit.status = DepositStatus::Detected;
     deposit.status = DepositStatus::Confirming;
 
-    // Step 6: verify confirmation depth.
+    // Step 6: verify confirmation depth via get_raw_transaction.
+    // `getaddresstxids` is a transparent-only Zebra API and rejects Unified
+    // Addresses; `get_raw_transaction` works for all pool types and serves as
+    // the on-chain presence check.
     let confs = wait_for_tx_confirmations(rpc, &txid, required_confirmations, polling).await?;
 
     deposit.current_confirmations = confs;
@@ -297,6 +309,7 @@ pub async fn run_deposit(
 /// `z_send_many`. Mines one regtest block after the operation proves, then waits
 /// for confirmation. Emits `withdrawal_proving_time_ms` and
 /// `withdrawal_broadcast_latency_ms` to the metrics recorder.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_withdrawal(
     rpc: &RpcClient,
     account_id: &str,
@@ -347,9 +360,10 @@ pub async fn run_withdrawal(
         .z_get_operation_result(&[&op_id])
         .await
         .map_err(ExchangeError::Rpc)?;
-    let final_result: OperationResult = results.pop().ok_or_else(|| ExchangeError::EmptyResult {
-        context: format!("z_get_operation_result returned empty list for {op_id}"),
-    })?;
+    let final_result: OperationResult =
+        results.pop().ok_or_else(|| ExchangeError::EmptyResult {
+            context: format!("z_get_operation_result returned empty list for {op_id}"),
+        })?;
     let txid = final_result
         .result
         .ok_or_else(|| ExchangeError::EmptyResult {
@@ -486,33 +500,33 @@ pub async fn run_sweep(
 
 /// Snapshot the current wallet balance at the current block height.
 ///
-/// Calls both `z_get_balances` (per-pool zatoshi amounts) and `z_get_total_balance`
-/// (aggregate ZEC strings) as required by the spec, then records the snapshot
-/// as a `Balance`. `get_block_count` provides the height at which the snapshot
-/// was taken. The `*_unconfirmed` fields are always zero because Zallet does
-/// not expose unconfirmed pool breakdowns.
-///
-/// Note: the confirmation tracker in this module uses `get_raw_transaction.confirmations`
-/// rather than polling `get_block_count` directly; both are equivalent but the
-/// former avoids needing to track the tx inclusion height separately.
+/// Calls `z_get_total_balance` (with `include_watchonly=true`, required by
+/// Zallet alpha) and parses the returned ZEC strings to zatoshis via
+/// `zec_str_to_zat`. `get_block_count` provides the block height. The
+/// `shielded_confirmed` field combines Sapling and Orchard (Zallet reports
+/// them together as `private`). The `*_unconfirmed` fields are always zero
+/// because Zallet does not expose unconfirmed pool breakdowns via this method.
 pub async fn run_balance_check(
     rpc: &RpcClient,
     wallet_id: &str,
     run_id: &str,
     metrics: Option<Arc<dyn MetricsRecorder>>,
 ) -> Result<Balance, ExchangeError> {
-    // Both methods called per spec: z_get_balances for per-pool zatoshi amounts,
-    // z_get_total_balance for the aggregate ZEC-string view.
-    let balances = rpc.z_get_balances().await.map_err(ExchangeError::Rpc)?;
-    let _total = rpc.z_get_total_balance().await.map_err(ExchangeError::Rpc)?;
+    let total = rpc
+        .z_get_total_balance()
+        .await
+        .map_err(ExchangeError::Rpc)?;
     let height = rpc.get_block_count().await.map_err(ExchangeError::Rpc)?;
 
-    let total_confirmed = balances.transparent + balances.sapling + balances.orchard;
+    let transparent_confirmed = zec_str_to_zat(&total.transparent)?;
+    let shielded_confirmed = zec_str_to_zat(&total.private)?;
+    let total_confirmed = zec_str_to_zat(&total.total)?;
+
     let snapshot = Balance {
         wallet_id: wallet_id.to_string(),
-        transparent_confirmed: balances.transparent,
+        transparent_confirmed,
         transparent_unconfirmed: 0,
-        shielded_confirmed: balances.sapling + balances.orchard,
+        shielded_confirmed,
         shielded_unconfirmed: 0,
         total_confirmed,
         at_block_height: height,
@@ -634,6 +648,34 @@ mod tests {
         RpcClient::new(url, "test-run", None, None)
     }
 
+    // ── zec_str_to_zat ────────────────────────────────────────────────────────
+
+    #[test]
+    fn zec_str_to_zat_parses_common_values() {
+        assert_eq!(zec_str_to_zat("0.00000000").unwrap(), 0);
+        assert_eq!(zec_str_to_zat("1.00000000").unwrap(), 100_000_000);
+        assert_eq!(zec_str_to_zat("0.75000000").unwrap(), 75_000_000);
+        assert_eq!(zec_str_to_zat("1.75000000").unwrap(), 175_000_000);
+        // Max ZEC supply: 21 000 000 ZEC = 2 100 000 000 000 000 zatoshis.
+        assert_eq!(
+            zec_str_to_zat("20999999.99999999").unwrap(),
+            2_099_999_999_999_999
+        );
+    }
+
+    #[test]
+    fn zec_str_to_zat_handles_no_decimal_point() {
+        assert_eq!(zec_str_to_zat("0").unwrap(), 0);
+        assert_eq!(zec_str_to_zat("1").unwrap(), 100_000_000);
+    }
+
+    #[test]
+    fn zec_str_to_zat_rejects_malformed_input() {
+        assert!(zec_str_to_zat("abc").is_err());
+        assert!(zec_str_to_zat("1.foo").is_err());
+        assert!(zec_str_to_zat("").is_err());
+    }
+
     // ── poll_operation_until_complete ─────────────────────────────────────────
 
     #[tokio::test]
@@ -654,10 +696,9 @@ mod tests {
             .mount(&server)
             .await;
 
-        let op =
-            poll_operation_until_complete(&rpc(&server.uri()), "op-1", &instant_polling())
-                .await
-                .unwrap();
+        let op = poll_operation_until_complete(&rpc(&server.uri()), "op-1", &instant_polling())
+            .await
+            .unwrap();
         assert_eq!(op.status, "success");
         assert_eq!(op.txid(), Some("abc123"));
     }
@@ -680,10 +721,9 @@ mod tests {
             .mount(&server)
             .await;
 
-        let err =
-            poll_operation_until_complete(&rpc(&server.uri()), "op-1", &instant_polling())
-                .await
-                .unwrap_err();
+        let err = poll_operation_until_complete(&rpc(&server.uri()), "op-1", &instant_polling())
+            .await
+            .unwrap_err();
         assert!(matches!(err, ExchangeError::OperationFailed { .. }));
         assert!(err.to_string().contains("insufficient funds"));
     }
@@ -710,10 +750,9 @@ mod tests {
             max_operation_wait: Duration::ZERO,
             ..instant_polling()
         };
-        let err =
-            poll_operation_until_complete(&rpc(&server.uri()), "op-1", &timeout_cfg)
-                .await
-                .unwrap_err();
+        let err = poll_operation_until_complete(&rpc(&server.uri()), "op-1", &timeout_cfg)
+            .await
+            .unwrap_err();
         assert!(matches!(err, ExchangeError::Timeout { .. }));
     }
 
@@ -734,10 +773,9 @@ mod tests {
             .mount(&server)
             .await;
 
-        let confs =
-            wait_for_tx_confirmations(&rpc(&server.uri()), "tx1", 5, &instant_polling())
-                .await
-                .unwrap();
+        let confs = wait_for_tx_confirmations(&rpc(&server.uri()), "tx1", 5, &instant_polling())
+            .await
+            .unwrap();
         assert!(confs >= 5);
     }
 
@@ -773,20 +811,6 @@ mod tests {
     async fn run_balance_check_sums_all_pools() {
         use wiremock::{matchers, Mock, MockServer, ResponseTemplate};
         let server = MockServer::start().await;
-        Mock::given(matchers::method("POST"))
-            .and(matchers::body_partial_json(
-                serde_json::json!({ "method": "z_getbalances" }),
-            ))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "result": {
-                    "transparent": 100_000_000u64,
-                    "sapling": 50_000_000u64,
-                    "orchard": 25_000_000u64
-                },
-                "error": null, "id": 1
-            })))
-            .mount(&server)
-            .await;
         Mock::given(matchers::method("POST"))
             .and(matchers::body_partial_json(
                 serde_json::json!({ "method": "z_gettotalbalance" }),
@@ -841,16 +865,6 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(matchers::method("POST"))
             .and(matchers::body_partial_json(
-                serde_json::json!({ "method": "z_getbalances" }),
-            ))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "result": { "transparent": 0u64, "sapling": 0u64, "orchard": 0u64 },
-                "error": null, "id": 1
-            })))
-            .mount(&server)
-            .await;
-        Mock::given(matchers::method("POST"))
-            .and(matchers::body_partial_json(
                 serde_json::json!({ "method": "z_gettotalbalance" }),
             ))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -873,6 +887,43 @@ mod tests {
         run_balance_check(&rpc(&server.uri()), "wallet-1", "run-1", None)
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_balance_check_returns_err_on_malformed_zec_string() {
+        use wiremock::{matchers, Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(matchers::method("POST"))
+            .and(matchers::body_partial_json(
+                serde_json::json!({ "method": "z_gettotalbalance" }),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": {
+                    "transparent": "not_a_number",
+                    "private": "0.00000000",
+                    "total": "0.00000000"
+                },
+                "error": null, "id": 1
+            })))
+            .mount(&server)
+            .await;
+        // getblockcount is called before zec_str_to_zat; mock it so the parse
+        // step is actually reached and produces the expected error.
+        Mock::given(matchers::method("POST"))
+            .and(matchers::body_partial_json(
+                serde_json::json!({ "method": "getblockcount" }),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": 1, "error": null, "id": 1
+            })))
+            .mount(&server)
+            .await;
+
+        let err = run_balance_check(&rpc(&server.uri()), "wallet-1", "run-1", None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ExchangeError::EmptyResult { .. }));
+        assert!(err.to_string().contains("invalid ZEC amount string"));
     }
 
     // ── run_deposit ───────────────────────────────────────────────────────────
@@ -927,18 +978,6 @@ mod tests {
             ))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "result": ["h1", "h2", "h3"], "error": null, "id": 1
-            })))
-            .mount(&server)
-            .await;
-
-        // Detection step: get_address_txids confirms the deposit tx appears on-chain.
-        Mock::given(matchers::method("POST"))
-            .and(matchers::body_partial_json(
-                serde_json::json!({ "method": "getaddresstxids" }),
-            ))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "result": ["deptxid"],
-                "error": null, "id": 1
             })))
             .mount(&server)
             .await;
