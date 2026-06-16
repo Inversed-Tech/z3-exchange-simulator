@@ -18,9 +18,14 @@ For a plain-English explanation of what Zallet is and its role in the stack, see
 | Field | Value |
 |---|---|
 | Repository | https://github.com/zcash/wallet |
+| Version | `v0.1.0-alpha.3` (image `electriccoinco/zallet:v0.1.0-alpha.3`) |
 | Pinned commit | `6fc85f68cf5ebe456160c6518255a83129e7d21c` — see [`z3-commits.lock`](../../z3-commits.lock) |
 | Language | Rust (Edition 2024, MSRV 1.85) |
 | Binary name | `zallet` |
+
+> **Provenance note.** The `v0.1.0-alpha.3` git tag resolves to
+> `f0db32d23de36b9a8e0c48b4438d22ab076aca58`; the commit cited above (Foundation-provided)
+> is one commit later on the same line of history. Runtime is fixed by the image tag.
 
 ---
 
@@ -38,7 +43,7 @@ For a plain-English explanation of what Zallet is and its role in the stack, see
 ```sh
 git clone https://github.com/zcash/wallet external/zallet
 cd external/zallet
-git checkout 6fc85f68cf5ebe456160c6518255a83129e7d21c
+git checkout 6fc85f68cf5ebe456160c6518255a83129e7d21c   # v0.1.0-alpha.3 (see provenance note above)
 cargo build --release
 ```
 

@@ -125,15 +125,16 @@ make build
 ## Pinned commits
 
 All benchmark runs reference the commits in [`z3-commits.lock`](z3-commits.lock).
-The primary pin is the Z3 meta-repository; individual component commits are candidates
-pending Foundation confirmation.
+The primary pin is the Z3 meta-repository; component versions are determined by the
+images that Z3 commit pins. All pins are confirmed and frozen for the engagement —
+see [`docs/integration/pinned-commits.md`](docs/integration/pinned-commits.md).
 
-| Entity | Pinned commit | Status |
+| Entity | Version / image | Pinned commit |
 |---|---|---|
-| Z3 stack | TBD | Pending Foundation confirmation |
-| Zebra | `aba329d6dca884f6d42bb4d36bda0010a071c2fc` | Candidate |
-| Zaino | `93a9495336e7ee6f28ab1b02d1959a23b459f035` | Candidate |
-| Zallet | `6fc85f68cf5ebe456160c6518255a83129e7d21c` | Candidate |
+| Z3 stack | `main` | `dfb9d0eae6d3f67a3c184e0d8fcb1166e7740724` |
+| Zebra | `v5.0.0` (`zfnd/zebra:5.0.0`) | `1e6519ea91e2d3035c20aadd4d9a40dcac2eed3a` |
+| Zaino | `0.4.0-rc.2` (`zingodevops/zainod:0.4.0-rc.2`) | `0cf4fd5008a7536e3495e3e377073faac1cb28f3` |
+| Zallet | `v0.1.0-alpha.3` (`electriccoinco/zallet:v0.1.0-alpha.3`) | `6fc85f68cf5ebe456160c6518255a83129e7d21c` |
 
 ## Development commands
 

@@ -17,8 +17,8 @@ For a plain-English explanation of Zaino's role, see
 | Field | Value |
 |---|---|
 | Repository | https://github.com/zingolabs/zaino |
-| Pinned commit | `93a9495336e7ee6f28ab1b02d1959a23b459f035` (candidate — pending Z3 update confirmation) — see [`z3-commits.lock`](../../z3-commits.lock) |
-| Branch | `dev` |
+| Version | `0.4.0-rc.2` (image `zingodevops/zainod:0.4.0-rc.2`, `-no-tls` variant in regtest) |
+| Pinned commit | `0cf4fd5008a7536e3495e3e377073faac1cb28f3` — see [`z3-commits.lock`](../../z3-commits.lock) |
 | Language | Rust |
 | Binary name | `zainod` |
 | MSRV | 1.95.0 |
@@ -61,7 +61,7 @@ If building Zaino from source independently:
 ```sh
 git clone https://github.com/zingolabs/zaino external/zaino
 cd external/zaino
-git checkout 93a9495336e7ee6f28ab1b02d1959a23b459f035
+git checkout 0cf4fd5008a7536e3495e3e377073faac1cb28f3   # 0.4.0-rc.2
 cargo build --release
 ```
 
