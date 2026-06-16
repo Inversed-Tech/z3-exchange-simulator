@@ -407,6 +407,9 @@ pub struct RpcClient {
     metrics: Option<Arc<dyn MetricsRecorder>>,
     routing: HashMap<&'static str, Backend>,
     call_counter: AtomicU64,
+    /// Optional HTTP Basic Auth credentials. The Z3 regtest RPC Router requires
+    /// these (default `zebra` / `zebra`); mainnet/testnet use cookie auth instead.
+    auth: Option<(String, String)>,
 }
 
 impl RpcClient {
@@ -428,6 +431,27 @@ impl RpcClient {
             metrics,
             routing: routing_table(),
             call_counter: AtomicU64::new(0),
+            auth: None,
+        }
+    }
+
+    /// Attach HTTP Basic Auth credentials, sent on every request. Required by the
+    /// Z3 regtest RPC Router (default `zebra` / `zebra`).
+    pub fn with_basic_auth(
+        mut self,
+        username: impl Into<String>,
+        password: impl Into<String>,
+    ) -> Self {
+        self.auth = Some((username.into(), password.into()));
+        self
+    }
+
+    /// Build a POST request to the RPC endpoint, applying Basic Auth if configured.
+    fn request(&self) -> reqwest::RequestBuilder {
+        let builder = self.http.post(&self.base_url);
+        match &self.auth {
+            Some((user, pass)) => builder.basic_auth(user, Some(pass)),
+            None => builder,
         }
     }
 
@@ -453,8 +477,7 @@ impl RpcClient {
         // for early returns while still recording the RpcCall in all paths.
         let outcome: Result<T, RpcError> = async {
             let resp = self
-                .http
-                .post(&self.base_url)
+                .request()
                 .json(&JsonRpcRequest {
                     method,
                     params,
@@ -527,8 +550,7 @@ impl RpcClient {
 
         let outcome: Result<Option<T>, RpcError> = async {
             let resp = self
-                .http
-                .post(&self.base_url)
+                .request()
                 .json(&JsonRpcRequest {
                     method,
                     params,
@@ -1883,6 +1905,27 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(v.txid, "vt1");
+    }
+
+    #[tokio::test]
+    async fn with_basic_auth_sends_authorization_header() {
+        use wiremock::{matchers, Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        // base64("zebra:zebra") == "emVicmE6emVicmE=". The mock only matches when
+        // the Authorization header is present, so a missing header fails the call.
+        Mock::given(matchers::method("POST"))
+            .and(matchers::header("Authorization", "Basic emVicmE6emVicmE="))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": { "chain": "regtest", "blocks": 1, "headers": 1 },
+                "error": null, "id": 1
+            })))
+            .mount(&server)
+            .await;
+
+        let client =
+            RpcClient::new(&server.uri(), "test-run", None, None).with_basic_auth("zebra", "zebra");
+        // Succeeds only if the Authorization header was sent.
+        client.get_blockchain_info().await.unwrap();
     }
 
     #[test]
