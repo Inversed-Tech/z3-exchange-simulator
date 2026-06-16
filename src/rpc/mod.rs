@@ -410,6 +410,10 @@ pub struct RpcClient {
     /// Optional HTTP Basic Auth credentials. The Z3 regtest RPC Router requires
     /// these (default `zebra` / `zebra`); mainnet/testnet use cookie auth instead.
     auth: Option<(String, String)>,
+    /// When set, every RpcCall is tagged with this backend instead of consulting
+    /// the routing table. Used for clients pointed directly at Zaino's JSON-RPC
+    /// mirror, where the router's method→backend mapping does not apply.
+    backend_override: Option<Backend>,
 }
 
 impl RpcClient {
@@ -432,7 +436,22 @@ impl RpcClient {
             routing: routing_table(),
             call_counter: AtomicU64::new(0),
             auth: None,
+            backend_override: None,
         }
+    }
+
+    /// Build a client pointed at Zaino's zcashd-style JSON-RPC mirror (regtest
+    /// host port `:28237`). Every call it records is tagged `Backend::Zaino`, so
+    /// Zaino's latency is attributed to Zaino rather than folded into Zallet. The
+    /// typed Zebra-style read methods (`get_blockchain_info`, `get_raw_transaction`,
+    /// …) can be issued against it to exercise the mirror.
+    pub fn for_zaino_mirror(
+        base_url: impl Into<String>,
+        run_id: impl Into<String>,
+        metrics: Option<Arc<dyn MetricsRecorder>>,
+        timeout: Option<Duration>,
+    ) -> Self {
+        Self::new(base_url, run_id, metrics, timeout).with_backend_override(Backend::Zaino)
     }
 
     /// Attach HTTP Basic Auth credentials, sent on every request. Required by the
@@ -444,6 +463,23 @@ impl RpcClient {
     ) -> Self {
         self.auth = Some((username.into(), password.into()));
         self
+    }
+
+    /// Tag every recorded call with a fixed backend instead of consulting the
+    /// routing table. Used for the Zaino JSON-RPC mirror client.
+    pub fn with_backend_override(mut self, backend: Backend) -> Self {
+        self.backend_override = Some(backend);
+        self
+    }
+
+    /// Resolve the backend for a method: the override if set, else the routing table.
+    fn backend_for(&self, method: &str) -> Backend {
+        self.backend_override.clone().unwrap_or_else(|| {
+            self.routing
+                .get(method)
+                .cloned()
+                .unwrap_or(Backend::Unknown)
+        })
     }
 
     /// Build a POST request to the RPC endpoint, applying Basic Auth if configured.
@@ -466,11 +502,7 @@ impl RpcClient {
     ) -> Result<T, RpcError> {
         let n = self.call_counter.fetch_add(1, Ordering::Relaxed);
         let call_id = format!("{method}-{n}");
-        let backend = self
-            .routing
-            .get(method)
-            .cloned()
-            .unwrap_or(Backend::Unknown);
+        let backend = self.backend_for(method);
         let request_at = Utc::now();
 
         // Run the HTTP round-trip inside an async block so we can use `?`
@@ -541,11 +573,7 @@ impl RpcClient {
     ) -> Result<Option<T>, RpcError> {
         let n = self.call_counter.fetch_add(1, Ordering::Relaxed);
         let call_id = format!("{method}-{n}");
-        let backend = self
-            .routing
-            .get(method)
-            .cloned()
-            .unwrap_or(Backend::Unknown);
+        let backend = self.backend_for(method);
         let request_at = Utc::now();
 
         let outcome: Result<Option<T>, RpcError> = async {
@@ -1926,6 +1954,34 @@ mod tests {
             RpcClient::new(&server.uri(), "test-run", None, None).with_basic_auth("zebra", "zebra");
         // Succeeds only if the Authorization header was sent.
         client.get_blockchain_info().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn zaino_mirror_client_tags_calls_with_zaino_backend() {
+        use wiremock::{matchers, Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(matchers::method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": { "chain": "regtest", "blocks": 1, "headers": 1 },
+                "error": null, "id": 1
+            })))
+            .mount(&server)
+            .await;
+
+        let rec = MockRecorder::new();
+        let client = RpcClient::for_zaino_mirror(
+            &server.uri(),
+            "test-run",
+            Some(rec.clone() as Arc<dyn MetricsRecorder>),
+            None,
+        );
+        // getblockchaininfo routes to Zebra via the table, but the Zaino mirror
+        // override must win, attributing the call to Zaino.
+        client.get_blockchain_info().await.unwrap();
+
+        let calls = rec.recorded_calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].backend, Backend::Zaino);
     }
 
     #[test]

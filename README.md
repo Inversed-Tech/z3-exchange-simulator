@@ -41,7 +41,7 @@ components plus an RPC Router:
 |---|---|---|
 | **Z3 stack** | Docker Compose orchestration — the primary testing target | https://github.com/ZcashFoundation/z3 |
 | **Zebra** | Zcash full node — validates and maintains the local chain state | https://github.com/ZcashFoundation/zebra |
-| **Zaino** | Blockchain indexing — embedded in Zallet as a library; also standalone gRPC | https://github.com/zingolabs/zaino |
+| **Zaino** | Blockchain indexing — covered via its zcashd-style JSON-RPC mirror (`:28237`); lightwalletd gRPC (`:28137`) documented, out of scope | https://github.com/zingolabs/zaino |
 | **Zallet** | Wallet — address generation, signing, transaction broadcasting | https://github.com/zcash/wallet |
 | **RPC Router** | Single JSON-RPC endpoint (`:8181`) routing calls to Zebra or Zallet | Part of Z3 repo |
 

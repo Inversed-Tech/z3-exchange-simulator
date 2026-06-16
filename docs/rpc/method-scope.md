@@ -146,9 +146,11 @@ router). The router requires HTTP Basic Auth (default `zebra` / `zebra`) and tra
 forwards each method to the correct backend (Zebra or Zallet) based on the method name.
 The simulator does not call Zebra or Zallet directly.
 
-Zaino is not a direct JSON-RPC target. It runs as a library inside Zallet (for indexing)
-and as a separate gRPC container for light clients. Its latency is implicit in Zallet
-method response times.
+Zaino is covered separately, outside the router: the simulator points a dedicated client
+at Zaino's zcashd-style JSON-RPC mirror (regtest `:28237`), tagging those calls
+`Backend::Zaino`. Zaino's lightwalletd `CompactTxStreamer` gRPC surface (`:28137`) is
+documented but out of scope for this engagement. See
+[`docs/integration/zaino.md`](../integration/zaino.md).
 
 ---
 

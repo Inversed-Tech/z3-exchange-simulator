@@ -97,7 +97,7 @@ with `serde` derive macros for serialisation, and `derive(Debug, Clone)` through
 - Implement all `enum` types: `AccountStatus`, `ActivityProfile`, `AddressType`,
   `AddressPurpose`, `FlowType`, `TransactionStatus`, `DepositStatus`,
   `WithdrawalStatus`, `SweepStatus`, `Backend` (replaces `Z3Component` — values are
-  `Zebra`, `Zallet`, `Unknown`; Zaino is not a direct RPC target)
+  `Zebra`, `Zallet`, `Zaino`, `Unknown`; `Zaino` tags calls to Zaino's JSON-RPC mirror)
 - Add `impl` helpers only where genuinely needed (e.g. `FlowType::is_shielded()`)
 - Unit tests: serialise/deserialise roundtrip for every type
 
