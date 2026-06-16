@@ -273,6 +273,72 @@ pub struct Recipient {
     pub memo: Option<String>,
 }
 
+// ── Additional stress-test response types ─────────────────────────────────────
+//
+// Types for the stress-test methods added per the Foundation's confirmed list.
+// Each declares only the fields the simulator reads. Parameter shapes for a few
+// of these (noted on the methods below) are provisional and will be verified
+// against the live stack / OpenRPC discovery during integration testing.
+
+/// Returned by `getbestblockheightandhash` (Zebra-specific combined tip call).
+#[derive(Debug, Clone, Deserialize)]
+pub struct BestBlockHeightAndHash {
+    pub height: u64,
+    pub hash: String,
+}
+
+/// Returned by `getblocktemplate`. Only the fields the simulator uses are declared.
+#[derive(Debug, Clone, Deserialize)]
+pub struct BlockTemplate {
+    pub height: u64,
+    pub previousblockhash: String,
+}
+
+/// Returned by `z_gettreestate` (Zebra). Sapling and Orchard tree state at a block.
+#[derive(Debug, Clone, Deserialize)]
+pub struct TreeState {
+    pub height: u64,
+    pub hash: String,
+}
+
+/// One subtree entry from `z_getsubtreesbyindex`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Subtree {
+    pub root: String,
+    pub end_height: u64,
+}
+
+/// Returned by `z_getsubtreesbyindex` (Zebra). Note-commitment subtree roots.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Subtrees {
+    pub pool: String,
+    pub start_index: u64,
+    pub subtrees: Vec<Subtree>,
+}
+
+/// Returned by `z_getnotescount` (Zallet). Unspent note counts per shielded pool.
+#[derive(Debug, Clone, Deserialize)]
+pub struct NotesCount {
+    #[serde(default)]
+    pub sapling: u64,
+    #[serde(default)]
+    pub orchard: u64,
+}
+
+/// One entry from `z_listtransactions` (Zallet). Minimal projection.
+#[derive(Debug, Clone, Deserialize)]
+pub struct WalletTransaction {
+    pub txid: String,
+    #[serde(default)]
+    pub account: Option<String>,
+}
+
+/// Returned by `z_viewtransaction` (Zallet). Minimal projection.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ViewedTransaction {
+    pub txid: String,
+}
+
 // ── Routing table ─────────────────────────────────────────────────────────────
 //
 // Maps every method name to the backend the RPC Router forwards it to.
@@ -284,6 +350,7 @@ fn routing_table() -> HashMap<&'static str, Backend> {
         ("getblockchaininfo", Backend::Zebra),
         ("getblockcount", Backend::Zebra),
         ("getbestblockhash", Backend::Zebra),
+        ("getbestblockheightandhash", Backend::Zebra),
         ("getblock", Backend::Zebra),
         ("getblockhash", Backend::Zebra),
         ("getblockheader", Backend::Zebra),
@@ -617,6 +684,45 @@ impl RpcClient {
         self.call("generate", serde_json::json!([num_blocks])).await
     }
 
+    /// Chain tip height and hash in a single call (Zebra-specific).
+    pub async fn get_best_block_height_and_hash(&self) -> Result<BestBlockHeightAndHash, RpcError> {
+        self.call("getbestblockheightandhash", serde_json::json!([]))
+            .await
+    }
+
+    /// Fetch a block template. Used to drive regtest block production.
+    pub async fn get_block_template(&self) -> Result<BlockTemplate, RpcError> {
+        self.call("getblocktemplate", serde_json::json!([])).await
+    }
+
+    /// Submit a mined block. Returns `None` when the block is accepted, or
+    /// `Some(reason)` when the node rejects it (e.g. `"duplicate"`, `"rejected"`).
+    pub async fn submit_block(&self, block_hex: &str) -> Result<Option<String>, RpcError> {
+        self.call_nullable("submitblock", serde_json::json!([block_hex]))
+            .await
+    }
+
+    /// Sapling and Orchard commitment tree state at a block (hash or height).
+    pub async fn z_get_treestate(&self, block_ref: BlockRef<'_>) -> Result<TreeState, RpcError> {
+        self.call("z_gettreestate", serde_json::json!([block_ref]))
+            .await
+    }
+
+    /// Note-commitment subtree roots. `pool` is `"sapling"` or `"orchard"`;
+    /// `limit` is optional (pass `None` for the server default).
+    pub async fn z_get_subtrees_by_index(
+        &self,
+        pool: &str,
+        start_index: u64,
+        limit: Option<u64>,
+    ) -> Result<Subtrees, RpcError> {
+        let params = match limit {
+            Some(l) => serde_json::json!([pool, start_index, l]),
+            None => serde_json::json!([pool, start_index]),
+        };
+        self.call("z_getsubtreesbyindex", params).await
+    }
+
     // ── Zallet methods ────────────────────────────────────────────────────────
 
     /// Create a new wallet account. `name` is a human-readable label stored in
@@ -717,6 +823,35 @@ impl RpcClient {
 
     pub async fn get_wallet_info(&self) -> Result<WalletInfo, RpcError> {
         self.call("getwalletinfo", serde_json::json!([])).await
+    }
+
+    /// Count of unspent notes per shielded pool — a shielded state-size signal.
+    pub async fn z_get_notes_count(&self) -> Result<NotesCount, RpcError> {
+        self.call("z_getnotescount", serde_json::json!([])).await
+    }
+
+    /// List wallet transactions.
+    ///
+    /// NOTE: the exact parameter signature (account / count / from filters) is
+    /// provisional and must be confirmed against the live stack / `rpc.discover`.
+    /// Called here with no filter.
+    pub async fn z_list_transactions(&self) -> Result<Vec<WalletTransaction>, RpcError> {
+        self.call("z_listtransactions", serde_json::json!([])).await
+    }
+
+    /// Decode and return full details of a wallet transaction.
+    pub async fn z_view_transaction(&self, txid: &str) -> Result<ViewedTransaction, RpcError> {
+        self.call("z_viewtransaction", serde_json::json!([txid]))
+            .await
+    }
+
+    /// Recover accounts from the wallet seed — used during wallet-reset scenarios.
+    ///
+    /// NOTE: the exact parameter signature is provisional and must be confirmed
+    /// against the live stack / `rpc.discover`. Called here with no arguments;
+    /// returns the recovered accounts.
+    pub async fn z_recover_accounts(&self) -> Result<Vec<AccountInfo>, RpcError> {
+        self.call("z_recoveraccounts", serde_json::json!([])).await
     }
 }
 
@@ -1550,5 +1685,200 @@ mod tests {
         let hashes = client(&server.uri()).generate(3).await.unwrap();
         assert_eq!(hashes.len(), 3);
         assert_eq!(hashes[0], "hash1");
+    }
+
+    // ── Added stress-test methods ─────────────────────────────────────────────
+
+    #[test]
+    fn routing_table_maps_getbestblockheightandhash_to_zebra() {
+        assert_eq!(
+            routing_table().get("getbestblockheightandhash"),
+            Some(&Backend::Zebra)
+        );
+    }
+
+    #[tokio::test]
+    async fn get_best_block_height_and_hash_parses() {
+        use wiremock::{matchers, Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(matchers::method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": { "height": 100, "hash": "abc" }, "error": null, "id": 1
+            })))
+            .mount(&server)
+            .await;
+        let r = client(&server.uri())
+            .get_best_block_height_and_hash()
+            .await
+            .unwrap();
+        assert_eq!(r.height, 100);
+        assert_eq!(r.hash, "abc");
+    }
+
+    #[tokio::test]
+    async fn get_block_template_parses_height_and_prev_hash() {
+        use wiremock::{matchers, Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(matchers::method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": { "height": 5, "previousblockhash": "prev", "extra": "ignored" },
+                "error": null, "id": 1
+            })))
+            .mount(&server)
+            .await;
+        let t = client(&server.uri()).get_block_template().await.unwrap();
+        assert_eq!(t.height, 5);
+        assert_eq!(t.previousblockhash, "prev");
+    }
+
+    #[tokio::test]
+    async fn submit_block_returns_none_on_acceptance() {
+        use wiremock::{matchers, Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(matchers::method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "result": null, "error": null, "id": 1 })),
+            )
+            .mount(&server)
+            .await;
+        let r = client(&server.uri())
+            .submit_block("deadbeef")
+            .await
+            .unwrap();
+        assert!(r.is_none());
+    }
+
+    #[tokio::test]
+    async fn submit_block_returns_reason_on_rejection() {
+        use wiremock::{matchers, Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(matchers::method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": "duplicate", "error": null, "id": 1
+            })))
+            .mount(&server)
+            .await;
+        let r = client(&server.uri())
+            .submit_block("deadbeef")
+            .await
+            .unwrap();
+        assert_eq!(r.as_deref(), Some("duplicate"));
+    }
+
+    #[tokio::test]
+    async fn z_get_treestate_parses() {
+        use wiremock::{matchers, Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(matchers::method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": { "height": 9, "hash": "h9", "sapling": {}, "orchard": {} },
+                "error": null, "id": 1
+            })))
+            .mount(&server)
+            .await;
+        let ts = client(&server.uri())
+            .z_get_treestate(BlockRef::Height(9))
+            .await
+            .unwrap();
+        assert_eq!(ts.height, 9);
+        assert_eq!(ts.hash, "h9");
+    }
+
+    #[tokio::test]
+    async fn z_get_subtrees_by_index_parses_and_sends_limit() {
+        use wiremock::{matchers, Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(matchers::method("POST"))
+            .and(matchers::body_partial_json(serde_json::json!({
+                "params": ["orchard", 0, 10]
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": {
+                    "pool": "orchard",
+                    "start_index": 0,
+                    "subtrees": [{ "root": "r1", "end_height": 42 }]
+                },
+                "error": null, "id": 1
+            })))
+            .mount(&server)
+            .await;
+        let s = client(&server.uri())
+            .z_get_subtrees_by_index("orchard", 0, Some(10))
+            .await
+            .unwrap();
+        assert_eq!(s.pool, "orchard");
+        assert_eq!(s.subtrees.len(), 1);
+        assert_eq!(s.subtrees[0].end_height, 42);
+    }
+
+    #[tokio::test]
+    async fn z_get_notes_count_parses_pools() {
+        use wiremock::{matchers, Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(matchers::method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": { "sapling": 3, "orchard": 7 }, "error": null, "id": 1
+            })))
+            .mount(&server)
+            .await;
+        let n = client(&server.uri()).z_get_notes_count().await.unwrap();
+        assert_eq!(n.sapling, 3);
+        assert_eq!(n.orchard, 7);
+    }
+
+    #[tokio::test]
+    async fn z_list_transactions_parses_list() {
+        use wiremock::{matchers, Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(matchers::method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [
+                    { "txid": "t1", "account": "uuid-1" },
+                    { "txid": "t2" }
+                ],
+                "error": null, "id": 1
+            })))
+            .mount(&server)
+            .await;
+        let txs = client(&server.uri()).z_list_transactions().await.unwrap();
+        assert_eq!(txs.len(), 2);
+        assert_eq!(txs[0].txid, "t1");
+        assert_eq!(txs[0].account.as_deref(), Some("uuid-1"));
+        assert!(txs[1].account.is_none());
+    }
+
+    #[tokio::test]
+    async fn z_view_transaction_parses() {
+        use wiremock::{matchers, Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(matchers::method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": { "txid": "vt1", "spends": [], "outputs": [] },
+                "error": null, "id": 1
+            })))
+            .mount(&server)
+            .await;
+        let v = client(&server.uri())
+            .z_view_transaction("vt1")
+            .await
+            .unwrap();
+        assert_eq!(v.txid, "vt1");
+    }
+
+    #[tokio::test]
+    async fn z_recover_accounts_parses_account_list() {
+        use wiremock::{matchers, Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(matchers::method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [{ "account": "uuid-r", "name": "recovered" }],
+                "error": null, "id": 1
+            })))
+            .mount(&server)
+            .await;
+        let accts = client(&server.uri()).z_recover_accounts().await.unwrap();
+        assert_eq!(accts.len(), 1);
+        assert_eq!(accts[0].account, "uuid-r");
     }
 }
