@@ -367,8 +367,11 @@ fn routing_table() -> HashMap<&'static str, Backend> {
         ("submitblock", Backend::Zebra),
         ("z_gettreestate", Backend::Zebra),
         ("z_getsubtreesbyindex", Backend::Zebra),
-        // Zebra — smoke-test
+        // Zebra — regtest-control
         ("generate", Backend::Zebra),
+        ("invalidateblock", Backend::Zebra),
+        ("reconsiderblock", Backend::Zebra),
+        // Zebra — smoke / compatibility
         ("validateaddress", Backend::Zebra),
         ("z_validateaddress", Backend::Zebra),
         ("z_listunifiedreceivers", Backend::Zebra),
@@ -682,6 +685,22 @@ impl RpcClient {
     /// Mine `num_blocks` blocks immediately. Regtest only.
     pub async fn generate(&self, num_blocks: u32) -> Result<Vec<String>, RpcError> {
         self.call("generate", serde_json::json!([num_blocks])).await
+    }
+
+    /// Mark a block (and its descendants) as invalid, rolling the chain back to
+    /// its parent. Regtest chain-reorganization control. Returns `()` on success.
+    pub async fn invalidate_block(&self, block_hash: &str) -> Result<(), RpcError> {
+        self.call_nullable::<serde_json::Value>("invalidateblock", serde_json::json!([block_hash]))
+            .await
+            .map(|_| ())
+    }
+
+    /// Undo a previous `invalidateblock`, restoring the block for reconsideration.
+    /// Regtest chain-reorganization control. Returns `()` on success.
+    pub async fn reconsider_block(&self, block_hash: &str) -> Result<(), RpcError> {
+        self.call_nullable::<serde_json::Value>("reconsiderblock", serde_json::json!([block_hash]))
+            .await
+            .map(|_| ())
     }
 
     /// Chain tip height and hash in a single call (Zebra-specific).
@@ -1864,6 +1883,73 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(v.txid, "vt1");
+    }
+
+    #[test]
+    fn routing_table_maps_regtest_control_methods_to_zebra() {
+        let table = routing_table();
+        for method in ["generate", "invalidateblock", "reconsiderblock"] {
+            assert_eq!(table.get(method), Some(&Backend::Zebra), "for {method}");
+        }
+    }
+
+    #[tokio::test]
+    async fn invalidate_block_succeeds_on_null_result() {
+        use wiremock::{matchers, Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(matchers::method("POST"))
+            .and(matchers::body_partial_json(serde_json::json!({
+                "method": "invalidateblock", "params": ["blockhash"]
+            })))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "result": null, "error": null, "id": 1 })),
+            )
+            .mount(&server)
+            .await;
+        client(&server.uri())
+            .invalidate_block("blockhash")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn reconsider_block_succeeds_on_null_result() {
+        use wiremock::{matchers, Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(matchers::method("POST"))
+            .and(matchers::body_partial_json(serde_json::json!({
+                "method": "reconsiderblock", "params": ["blockhash"]
+            })))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "result": null, "error": null, "id": 1 })),
+            )
+            .mount(&server)
+            .await;
+        client(&server.uri())
+            .reconsider_block("blockhash")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn invalidate_block_propagates_json_rpc_error() {
+        use wiremock::{matchers, Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(matchers::method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": null,
+                "error": { "code": -5, "message": "Block not found" },
+                "id": 1
+            })))
+            .mount(&server)
+            .await;
+        let err = client(&server.uri())
+            .invalidate_block("nope")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, RpcError::JsonRpc { code: -5, .. }));
     }
 
     #[tokio::test]

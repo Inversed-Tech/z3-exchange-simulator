@@ -5,3 +5,4 @@
 //! against the live Z3 stack via the RPC client.
 
 pub mod exchange;
+pub mod regtest_control;
