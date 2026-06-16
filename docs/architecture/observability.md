@@ -188,40 +188,66 @@ Run directories are gitignored and are not tracked by version control.
 
 | Component | Metrics endpoint | Details |
 |---|---|---|
-| **Zebra** | Yes — Prometheus | `http://localhost:9999/metrics`, disabled by default. Enable via `[metrics] endpoint_addr = "0.0.0.0:9999"` in `zebrad.toml`. Exposes chain sync, block/tx verification times, peer connections, and more. |
-| **Zaino** | No | Uses `tracing` crate for structured logging only. No HTTP metrics endpoint at pinned commit. |
-| **Zallet** | No | Uses `tracing` crate for structured logging only. No HTTP metrics endpoint at pinned commit. |
+| **Zebra** | Yes — Prometheus | In-network scrape endpoint on `:9999` (`ZEBRA_METRICS__ENDPOINT_ADDR`, default `0.0.0.0:9999`). Exposes chain sync, block/tx verification times, peer connections, and more. Scraped by the monitoring profile's Prometheus. |
+| **Zaino** | No HTTP metrics | Structured `tracing` logs only; resource usage captured via `docker stats`. |
+| **Zallet** | No HTTP metrics | Structured `tracing` logs only; resource usage captured via `docker stats`. |
 
-The simulator should enable Zebra's Prometheus endpoint in the regtest config and
-optionally scrape it during runs for richer chain-level metrics. Zaino and Zallet
-resource usage is measured via OS-level polling.
+---
+
+## Z3 monitoring profile (cross-validation)
+
+Z3 ships an opt-in `monitoring` Compose profile — **Prometheus, Grafana, Jaeger (with
+spanmetrics), and AlertManager** — declared in `z3-contract.yaml` under
+`profiles: monitoring`. It scrapes Zebra's Prometheus endpoint and collects OpenTelemetry
+traces (via `ZEBRA_TRACING__OPENTELEMETRY_ENDPOINT`), giving **server-side per-RPC latency
+and resource profiles** out of the box.
+
+The simulator's own client-side measurements (`rpc_calls.jsonl`, `metrics.jsonl`) remain
+the authoritative findings source — they are transport-accurate and reproducible. The Z3
+monitoring profile is used to **cross-validate** those numbers: Jaeger spanmetrics give a
+server-side latency view per RPC that should track the client-side histograms, and the
+Grafana dashboards are useful for the live demonstration.
+
+Bring it up alongside the stack with the profile enabled (regtest host ports from the
+contract: Grafana `23000`, Prometheus `29094`, Jaeger UI `36686`):
+
+```sh
+docker compose --env-file .env.regtest --profile monitoring up -d
+```
+
+Enabling the profile is **optional** and additive — the simulator runs and produces all
+findings without it.
 
 ---
 
 ## Resource profiling (CPU and memory)
 
-CPU and memory usage of all three Z3 processes are sampled during runs to identify
-resource bottlenecks at scale.
+CPU and memory usage of the Z3 containers are sampled during runs to identify resource
+bottlenecks at scale.
 
 **Always-on.** Resource profiling runs on every scenario — the polling overhead is
 negligible and resource behavior under load is a core project deliverable.
 
-Approach:
-- **Zebra**: OS-level polling supplemented by Prometheus endpoint scraping where enabled
-- **Zaino / Zallet**: OS-level polling via `/proc/<pid>/stat` (Linux) or `ps` (macOS)
+Approach: the harness polls `docker stats --no-stream`, scoped to the active network's
+Compose project (containers named `z3-regtest-*`), and records CPU % and memory for each.
+Zebra's Prometheus endpoint (and the monitoring profile, when enabled) supplements this
+with richer chain-level metrics.
 
 Resource samples are written to `metrics.jsonl` using metric names like
 `process_cpu_percent` and `process_memory_mb` with a `process` label.
 
 ---
 
-## Mempool notification mechanism
+## Mempool monitoring
 
-ZMQ is not used anywhere in Z3. Both Zebra and Zaino provide gRPC-based streaming instead.
+The simulator monitors the mempool by **polling** `getrawmempool` / `getmempoolinfo`
+through the RPC Router (see the mempool watcher in `src/scenarios/exchange.rs`), recording
+`mempool_tx_count`, `mempool_bytes`, and saturation events.
+
+ZMQ is not used anywhere in Z3; the push-based replacements below are **documented but out
+of scope for this engagement** (no gRPC client is built):
 
 | Component | Mechanism | Details |
 |---|---|---|
-| **Zebra** | `Indexer.mempool_change()` gRPC stream | Pushes `MempoolChangeMessage` with `change_type` (ADDED / INVALIDATED / MINED) and `tx_hash`. Requires `--features indexer` build flag and `[rpc] indexer_listen_addr = "127.0.0.1:8230"` in config. |
+| **Zebra** | `Indexer.mempool_change()` gRPC stream | Pushes `MempoolChangeMessage` with `change_type` (ADDED / INVALIDATED / MINED) and `tx_hash`. Requires `--features indexer` build flag and an `indexer_listen_addr` in config. |
 | **Zaino** | `GetMempoolTx` / `GetMempoolStream` gRPC streams | `GetMempoolStream` streams all mempool transactions until the next block is mined. `GetMempoolTx` streams compact transactions with optional txid filtering. |
-
-**For the simulator:** Use Zebra's `Indexer.mempool_change()` for event-driven deposit detection — it tells you exactly when a transaction is added, invalidated, or mined. Use Zaino's `GetMempoolStream` as a secondary signal for mempool saturation measurement. Polling `getrawmempool` remains a fallback if gRPC is not configured.
