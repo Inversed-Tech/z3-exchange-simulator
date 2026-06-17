@@ -125,7 +125,9 @@ pub async fn run_reorg(
 
     Ok(ReorgResult {
         start_height,
-        mined_blocks: depth,
+        // Record the blocks actually produced, not the requested depth — they can
+        // differ if `generate` returns fewer hashes than asked.
+        mined_blocks: mined.len() as u32,
         invalidated_hash,
         height_after_invalidate,
         height_after_reconsider,
@@ -231,6 +233,53 @@ mod tests {
         assert!(samples
             .iter()
             .any(|s| s.metric_name == "reorg_branch_blocks" && s.value == 3.0));
+    }
+
+    #[tokio::test]
+    async fn run_reorg_reports_actual_mined_count_not_requested_depth() {
+        use wiremock::{matchers, Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+
+        Mock::given(matchers::method("POST"))
+            .and(matchers::body_partial_json(
+                serde_json::json!({ "method": "getblockcount" }),
+            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "result": 1, "error": null, "id": 1 })),
+            )
+            .mount(&server)
+            .await;
+        // Requested depth is 5, but the node only returns 2 block hashes.
+        Mock::given(matchers::method("POST"))
+            .and(matchers::body_partial_json(
+                serde_json::json!({ "method": "generate" }),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": ["only1", "only2"], "error": null, "id": 1
+            })))
+            .mount(&server)
+            .await;
+        for method in ["invalidateblock", "reconsiderblock"] {
+            Mock::given(matchers::method("POST"))
+                .and(matchers::body_partial_json(
+                    serde_json::json!({ "method": method }),
+                ))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(
+                        serde_json::json!({ "result": null, "error": null, "id": 1 }),
+                    ),
+                )
+                .mount(&server)
+                .await;
+        }
+
+        let result = run_reorg(&rpc(&server.uri()), 5, "run-1", None)
+            .await
+            .unwrap();
+        // Reflects the 2 blocks actually produced, not the requested depth of 5.
+        assert_eq!(result.mined_blocks, 2);
+        assert_eq!(result.invalidated_hash, "only1");
     }
 
     #[tokio::test]

@@ -348,6 +348,17 @@ async fn capture_logs(compose_dir: &Path, service: &str, log_path: &Path) {
     }
 }
 
+/// Whether a `docker stats` container name belongs to the given Compose project.
+///
+/// Compose v2 names containers `<project>-<service>-<n>`, so we match on the
+/// `<project>-` prefix. The trailing hyphen is significant: it stops a project
+/// named `z3` from matching `z3-regtest-…`, and keeps the per-network projects
+/// (`z3-mainnet` / `z3-testnet` / `z3-regtest`) from capturing each other's
+/// containers.
+fn container_in_project(container_name: &str, compose_project: &str) -> bool {
+    container_name.starts_with(&format!("{compose_project}-"))
+}
+
 async fn sample_resources(
     run_id: String,
     compose_project: String,
@@ -357,10 +368,6 @@ async fn sample_resources(
     let Some(m) = metrics else { return };
     let mut ticker = time::interval(Duration::from_secs(interval_secs));
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
-
-    // Compose v2 names containers `<project>-<service>-<n>`; we use this prefix
-    // to scope `docker stats` (which samples all host containers) to our stack.
-    let name_prefix = format!("{compose_project}-");
 
     loop {
         ticker.tick().await;
@@ -382,7 +389,7 @@ async fn sample_resources(
                 continue;
             };
             // Only sample containers belonging to this Z3 network's project.
-            if !name.starts_with(&name_prefix) {
+            if !container_in_project(name, &compose_project) {
                 continue;
             }
             let labels = HashMap::from([("process".to_string(), name.to_string())]);
@@ -653,6 +660,39 @@ networks:
     }
 
     // ── parse_cpu_percent ────────────────────────────────────────────────────
+
+    // ── container_in_project (docker stats scoping) ───────────────────────────
+
+    #[test]
+    fn container_in_project_matches_own_services() {
+        assert!(container_in_project("z3-regtest-zebra-1", "z3-regtest"));
+        assert!(container_in_project("z3-regtest-zallet-1", "z3-regtest"));
+        assert!(container_in_project("z3-regtest-zaino-1", "z3-regtest"));
+        assert!(container_in_project(
+            "z3-regtest-rpc-router-1",
+            "z3-regtest"
+        ));
+    }
+
+    #[test]
+    fn container_in_project_excludes_other_networks_and_apps() {
+        // Other Z3 networks must not be captured by the regtest sampler.
+        assert!(!container_in_project("z3-mainnet-zebra-1", "z3-regtest"));
+        assert!(!container_in_project("z3-testnet-zebra-1", "z3-regtest"));
+        // Unrelated host containers are ignored.
+        assert!(!container_in_project("some-other-app-1", "z3-regtest"));
+        assert!(!container_in_project("postgres", "z3-regtest"));
+    }
+
+    #[test]
+    fn container_in_project_requires_the_hyphen_separator() {
+        // The trailing hyphen prevents a longer sibling project name from being
+        // captured by a shorter one, and requires the literal `<project>-` boundary.
+        assert!(!container_in_project("z3-regtestnet-zebra-1", "z3-regtest"));
+        assert!(!container_in_project("z3regtest-zebra-1", "z3-regtest"));
+        // The exact project name without the service suffix is not a container.
+        assert!(!container_in_project("z3-regtest", "z3-regtest"));
+    }
 
     #[test]
     fn parse_cpu_100_percent() {
