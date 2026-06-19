@@ -93,12 +93,17 @@ pub enum SweepStatus {
     Failed,
 }
 
-/// Which Z3 backend the RPC Router forwarded a call to.
-/// Derived from the method routing table, not from which URL was called.
+/// Which Z3 backend served an RPC call.
+///
+/// For calls through the regtest RPC Router this is derived from the method
+/// routing table (Zebra or Zallet). For calls made directly to Zaino's
+/// zcashd-style JSON-RPC mirror, the client tags every call `Zaino` via a
+/// backend override (the routing table does not apply to that endpoint).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Backend {
     Zebra,
     Zallet,
+    Zaino,
     Unknown,
 }
 
@@ -777,7 +782,7 @@ mod tests {
         // None of these enums use #[serde(other)], so unknown variants must fail.
         assert!(serde_json::from_str::<AccountStatus>(r#""suspended""#).is_err());
         assert!(serde_json::from_str::<FlowType>(r#""t_to_everything""#).is_err());
-        assert!(serde_json::from_str::<Backend>(r#""Zaino""#).is_err());
+        assert!(serde_json::from_str::<Backend>(r#""Lightwalletd""#).is_err());
         assert!(serde_json::from_str::<DepositStatus>(r#""bounced""#).is_err());
     }
 

@@ -10,6 +10,14 @@ RPC method list organised by test category.
 state-size-sensitive, mempool-sensitive, or likely to degrade with account, transaction,
 UTXO, note, or block volume. Latency histograms and failure rates are recorded for each.
 
+**Regtest-control** — deterministic chain-manipulation methods that only exist in
+regtest (`generate`, `invalidateblock`, `reconsiderblock`). They shape the test rather
+than being part of the workload under measurement, so they are driven by scenario logic
+(setup, block production, reorg scenarios) and are **excluded from the stress latency
+histograms** to keep the workload statistics clean. The Foundation specifically asked
+for these to be included; they are first-class and scenario-driven, not passive
+references.
+
 **Smoke-test / compatibility** — called once or a small number of times to verify
 presence and basic correctness. Not subjected to load. Used to populate the RPC
 compatibility matrix.
@@ -25,6 +33,7 @@ compatibility matrix.
 | `getblockchaininfo` | Node health and chain identification — primary smoke signal at start of every run |
 | `getblockcount` | Current block height — used to count confirmations on deposits |
 | `getbestblockhash` | Hash of the current chain tip |
+| `getbestblockheightandhash` | Chain tip height and hash in one call (Zebra-specific) |
 | `getblock` | Fetch a full block — used to detect incoming deposits |
 | `getblockhash` | Get a block's hash by height |
 | `getblockheader` | Block header without the full transaction list |
@@ -72,13 +81,28 @@ compatibility matrix.
 
 ---
 
+## Regtest-control methods
+
+### Zebra (via RPC Router)
+
+| Method | What it does |
+|---|---|
+| `generate` | Mine N blocks on demand — block production for setup and confirmations |
+| `invalidateblock` | Mark a block as invalid — drives chain-reorganization scenarios |
+| `reconsiderblock` | Undo a previous `invalidateblock` — restores the invalidated branch |
+
+These are exercised by scenario logic (warmup block production, deposit/withdrawal
+confirmation, and a dedicated reorg scenario) and are excluded from stress latency
+histograms.
+
+---
+
 ## Smoke-test / compatibility methods
 
 ### Zebra (via RPC Router)
 
 | Method | What it does |
 |---|---|
-| `generate` | Mine N blocks on demand — regtest chain control |
 | `validateaddress` | Confirm a transparent address is valid |
 | `z_validateaddress` | Confirm a shielded address is valid |
 | `z_listunifiedreceivers` | List the individual receivers within a Unified Address |
@@ -92,8 +116,6 @@ compatibility matrix.
 | `getpeerinfo` | (also stress-tested; listed here for completeness) |
 | `addnode` | Add a peer to the node's address book |
 | `ping` | Ping all connected peers |
-| `invalidateblock` | Mark a block as invalid — chain reorganization testing |
-| `reconsiderblock` | Undo a previous `invalidateblock` |
 | `rpc.discover` | OpenRPC service discovery |
 | `stop` | Graceful node shutdown |
 
@@ -111,19 +133,24 @@ compatibility matrix.
 
 ---
 
-## Total: 35 stress-test methods + 24 smoke-test methods
+## Total: 36 stress-test + 3 regtest-control + 21 smoke/compatibility methods
+
+(`getrawtransaction` and `z_listunifiedreceivers` appear under both backends.)
 
 ---
 
 ## Routing note
 
-All calls go through the Z3 RPC Router at `:8181` (regtest). The router transparently
+All calls go through the Z3 RPC Router at `:8181` (regtest, the only network with a
+router). The router requires HTTP Basic Auth (default `zebra` / `zebra`) and transparently
 forwards each method to the correct backend (Zebra or Zallet) based on the method name.
 The simulator does not call Zebra or Zallet directly.
 
-Zaino is not a direct JSON-RPC target. It runs as a library inside Zallet (for indexing)
-and as a separate gRPC container for light clients. Its latency is implicit in Zallet
-method response times.
+Zaino is covered separately, outside the router: the simulator points a dedicated client
+at Zaino's zcashd-style JSON-RPC mirror (regtest `:28237`), tagging those calls
+`Backend::Zaino`. Zaino's lightwalletd `CompactTxStreamer` gRPC surface (`:28137`) is
+documented but out of scope for this engagement. See
+[`docs/integration/zaino.md`](../integration/zaino.md).
 
 ---
 

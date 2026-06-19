@@ -38,9 +38,20 @@ Flow fractions must sum to 1.0.
 | `ramp` | Linearly increasing TPS | TBD | TBD | Find inflection point |
 | `burst` | Spike then recovery | TBD | TBD | Model sudden volume events |
 | `mixed` | Steady with shielded mix | TBD | TBD | Exercise full shielded RPC surface |
+| `reorg` | Regtest-control | N/A | N/A | Mine a branch, `invalidateblock`, `reconsiderblock`; verify rollback/restore (`src/scenarios/regtest_control.rs`) |
 
 Account counts and TPS targets for non-smoke scenarios are calibrated after initial
 load runs establish baseline performance.
+
+The `reorg` scenario uses the regtest-control methods (`generate`, `invalidateblock`,
+`reconsiderblock`); it exercises chain manipulation rather than transaction load, so it
+carries no TPS/account targets and is excluded from the stress latency histograms.
+
+## Zaino coverage
+
+Scenarios that exercise indexer reads additionally drive Zaino's zcashd-style JSON-RPC
+mirror (regtest `:28237`) through a dedicated client, recording latency against the
+`Zaino` backend. See [`docs/integration/zaino.md`](../integration/zaino.md).
 
 ## Reproducibility
 

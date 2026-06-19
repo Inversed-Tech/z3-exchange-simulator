@@ -273,6 +273,72 @@ pub struct Recipient {
     pub memo: Option<String>,
 }
 
+// ── Additional stress-test response types ─────────────────────────────────────
+//
+// Types for the stress-test methods added per the Foundation's confirmed list.
+// Each declares only the fields the simulator reads. Parameter shapes for a few
+// of these (noted on the methods below) are provisional and will be verified
+// against the live stack / OpenRPC discovery during integration testing.
+
+/// Returned by `getbestblockheightandhash` (Zebra-specific combined tip call).
+#[derive(Debug, Clone, Deserialize)]
+pub struct BestBlockHeightAndHash {
+    pub height: u64,
+    pub hash: String,
+}
+
+/// Returned by `getblocktemplate`. Only the fields the simulator uses are declared.
+#[derive(Debug, Clone, Deserialize)]
+pub struct BlockTemplate {
+    pub height: u64,
+    pub previousblockhash: String,
+}
+
+/// Returned by `z_gettreestate` (Zebra). Sapling and Orchard tree state at a block.
+#[derive(Debug, Clone, Deserialize)]
+pub struct TreeState {
+    pub height: u64,
+    pub hash: String,
+}
+
+/// One subtree entry from `z_getsubtreesbyindex`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Subtree {
+    pub root: String,
+    pub end_height: u64,
+}
+
+/// Returned by `z_getsubtreesbyindex` (Zebra). Note-commitment subtree roots.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Subtrees {
+    pub pool: String,
+    pub start_index: u64,
+    pub subtrees: Vec<Subtree>,
+}
+
+/// Returned by `z_getnotescount` (Zallet). Unspent note counts per shielded pool.
+#[derive(Debug, Clone, Deserialize)]
+pub struct NotesCount {
+    #[serde(default)]
+    pub sapling: u64,
+    #[serde(default)]
+    pub orchard: u64,
+}
+
+/// One entry from `z_listtransactions` (Zallet). Minimal projection.
+#[derive(Debug, Clone, Deserialize)]
+pub struct WalletTransaction {
+    pub txid: String,
+    #[serde(default)]
+    pub account: Option<String>,
+}
+
+/// Returned by `z_viewtransaction` (Zallet). Minimal projection.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ViewedTransaction {
+    pub txid: String,
+}
+
 // ── Routing table ─────────────────────────────────────────────────────────────
 //
 // Maps every method name to the backend the RPC Router forwards it to.
@@ -284,6 +350,7 @@ fn routing_table() -> HashMap<&'static str, Backend> {
         ("getblockchaininfo", Backend::Zebra),
         ("getblockcount", Backend::Zebra),
         ("getbestblockhash", Backend::Zebra),
+        ("getbestblockheightandhash", Backend::Zebra),
         ("getblock", Backend::Zebra),
         ("getblockhash", Backend::Zebra),
         ("getblockheader", Backend::Zebra),
@@ -300,8 +367,11 @@ fn routing_table() -> HashMap<&'static str, Backend> {
         ("submitblock", Backend::Zebra),
         ("z_gettreestate", Backend::Zebra),
         ("z_getsubtreesbyindex", Backend::Zebra),
-        // Zebra — smoke-test
+        // Zebra — regtest-control
         ("generate", Backend::Zebra),
+        ("invalidateblock", Backend::Zebra),
+        ("reconsiderblock", Backend::Zebra),
+        // Zebra — smoke / compatibility
         ("validateaddress", Backend::Zebra),
         ("z_validateaddress", Backend::Zebra),
         ("z_listunifiedreceivers", Backend::Zebra),
@@ -337,6 +407,13 @@ pub struct RpcClient {
     metrics: Option<Arc<dyn MetricsRecorder>>,
     routing: HashMap<&'static str, Backend>,
     call_counter: AtomicU64,
+    /// Optional HTTP Basic Auth credentials. The Z3 regtest RPC Router requires
+    /// these (default `zebra` / `zebra`); mainnet/testnet use cookie auth instead.
+    auth: Option<(String, String)>,
+    /// When set, every RpcCall is tagged with this backend instead of consulting
+    /// the routing table. Used for clients pointed directly at Zaino's JSON-RPC
+    /// mirror, where the router's method→backend mapping does not apply.
+    backend_override: Option<Backend>,
 }
 
 impl RpcClient {
@@ -358,6 +435,59 @@ impl RpcClient {
             metrics,
             routing: routing_table(),
             call_counter: AtomicU64::new(0),
+            auth: None,
+            backend_override: None,
+        }
+    }
+
+    /// Build a client pointed at Zaino's zcashd-style JSON-RPC mirror (regtest
+    /// host port `:28237`). Every call it records is tagged `Backend::Zaino`, so
+    /// Zaino's latency is attributed to Zaino rather than folded into Zallet. The
+    /// typed Zebra-style read methods (`get_blockchain_info`, `get_raw_transaction`,
+    /// …) can be issued against it to exercise the mirror.
+    pub fn for_zaino_mirror(
+        base_url: impl Into<String>,
+        run_id: impl Into<String>,
+        metrics: Option<Arc<dyn MetricsRecorder>>,
+        timeout: Option<Duration>,
+    ) -> Self {
+        Self::new(base_url, run_id, metrics, timeout).with_backend_override(Backend::Zaino)
+    }
+
+    /// Attach HTTP Basic Auth credentials, sent on every request. Required by the
+    /// Z3 regtest RPC Router (default `zebra` / `zebra`).
+    pub fn with_basic_auth(
+        mut self,
+        username: impl Into<String>,
+        password: impl Into<String>,
+    ) -> Self {
+        self.auth = Some((username.into(), password.into()));
+        self
+    }
+
+    /// Tag every recorded call with a fixed backend instead of consulting the
+    /// routing table. Used for the Zaino JSON-RPC mirror client.
+    pub fn with_backend_override(mut self, backend: Backend) -> Self {
+        self.backend_override = Some(backend);
+        self
+    }
+
+    /// Resolve the backend for a method: the override if set, else the routing table.
+    fn backend_for(&self, method: &str) -> Backend {
+        self.backend_override.clone().unwrap_or_else(|| {
+            self.routing
+                .get(method)
+                .cloned()
+                .unwrap_or(Backend::Unknown)
+        })
+    }
+
+    /// Build a POST request to the RPC endpoint, applying Basic Auth if configured.
+    fn request(&self) -> reqwest::RequestBuilder {
+        let builder = self.http.post(&self.base_url);
+        match &self.auth {
+            Some((user, pass)) => builder.basic_auth(user, Some(pass)),
+            None => builder,
         }
     }
 
@@ -372,19 +502,14 @@ impl RpcClient {
     ) -> Result<T, RpcError> {
         let n = self.call_counter.fetch_add(1, Ordering::Relaxed);
         let call_id = format!("{method}-{n}");
-        let backend = self
-            .routing
-            .get(method)
-            .cloned()
-            .unwrap_or(Backend::Unknown);
+        let backend = self.backend_for(method);
         let request_at = Utc::now();
 
         // Run the HTTP round-trip inside an async block so we can use `?`
         // for early returns while still recording the RpcCall in all paths.
         let outcome: Result<T, RpcError> = async {
             let resp = self
-                .http
-                .post(&self.base_url)
+                .request()
                 .json(&JsonRpcRequest {
                     method,
                     params,
@@ -448,17 +573,12 @@ impl RpcClient {
     ) -> Result<Option<T>, RpcError> {
         let n = self.call_counter.fetch_add(1, Ordering::Relaxed);
         let call_id = format!("{method}-{n}");
-        let backend = self
-            .routing
-            .get(method)
-            .cloned()
-            .unwrap_or(Backend::Unknown);
+        let backend = self.backend_for(method);
         let request_at = Utc::now();
 
         let outcome: Result<Option<T>, RpcError> = async {
             let resp = self
-                .http
-                .post(&self.base_url)
+                .request()
                 .json(&JsonRpcRequest {
                     method,
                     params,
@@ -617,6 +737,61 @@ impl RpcClient {
         self.call("generate", serde_json::json!([num_blocks])).await
     }
 
+    /// Mark a block (and its descendants) as invalid, rolling the chain back to
+    /// its parent. Regtest chain-reorganization control. Returns `()` on success.
+    pub async fn invalidate_block(&self, block_hash: &str) -> Result<(), RpcError> {
+        self.call_nullable::<serde_json::Value>("invalidateblock", serde_json::json!([block_hash]))
+            .await
+            .map(|_| ())
+    }
+
+    /// Undo a previous `invalidateblock`, restoring the block for reconsideration.
+    /// Regtest chain-reorganization control. Returns `()` on success.
+    pub async fn reconsider_block(&self, block_hash: &str) -> Result<(), RpcError> {
+        self.call_nullable::<serde_json::Value>("reconsiderblock", serde_json::json!([block_hash]))
+            .await
+            .map(|_| ())
+    }
+
+    /// Chain tip height and hash in a single call (Zebra-specific).
+    pub async fn get_best_block_height_and_hash(&self) -> Result<BestBlockHeightAndHash, RpcError> {
+        self.call("getbestblockheightandhash", serde_json::json!([]))
+            .await
+    }
+
+    /// Fetch a block template. Used to drive regtest block production.
+    pub async fn get_block_template(&self) -> Result<BlockTemplate, RpcError> {
+        self.call("getblocktemplate", serde_json::json!([])).await
+    }
+
+    /// Submit a mined block. Returns `None` when the block is accepted, or
+    /// `Some(reason)` when the node rejects it (e.g. `"duplicate"`, `"rejected"`).
+    pub async fn submit_block(&self, block_hex: &str) -> Result<Option<String>, RpcError> {
+        self.call_nullable("submitblock", serde_json::json!([block_hex]))
+            .await
+    }
+
+    /// Sapling and Orchard commitment tree state at a block (hash or height).
+    pub async fn z_get_treestate(&self, block_ref: BlockRef<'_>) -> Result<TreeState, RpcError> {
+        self.call("z_gettreestate", serde_json::json!([block_ref]))
+            .await
+    }
+
+    /// Note-commitment subtree roots. `pool` is `"sapling"` or `"orchard"`;
+    /// `limit` is optional (pass `None` for the server default).
+    pub async fn z_get_subtrees_by_index(
+        &self,
+        pool: &str,
+        start_index: u64,
+        limit: Option<u64>,
+    ) -> Result<Subtrees, RpcError> {
+        let params = match limit {
+            Some(l) => serde_json::json!([pool, start_index, l]),
+            None => serde_json::json!([pool, start_index]),
+        };
+        self.call("z_getsubtreesbyindex", params).await
+    }
+
     // ── Zallet methods ────────────────────────────────────────────────────────
 
     /// Create a new wallet account. `name` is a human-readable label stored in
@@ -717,6 +892,35 @@ impl RpcClient {
 
     pub async fn get_wallet_info(&self) -> Result<WalletInfo, RpcError> {
         self.call("getwalletinfo", serde_json::json!([])).await
+    }
+
+    /// Count of unspent notes per shielded pool — a shielded state-size signal.
+    pub async fn z_get_notes_count(&self) -> Result<NotesCount, RpcError> {
+        self.call("z_getnotescount", serde_json::json!([])).await
+    }
+
+    /// List wallet transactions.
+    ///
+    /// NOTE: the exact parameter signature (account / count / from filters) is
+    /// provisional and must be confirmed against the live stack / `rpc.discover`.
+    /// Called here with no filter.
+    pub async fn z_list_transactions(&self) -> Result<Vec<WalletTransaction>, RpcError> {
+        self.call("z_listtransactions", serde_json::json!([])).await
+    }
+
+    /// Decode and return full details of a wallet transaction.
+    pub async fn z_view_transaction(&self, txid: &str) -> Result<ViewedTransaction, RpcError> {
+        self.call("z_viewtransaction", serde_json::json!([txid]))
+            .await
+    }
+
+    /// Recover accounts from the wallet seed — used during wallet-reset scenarios.
+    ///
+    /// NOTE: the exact parameter signature is provisional and must be confirmed
+    /// against the live stack / `rpc.discover`. Called here with no arguments;
+    /// returns the recovered accounts.
+    pub async fn z_recover_accounts(&self) -> Result<Vec<AccountInfo>, RpcError> {
+        self.call("z_recoveraccounts", serde_json::json!([])).await
     }
 }
 
@@ -1550,5 +1754,316 @@ mod tests {
         let hashes = client(&server.uri()).generate(3).await.unwrap();
         assert_eq!(hashes.len(), 3);
         assert_eq!(hashes[0], "hash1");
+    }
+
+    // ── Added stress-test methods ─────────────────────────────────────────────
+
+    #[test]
+    fn routing_table_maps_getbestblockheightandhash_to_zebra() {
+        assert_eq!(
+            routing_table().get("getbestblockheightandhash"),
+            Some(&Backend::Zebra)
+        );
+    }
+
+    #[tokio::test]
+    async fn get_best_block_height_and_hash_parses() {
+        use wiremock::{matchers, Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(matchers::method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": { "height": 100, "hash": "abc" }, "error": null, "id": 1
+            })))
+            .mount(&server)
+            .await;
+        let r = client(&server.uri())
+            .get_best_block_height_and_hash()
+            .await
+            .unwrap();
+        assert_eq!(r.height, 100);
+        assert_eq!(r.hash, "abc");
+    }
+
+    #[tokio::test]
+    async fn get_block_template_parses_height_and_prev_hash() {
+        use wiremock::{matchers, Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(matchers::method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": { "height": 5, "previousblockhash": "prev", "extra": "ignored" },
+                "error": null, "id": 1
+            })))
+            .mount(&server)
+            .await;
+        let t = client(&server.uri()).get_block_template().await.unwrap();
+        assert_eq!(t.height, 5);
+        assert_eq!(t.previousblockhash, "prev");
+    }
+
+    #[tokio::test]
+    async fn submit_block_returns_none_on_acceptance() {
+        use wiremock::{matchers, Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(matchers::method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "result": null, "error": null, "id": 1 })),
+            )
+            .mount(&server)
+            .await;
+        let r = client(&server.uri())
+            .submit_block("deadbeef")
+            .await
+            .unwrap();
+        assert!(r.is_none());
+    }
+
+    #[tokio::test]
+    async fn submit_block_returns_reason_on_rejection() {
+        use wiremock::{matchers, Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(matchers::method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": "duplicate", "error": null, "id": 1
+            })))
+            .mount(&server)
+            .await;
+        let r = client(&server.uri())
+            .submit_block("deadbeef")
+            .await
+            .unwrap();
+        assert_eq!(r.as_deref(), Some("duplicate"));
+    }
+
+    #[tokio::test]
+    async fn z_get_treestate_parses() {
+        use wiremock::{matchers, Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(matchers::method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": { "height": 9, "hash": "h9", "sapling": {}, "orchard": {} },
+                "error": null, "id": 1
+            })))
+            .mount(&server)
+            .await;
+        let ts = client(&server.uri())
+            .z_get_treestate(BlockRef::Height(9))
+            .await
+            .unwrap();
+        assert_eq!(ts.height, 9);
+        assert_eq!(ts.hash, "h9");
+    }
+
+    #[tokio::test]
+    async fn z_get_subtrees_by_index_parses_and_sends_limit() {
+        use wiremock::{matchers, Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(matchers::method("POST"))
+            .and(matchers::body_partial_json(serde_json::json!({
+                "params": ["orchard", 0, 10]
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": {
+                    "pool": "orchard",
+                    "start_index": 0,
+                    "subtrees": [{ "root": "r1", "end_height": 42 }]
+                },
+                "error": null, "id": 1
+            })))
+            .mount(&server)
+            .await;
+        let s = client(&server.uri())
+            .z_get_subtrees_by_index("orchard", 0, Some(10))
+            .await
+            .unwrap();
+        assert_eq!(s.pool, "orchard");
+        assert_eq!(s.subtrees.len(), 1);
+        assert_eq!(s.subtrees[0].end_height, 42);
+    }
+
+    #[tokio::test]
+    async fn z_get_notes_count_parses_pools() {
+        use wiremock::{matchers, Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(matchers::method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": { "sapling": 3, "orchard": 7 }, "error": null, "id": 1
+            })))
+            .mount(&server)
+            .await;
+        let n = client(&server.uri()).z_get_notes_count().await.unwrap();
+        assert_eq!(n.sapling, 3);
+        assert_eq!(n.orchard, 7);
+    }
+
+    #[tokio::test]
+    async fn z_list_transactions_parses_list() {
+        use wiremock::{matchers, Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(matchers::method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [
+                    { "txid": "t1", "account": "uuid-1" },
+                    { "txid": "t2" }
+                ],
+                "error": null, "id": 1
+            })))
+            .mount(&server)
+            .await;
+        let txs = client(&server.uri()).z_list_transactions().await.unwrap();
+        assert_eq!(txs.len(), 2);
+        assert_eq!(txs[0].txid, "t1");
+        assert_eq!(txs[0].account.as_deref(), Some("uuid-1"));
+        assert!(txs[1].account.is_none());
+    }
+
+    #[tokio::test]
+    async fn z_view_transaction_parses() {
+        use wiremock::{matchers, Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(matchers::method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": { "txid": "vt1", "spends": [], "outputs": [] },
+                "error": null, "id": 1
+            })))
+            .mount(&server)
+            .await;
+        let v = client(&server.uri())
+            .z_view_transaction("vt1")
+            .await
+            .unwrap();
+        assert_eq!(v.txid, "vt1");
+    }
+
+    #[tokio::test]
+    async fn with_basic_auth_sends_authorization_header() {
+        use wiremock::{matchers, Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        // base64("zebra:zebra") == "emVicmE6emVicmE=". The mock only matches when
+        // the Authorization header is present, so a missing header fails the call.
+        Mock::given(matchers::method("POST"))
+            .and(matchers::header("Authorization", "Basic emVicmE6emVicmE="))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": { "chain": "regtest", "blocks": 1, "headers": 1 },
+                "error": null, "id": 1
+            })))
+            .mount(&server)
+            .await;
+
+        let client =
+            RpcClient::new(&server.uri(), "test-run", None, None).with_basic_auth("zebra", "zebra");
+        // Succeeds only if the Authorization header was sent.
+        client.get_blockchain_info().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn zaino_mirror_client_tags_calls_with_zaino_backend() {
+        use wiremock::{matchers, Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(matchers::method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": { "chain": "regtest", "blocks": 1, "headers": 1 },
+                "error": null, "id": 1
+            })))
+            .mount(&server)
+            .await;
+
+        let rec = MockRecorder::new();
+        let client = RpcClient::for_zaino_mirror(
+            &server.uri(),
+            "test-run",
+            Some(rec.clone() as Arc<dyn MetricsRecorder>),
+            None,
+        );
+        // getblockchaininfo routes to Zebra via the table, but the Zaino mirror
+        // override must win, attributing the call to Zaino.
+        client.get_blockchain_info().await.unwrap();
+
+        let calls = rec.recorded_calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].backend, Backend::Zaino);
+    }
+
+    #[test]
+    fn routing_table_maps_regtest_control_methods_to_zebra() {
+        let table = routing_table();
+        for method in ["generate", "invalidateblock", "reconsiderblock"] {
+            assert_eq!(table.get(method), Some(&Backend::Zebra), "for {method}");
+        }
+    }
+
+    #[tokio::test]
+    async fn invalidate_block_succeeds_on_null_result() {
+        use wiremock::{matchers, Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(matchers::method("POST"))
+            .and(matchers::body_partial_json(serde_json::json!({
+                "method": "invalidateblock", "params": ["blockhash"]
+            })))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "result": null, "error": null, "id": 1 })),
+            )
+            .mount(&server)
+            .await;
+        client(&server.uri())
+            .invalidate_block("blockhash")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn reconsider_block_succeeds_on_null_result() {
+        use wiremock::{matchers, Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(matchers::method("POST"))
+            .and(matchers::body_partial_json(serde_json::json!({
+                "method": "reconsiderblock", "params": ["blockhash"]
+            })))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "result": null, "error": null, "id": 1 })),
+            )
+            .mount(&server)
+            .await;
+        client(&server.uri())
+            .reconsider_block("blockhash")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn invalidate_block_propagates_json_rpc_error() {
+        use wiremock::{matchers, Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(matchers::method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": null,
+                "error": { "code": -5, "message": "Block not found" },
+                "id": 1
+            })))
+            .mount(&server)
+            .await;
+        let err = client(&server.uri())
+            .invalidate_block("nope")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, RpcError::JsonRpc { code: -5, .. }));
+    }
+
+    #[tokio::test]
+    async fn z_recover_accounts_parses_account_list() {
+        use wiremock::{matchers, Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(matchers::method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [{ "account": "uuid-r", "name": "recovered" }],
+                "error": null, "id": 1
+            })))
+            .mount(&server)
+            .await;
+        let accts = client(&server.uri()).z_recover_accounts().await.unwrap();
+        assert_eq!(accts.len(), 1);
+        assert_eq!(accts[0].account, "uuid-r");
     }
 }

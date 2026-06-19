@@ -19,7 +19,7 @@ setup: ## Check local development dependencies
 	@echo "cargo:  $$(cargo --version)"
 	@echo "rustc:  $$(rustc --version)"
 
-clone-z3: ## Clone pinned Z3 component repositories (Zebra, Zaino, Zallet)
+clone-z3: ## Clone the pinned Z3 Docker Compose stack (meta-repo) into external/z3
 	@bash scripts/dev/clone-z3.sh
 
 build: ## Build the simulator binary (debug mode)

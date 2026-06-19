@@ -67,8 +67,9 @@ in regtest). The router transparently forwards calls to the correct backend:
 - **Zebra** — block processing, chain state, regtest block generation
 - **Zallet** — wallet operations: account creation, address derivation, transaction
   construction and signing, balance queries, async shielded transaction tracking
-- **Zaino** — runs as a library inside Zallet (for indexing) and as a standalone gRPC
-  container for light clients; not a direct JSON-RPC target
+- **Zaino** — indexing layer; covered directly via its zcashd-style JSON-RPC mirror
+  (regtest `:28237`, outside the router). Its lightwalletd `CompactTxStreamer` gRPC
+  surface (`:28137`) is documented but out of scope for this engagement.
 
 Every RPC call is recorded (method, backend, latency, success/failure) for the
 compatibility matrix and per-method latency histograms.
@@ -113,9 +114,10 @@ transparent/shielded ratio are all configurable. See
   Deviations are characterised and documented — they are not automatically treated as
   bugs, since Z3 intentionally changes some behaviours.
 
-- **Mempool change notifications** are tested using Z3's gRPC streaming interfaces:
-  Zebra's `Indexer.mempool_change()` and Zaino's `GetMempoolStream`, which replace the
-  ZMQ mechanism used in zcashd.
+- **Mempool** is monitored by polling `getrawmempool` / `getmempoolinfo` through the
+  router. Z3's gRPC streaming interfaces that replace zcashd's ZMQ — Zebra's
+  `Indexer.mempool_change()` and Zaino's `GetMempoolStream` — are documented but out of
+  scope for this engagement.
 
 - **All account and transaction data is synthetic.** Generated inside the harness,
   seeded deterministically, never sourced from real users. Safe to ship in the public
@@ -259,5 +261,5 @@ result after the fact.
 | Item | Status |
 |---|---|
 | Specific TPS and account count targets for load scenarios | TBD — calibrated from initial load runs |
-| Z3 pinned commit | TBD — pending Foundation confirmation |
-| Zaino gRPC scope: direct testing of `GetMempoolStream` / `GetMempoolTx` | TBD — pending Foundation confirmation |
+| Z3 pinned commit | Confirmed — `main` @ `dfb9d0ea` (frozen for the engagement) |
+| Zaino coverage | Confirmed — JSON-RPC mirror (`:28237`); gRPC `CompactTxStreamer` out of scope |

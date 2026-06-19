@@ -56,16 +56,18 @@ Zaino provides indexed access to chain data — address balances, transaction hi
 sets — and exposes the LightWallet gRPC interface (`CompactTxStreamer`) for light wallet
 clients.
 
-**Role in this project:** Zaino operates in two modes within the Z3 stack:
+**Role in this project:** Zaino runs as its own container in Z3 and exposes two network
+interfaces:
 
-1. **As a library inside Zallet** — Zallet embeds Zaino's indexing code directly. When
-   the simulator calls Zallet's wallet methods, Zaino's indexing runs transparently inside
-   the same process.
-2. **As a standalone gRPC container** — Zaino runs separately to serve light wallet
-   clients via the LightWallet gRPC protocol on port 8137.
+1. **LightWallet gRPC (`CompactTxStreamer`)** — the lightwalletd-compatible interface
+   for light clients (regtest host port `28137`). Documented but out of scope for this
+   engagement.
+2. **zcashd-style JSON-RPC mirror** — a JSON-RPC endpoint (regtest host port `28237`)
+   backed by the indexer. **This is how the simulator exercises Zaino directly**, with a
+   client that tags its calls as the `Zaino` backend.
 
-The simulator does not call Zaino directly via JSON-RPC. Zaino's latency is implicit in
-Zallet method response times.
+(Zaino is also embedded as a library inside Zallet for the wallet's own indexing; that
+internal use is separate from the directly-testable interfaces above.)
 
 **Repository:** https://github.com/zingolabs/zaino
 
@@ -195,20 +197,23 @@ At a high level:
               ┌──────────────┴──────────────┐
               ▼                             ▼
         ┌──────────┐                  ┌──────────┐
-        │  Zebra   │ :18232           │  Zallet  │ :28232
+        │  Zebra   │ host :29232      │  Zallet  │ host :50232
         │(full node│                  │ (wallet) │
         └──────────┘                  └────┬─────┘
-              │                           │ Zaino embedded
+              │                           │
               │                      ┌────▼──────┐
               └──────────────────────│   Chain   │
                                      │  (regtest)│
                                      └───────────┘
-                                     
-         ┌──────────┐
-         │  Zaino   │ :8137  ← gRPC only, for light clients
-         │  (gRPC)  │            not called by simulator
+
+         ┌──────────┐  :28237 JSON-RPC mirror ◄── simulator (Backend::Zaino)
+         │  Zaino   │
+         │ (indexer)│  :28137 lightwalletd gRPC  (documented, out of scope)
          └──────────┘
 ```
+
+(Regtest host ports shown; the router reaches Zebra/Zallet over the internal Docker
+network. Exact ports come from `z3-contract.yaml`.)
 
 ---
 
@@ -222,7 +227,7 @@ The Z3 stack replaces `zcashd` by splitting those responsibilities:
 | Old (`zcashd`) | New (Z3) |
 |---|---|
 | Full node | Zebra |
-| Blockchain data / indexing | Zaino (as Zallet library + standalone gRPC) |
+| Blockchain data / indexing | Zaino (own container: JSON-RPC mirror + lightwalletd gRPC; also embedded in Zallet) |
 | Wallet | Zallet |
 | Single RPC endpoint | RPC Router (routes to Zebra or Zallet) |
 
