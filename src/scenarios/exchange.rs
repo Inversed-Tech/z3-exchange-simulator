@@ -55,6 +55,7 @@ impl std::error::Error for ExchangeError {
 // ── Polling config ────────────────────────────────────────────────────────────
 
 /// Controls poll rates and timeouts used by all four workflows.
+#[derive(Clone, Copy)]
 pub struct PollingConfig {
     /// How often to call `z_get_operation_status` while ZK proving is in progress.
     pub operation_poll_interval: Duration,
