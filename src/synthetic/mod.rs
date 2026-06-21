@@ -178,6 +178,7 @@ mod tests {
             },
             config_hash: String::new(),
             source_path: String::new(),
+            warmup_blocks: 10,
         }
     }
 

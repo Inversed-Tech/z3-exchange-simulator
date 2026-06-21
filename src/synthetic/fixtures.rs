@@ -85,6 +85,7 @@ mod tests {
             },
             config_hash: String::new(),
             source_path: String::new(),
+            warmup_blocks: 10,
         };
         let mut gen = AccountGenerator::new(config).unwrap();
         gen.generate_population().unwrap()

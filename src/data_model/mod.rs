@@ -264,6 +264,10 @@ pub struct AmountRangeConfig {
     pub max_zatoshis: u64,
 }
 
+fn default_warmup_blocks() -> u64 {
+    10
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScenarioConfig {
     pub name: String,
@@ -282,6 +286,8 @@ pub struct ScenarioConfig {
     pub config_hash: String,
     #[serde(default)]
     pub source_path: String,
+    #[serde(default = "default_warmup_blocks")]
+    pub warmup_blocks: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -520,6 +526,7 @@ mod tests {
             },
             config_hash: "abc123".into(),
             source_path: "configs/scenarios/smoke.yaml".into(),
+            warmup_blocks: 10,
         };
         let back = roundtrip(&v);
         assert_eq!(v.name, back.name);
@@ -1073,6 +1080,7 @@ mod tests {
             config_hash: "sha256:abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890"
                 .into(),
             source_path: "/workspace/configs/scenarios/burst.yaml".into(),
+            warmup_blocks: 10,
         };
         let back = roundtrip(&v);
         assert_eq!(back.config_hash, v.config_hash);
