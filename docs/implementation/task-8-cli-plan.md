@@ -6,7 +6,7 @@
 > **Implementation branch:** `t8-cli` (rebased onto `main` after T7 merge, commit `817b4b7`)
 > **T7 baseline:** merged into `main` at commit `18081f2` — all T7 API references in this plan have been re-verified against the merged code
 > **Output modules:** `src/main.rs`, `src/cli/mod.rs`
-> **Remaining prerequisite:** The D2 change (`output_dir: PathBuf` on `RunResult`) was not included in the T7 merge and must be applied as the first commit on the T8 implementation branch before implementing Step 8 (live `run_command`).
+> **Remaining prerequisite:** The D2 change (`output_dir: Option<PathBuf>` on `RunResult`) was not included in the T7 merge and is applied as Step 0 of the T8 implementation sequence before Step 8 (live `run_command`).
 
 ---
 
@@ -103,18 +103,22 @@ must gain one field before T8 can be implemented:
 ```rust
 pub struct RunResult {
     pub run_id: String,
-    pub output_dir: std::path::PathBuf, // ← add this; populated from run_dir.path()
+    pub output_dir: Option<std::path::PathBuf>, // None for dry-run; Some(path) for real runs
     pub dry_run: bool,
     pub stats: RunStats,
     pub outcomes: Vec<IntentOutcome>,
 }
 ```
 
-This is a three-line change to T7 (`result.rs` + the two call sites in `runner/mod.rs`
-where `RunResult` is constructed). It lets the CLI print the exact output directory without
-reconstructing it from `run_id` and `output_base`, which would create hidden coupling to
-T7's internal directory naming logic. This change should be included in the T7 PR or applied
-as the first commit on the T8 implementation branch after T7 merges.
+`output_dir` is `Option<PathBuf>` (not plain `PathBuf`) because the dry-run early return in
+`runner::run()` never creates a run directory; there is no path to populate. Real runs set
+`output_dir: Some(run_dir.path().to_path_buf())`; dry-runs set `output_dir: None`.
+
+This is a four-line change to T7 (`result.rs` field declaration + two `RunResult { ... }`
+construction sites in `runner/mod.rs`). It lets the CLI print the exact output directory
+without reconstructing it from `run_id` and `output_base`, which would create hidden
+coupling to T7's internal directory naming logic. This change is applied as Step 0 on the
+T8 implementation branch (see Section 11).
 
 ### 2.3 Fixture generation API
 
@@ -204,7 +208,7 @@ documents it, and a runtime note to the operator should explain it.
 | R5 | `z3sim validate-scenario <path>` exits 0 on valid scenario, 1 with detailed errors on invalid |
 | R6 | SIGINT (Ctrl-C) triggers graceful shutdown of an active run |
 | R7 | `--verbose` / `--quiet` flags adjust log verbosity |
-| R8 | Run ID and output directory are printed to stdout when a run starts |
+| R8 | Run ID and output directory are printed to stdout when a **live** run starts (not for `--dry-run`) |
 | R9 | All errors print to stderr; normal output prints to stdout |
 | R10 | Exit code 0 on success, 1 on any error |
 | R11 | CLI layer contains no business logic — all substantive work delegates to T4–T7 |
@@ -371,6 +375,15 @@ OPTIONS:
 `--verbose` and `--quiet` are mutually exclusive. If both are passed, `clap` should reject
 the combination at parse time (use `conflicts_with`).
 
+**Companion-flag behaviour for non-burst shapes:** `--burst-pre-secs`, `--burst-secs`, and
+`--burst-multiplier` are silently ignored when `--load-shape` is not `burst`. No warning is
+emitted. Because all three carry `default_value_t`, they always have a value and the CLI
+cannot distinguish "user explicitly passed" from "left at default" — a warning would fire
+spuriously on every non-burst run. The help text `(ignored unless --load-shape burst)` is
+the documentation mechanism. The one hard guard: `--burst-multiplier <= 0.0` is always
+rejected as `CliError::InvalidArgs` regardless of load shape, because the value is
+mathematically invalid.
+
 ### 5.3 Help text conventions
 
 - Short help via `-h`; full help via `--help` (clap default)
@@ -388,12 +401,94 @@ the combination at parse time (use `conflicts_with`).
 | `--verbose` | `DEBUG` | Yes, `RUST_LOG` can override |
 | `--quiet` | `ERROR` | Yes, `RUST_LOG` can override |
 
-Use `tracing_subscriber::EnvFilter` so that `RUST_LOG=trace` works for fine-grained
-debugging regardless of the flag.
+The subscriber uses `EnvFilter::builder().with_default_directive(level).from_env_lossy()`.
+The flag sets the *default* directive; `RUST_LOG` overrides it when set. For example,
+`RUST_LOG=trace z3sim --quiet ...` produces TRACE output regardless of the flag.
 
 ---
 
 ## 6. Dispatch and Data Flow
+
+### 6.0 Helper: `build_load_shape`
+
+All run paths call this function before constructing `RunOptions`. It validates companion
+flags and maps from the clap-parsed enum to the library type:
+
+```rust
+fn build_load_shape(args: &RunArgs) -> Result<LoadShape, CliError> {
+    match args.load_shape {
+        LoadShapeArg::Steady => Ok(LoadShape::SteadyState),
+        LoadShapeArg::Ramp   => Ok(LoadShape::Ramp { ramp_secs: args.ramp_secs }),
+        LoadShapeArg::Burst  => {
+            if args.burst_multiplier <= 0.0 {
+                return Err(CliError::InvalidArgs(
+                    "--burst-multiplier must be > 0.0".into(),
+                ));
+            }
+            Ok(LoadShape::Burst {
+                pre_burst_secs:  args.burst_pre_secs,
+                burst_secs:      args.burst_secs,
+                spike_multiplier: args.burst_multiplier, // CLI field → LoadShape field name
+            })
+        }
+        LoadShapeArg::Mixed => Ok(LoadShape::Mixed),
+    }
+}
+```
+
+Key points:
+- `LoadShapeArg::Steady` maps to `LoadShape::SteadyState` (different name in the library enum).
+- `LoadShape::Burst` uses `spike_multiplier` (the library field name); `RunArgs` uses
+  `burst_multiplier` (the CLI flag name). The conversion is the single translation point.
+- Burst companion flags (`--burst-pre-secs`, `--burst-secs`, `--burst-multiplier`) are
+  silently ignored for non-burst shapes. The `<= 0.0` guard is the one hard error, raised
+  regardless of load shape.
+
+### 6.0b Unified `run_command` function structure (H3)
+
+The `run` subcommand has two paths (dry-run and live) inside a single async function:
+
+```
+async fn run_command(args: RunArgs) -> Result<(), CliError>:
+  1. load_scenario(&args.scenario)              → ScenarioConfig | CliError::Scenario
+  2. validate_scenario(&config)                 → () | CliError::Scenario
+     (pre-flight; see M4 note in 6.1 for why CLI validates before calling runner::run)
+  3. load_shape = build_load_shape(&args)?      → LoadShape | CliError::InvalidArgs
+
+  4. if args.dry_run:
+       opts = RunOptions { dry_run: true, cancel: None, load_shape, ... }
+       runner::run(config, opts).await?   // T7 prints dry-run summary; CLI adds nothing
+       return Ok(())                      // no run ID printed (see R8 note in 6.2)
+
+  5. else (live run):
+       token = CancellationToken::new()
+       cancel_clone = token.clone()
+       ctrl_c_handle = tokio::spawn(async move {
+           ctrl_c().await.ok();
+           tracing::warn!("interrupt signal received — cancelling load phase");
+           cancel_clone.cancel();
+       })
+       eprintln!("Starting run — press Ctrl-C to interrupt")
+       opts = RunOptions { dry_run: false, cancel: Some(token.clone()), load_shape, ... }
+       result = runner::run(config, opts).await
+       ctrl_c_handle.abort()             // prevent task outliving this invocation
+       if token.is_cancelled():
+           if let Err(e) = &result:
+               tracing::error!("teardown error during cancellation: {e}")
+           return Err(CliError::Interrupted)
+       let r = result?                   // propagates RunnerError as CliError::Run
+       println!("Run ID   : {}", r.run_id)
+       if let Some(dir) = &r.output_dir:
+           println!("Output   : {}", dir.display())
+       println!("Attempted: {}", r.stats.total_attempted)
+       println!("Confirmed: {}", r.stats.confirmed)
+       println!("Failed   : {}", r.stats.failed)
+       println!("Timed out: {}", r.stats.timed_out)
+       return Ok(())
+```
+
+Sections 6.1 and 6.2 below detail each path; this unified view shows the branching logic
+and ensures a coding agent can implement the function without inference.
 
 ### 6.1 `z3sim run --scenario <path>`
 
@@ -408,31 +503,45 @@ argv
              4. Build RunOptions { load_shape, dry_run: false, cancel: Some(token), ... }
              5. Create CancellationToken
              6. Spawn Ctrl-C task: ctrl_c().await → token.cancel()
-             7. Print: "Starting run — press Ctrl-C to interrupt"
+             7. eprintln!("Starting run — press Ctrl-C to interrupt")
+                // Direct stderr — always visible; not gated by log level.
+                // Do NOT use tracing::info!: default level is WARN and it would be suppressed.
              8. scenarios::runner::run(config, opts).await → RunResult | RunnerError
-             9. On Ok(result):
-                  if token.is_cancelled(): return Err(CliError::Interrupted)
+             9. ctrl_c_handle.abort()  // prevent Ctrl-C task from outliving this invocation
+            10. On Ok(result):
+                  if token.is_cancelled():
+                    if Err(e) in result: tracing::error!("teardown error during cancellation: {e}")
+                    return Err(CliError::Interrupted)
                   println!("Run ID   : {}", result.run_id)
-                  println!("Output   : {}", result.output_dir.display())
+                  if let Some(dir) = &result.output_dir:
+                    println!("Output   : {}", dir.display())
                   println!("Attempted: {}", result.stats.total_attempted)
                   println!("Confirmed: {}", result.stats.confirmed)
                   println!("Failed   : {}", result.stats.failed)
                   println!("Timed out: {}", result.stats.timed_out)
-                  exit 0
-            10. On Err(CliError::Interrupted): exit 130
-            11. On Err(e): eprintln!("error: {e}") → exit 1
+                  return Ok(())  → main() exits 0
+            11. On Err(e): return Err(CliError::Run(e)) → main() prints and exits 1
 ```
 
-**Note on output directory path:** The CLI prints `result.output_dir` directly — this field
-is populated by T7 from `run_dir.path()` and requires the prerequisite T7 change described
-in Section 2.2. The CLI does not reconstruct the path itself.
+**Note on output directory path:** The CLI prints `result.output_dir` when `Some` — this
+field is populated by T7 from `run_dir.path()` as `Some(path)` for real runs and `None` for
+dry-runs. The prerequisite change is in Section 2.2 / Step 0. The CLI does not reconstruct
+the path itself.
 
 **Note on exit code 130:** After `runner::run()` returns, the CLI checks
 `token.is_cancelled()`. If true, the run was interrupted by SIGINT and the process exits
 with code 130 (Unix convention: `128 + SIGINT signal number 2`). This allows shell scripts
 and CI pipelines to distinguish "the run failed" from "someone pressed Ctrl-C." The check
 happens after `runner::run()` returns because teardown must complete regardless — the exit
-code reflects what happened during the run, not during teardown.
+code reflects what happened during the run, not during teardown. If teardown itself errored
+during a cancelled run, the teardown error is logged at `ERROR` level; exit 130 still
+applies (signal semantics take precedence).
+
+**Note on double validation (M4):** `runner::run()` calls `validate_scenario()` as its first
+operation. The CLI's pre-flight call in step 2 is intentional: it ensures validation errors
+surface as `CliError::Scenario` (with the clean multi-line format from `CliError::Display`)
+rather than as `CliError::Run(RunnerError::Config(...))`. If pre-flight passes, T7's
+internal validation is a no-op redundancy. This is the intended behaviour.
 
 **Ctrl-C during setup/warmup:** The cancellation token is checked only in the load phase
 loop. If the operator presses Ctrl-C during setup or warmup, those phases complete
@@ -457,6 +566,12 @@ argv
 
 T7's `run()` already handles the dry-run case internally via `print_dry_run_summary`.
 The CLI does not need to duplicate that output.
+
+**Note on R8 (run ID) for dry-run:** Dry-run does not print a run ID. A run ID's only
+purpose is to point the operator to an output directory; for a dry-run, no directory is
+created and no files are written, making the ID a reference to nothing. The scenario hash
+(`sha256:...`) that T7 prints in its dry-run summary is the stable identifier for
+correlation. R8 applies to live runs only.
 
 ### 6.3 `z3sim generate-fixtures --scenario <path> --out <dir>`
 
@@ -494,19 +609,18 @@ argv
  └─ Commands::ValidateScenario { path }
      └─ cli::validate_scenario_command(path)  (sync)
          1. load_scenario(&path)
-              On Io error:    eprintln!("error: cannot read {path}: {e}") → exit 1
-              On Parse error: eprintln!("error: invalid YAML in {path}: {e}") → exit 1
+              On Io error:    return Err(CliError::Scenario(ConfigError::Io(...)))
+              On Parse error: return Err(CliError::Scenario(ConfigError::Parse(...)))
+              // main() calls eprintln!("error: {e}") — handlers never print errors directly
          2. validate_scenario(&config)
-              On ValidationErrors(errs):
-                eprintln!("error: scenario validation failed ({n} error(s)):")
-                for (field, msg) in &errs:
-                  eprintln!("  {field}: {msg}")
-                exit 1
+              On ValidationErrors: return Err(CliError::Scenario(ConfigError::ValidationErrors(...)))
+              // main()'s eprintln!("error: {e}") triggers CliError::Display which formats
+              // all violations with "(N error(s)):" prefix (see Section 7.1 Display impl)
          3. println!("OK: {path} is valid")
             println!("  name : {}", config.name)
             println!("  seed : {}", config.seed)
             println!("  hash : {}", config.config_hash)
-         4. exit 0
+         4. return Ok(())  → main() exits 0
 ```
 
 `validate-scenario` must never call any Z3, RPC, or synthetic generator code.
@@ -540,6 +654,39 @@ impl std::error::Error for CliError { ... }
 `dispatch()` returns `Result<(), CliError>`. `main()` pattern-matches on the error variant
 to select the correct exit code: `Interrupted` → 130, all others → 1.
 
+**`CliError::Display` implementation skeleton:**
+
+```rust
+impl std::fmt::Display for CliError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            // ValidationErrors requires special formatting: count prefix + per-field lines.
+            // Delegating to ConfigError::Display would omit the count and differ in capitalisation.
+            CliError::Scenario(ConfigError::ValidationErrors(errs)) => {
+                write!(f, "scenario validation failed ({} error(s)):", errs.len())?;
+                for (field, msg) in errs {
+                    write!(f, "\n  {field}: {msg}")?;
+                }
+                Ok(())
+            }
+            CliError::Scenario(e)    => write!(f, "{e}"),
+            CliError::Run(e)         => write!(f, "{e}"),
+            CliError::Fixture(e)     => write!(f, "{e}"),
+            CliError::Generator(e)   => write!(f, "{e}"),
+            CliError::InvalidArgs(s) => write!(f, "invalid arguments: {s}"),
+            CliError::Io(e)          => write!(f, "{e}"),
+            CliError::Interrupted    => write!(f, "interrupted"),
+        }
+    }
+}
+```
+
+**Error printing rule:** All command handler functions return `Err(CliError::...)` on
+failure. They never call `eprintln!` for errors. `main()` is the single site that calls
+`eprintln!("error: {e}")`, which triggers `CliError::Display`. The `→ exit 1` and
+`return Ok()` notation in Sections 6.1–6.4 pseudocode denotes control flow intent, not
+`std::process::exit` calls inside handlers.
+
 `InvalidArgs` is used for pre-flight validation of flag combinations that `clap` cannot
 enforce statically (e.g. `--burst-multiplier` must be > 0). It produces a clear
 `"error: invalid arguments: ..."` message rather than the misleading `"I/O error: ..."`
@@ -556,7 +703,9 @@ Error messages follow this format:
 error: <human-readable context>: <cause>
 ```
 
-For validation errors, each field violation is indented:
+For validation errors, each field violation is indented. This format is produced by the
+`CliError::Scenario(ConfigError::ValidationErrors(...))` arm in `CliError::Display`
+(Section 7.1) — not by inline `eprintln!` calls in command handlers:
 
 ```
 error: scenario validation failed (3 error(s)):
@@ -619,23 +768,22 @@ before any other library code runs:
 pub fn init_tracing(verbose: bool, quiet: bool) {
     use std::io::IsTerminal as _;
 
-    let level = if verbose {
-        tracing::Level::DEBUG
-    } else if quiet {
-        tracing::Level::ERROR
-    } else {
-        tracing::Level::WARN
-    };
+    let level = if verbose { "debug" } else if quiet { "error" } else { "warn" };
+
+    // with_default_directive sets the fallback level; from_env_lossy() reads RUST_LOG
+    // and overrides the default when set. This is the documented, version-stable pattern
+    // for "flag sets default, RUST_LOG overrides."
+    let filter = tracing_subscriber::EnvFilter::builder()
+        .with_default_directive(level.parse().expect("valid level directive"))
+        .from_env_lossy();
 
     tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive(level.into()),
-        )
+        .compact()                                   // single line per event (Decision D9)
+        .with_env_filter(filter)
         .with_target(true)
         .with_level(true)
-        .with_ansi(std::io::stderr().is_terminal()) // colour in interactive shells; plain in CI/pipes
-        .with_writer(std::io::stderr)               // logs to stderr; stdout stays clean for CLI output
+        .with_ansi(std::io::stderr().is_terminal())  // colour in interactive shells; plain in CI/pipes
+        .with_writer(std::io::stderr)                // logs to stderr; stdout stays clean for CLI output
         .init();
 }
 ```
@@ -676,7 +824,7 @@ pub struct Cli { ... }
 
 | Event | Stream | Format |
 |---|---|---|
-| Run start message | stdout | `"Starting run — press Ctrl-C to interrupt"` |
+| Run start message | stderr (direct `eprintln!`, not logged) | `"Starting run — press Ctrl-C to interrupt"` |
 | Run ID + output dir | stdout | `"Run ID: <id>"` / `"Output: <path>"` |
 | Dry-run summary | stdout | Delegated to T7's `print_dry_run_summary` |
 | Run statistics | stdout | Tabular key/value |
@@ -710,17 +858,19 @@ Windows). Spawn a dedicated Tokio task before calling `runner::run`:
 let token = tokio_util::sync::CancellationToken::new();
 let cancel_task_token = token.clone();
 
-tokio::spawn(async move {
+let ctrl_c_handle = tokio::spawn(async move {
     tokio::signal::ctrl_c().await.ok();
     tracing::warn!("interrupt signal received — cancelling load phase");
     cancel_task_token.cancel();
 });
 
 let opts = RunOptions {
-    cancel: Some(token),
+    cancel: Some(token.clone()),
     ..
 };
-runner::run(config, opts).await
+let result = runner::run(config, opts).await;
+ctrl_c_handle.abort(); // prevent the task from outliving this invocation
+result
 ```
 
 ### 9.2 Cancellation propagation
@@ -796,8 +946,14 @@ After `runner::run()` returns (teardown has completed), the CLI checks the token
 
 ```rust
 let result = runner::run(config, opts).await;
+ctrl_c_handle.abort(); // prevent the task from outliving this invocation
 if token.is_cancelled() {
-    // Interrupted by SIGINT — teardown has already completed
+    // Interrupted by SIGINT — teardown has already completed.
+    // If teardown also errored, log it so operators can investigate;
+    // exit 130 (signal semantics) still takes precedence over exit 1.
+    if let Err(e) = &result {
+        tracing::error!("teardown error during cancellation: {e}");
+    }
     return Err(CliError::Interrupted);
 }
 match result {
@@ -813,8 +969,9 @@ errors print to stderr and exit 1.
 
 `RunOptions::cancel` is already defined and wired. T8 only needs to populate it.
 
-The one required T7 change is adding `output_dir: PathBuf` to `RunResult` (see Section
-2.2). This is the only modification to T7 code that T8 requires.
+The one required T7 change is adding `output_dir: Option<PathBuf>` to `RunResult` (see
+Section 2.2). This is the only modification to T7 code that T8 requires; it is applied as
+Step 0 of the T8 implementation sequence.
 
 ---
 
@@ -839,6 +996,10 @@ These tests live in `src/cli/mod.rs` under `#[cfg(test)]` and use `clap`'s built
 // Test: LoadShapeArg::Ramp converts to LoadShape::Ramp with default ramp_secs
 // Test: LoadShapeArg::Burst converts to LoadShape::Burst with all three parameters
 // Test: --burst-multiplier <= 0.0 produces CliError::InvalidArgs (not CliError::Io)
+// Test: --burst-multiplier 0.0 (zero, not just negative) also produces CliError::InvalidArgs
+// Test: LoadShapeArg::Ramp converts to LoadShape::Ramp { ramp_secs } with correct value
+// Test: LoadShapeArg::Burst with valid multiplier converts to LoadShape::Burst { spike_multiplier }
+// Test: run_command with dry_run: true sets RunOptions::cancel to None (no CancellationToken)
 ```
 
 All these tests call `Cli::try_parse_from(["z3sim", ...])` and assert on the parsed
@@ -855,6 +1016,8 @@ binary.
 // Test: non-existent path produces CliError::Scenario(ConfigError::Io)
 // Test: malformed YAML produces CliError::Scenario(ConfigError::Parse)
 // Test: invalid flows (sum != 1.0) produces CliError with all violations listed
+// Test: CliError::Scenario(ConfigError::ValidationErrors(errs)) Display includes "(N error(s)):" count prefix
+// Test: multiple violations all appear in Display output, each on its own indented line
 ```
 
 Use `tempfile::NamedTempFile` for invalid YAML paths (consistent with existing T7 tests).
@@ -873,6 +1036,7 @@ Use `tempfile::NamedTempFile` for invalid YAML paths (consistent with existing T
 
 ```rust
 // Test: dry-run with valid scenario returns Ok without creating run directory
+// Test: dry-run result.output_dir is None (not Some)
 // Test: dry-run with invalid scenario returns CliError (no run dir created)
 ```
 
@@ -923,6 +1087,39 @@ Mark any test that requires Z3 with `#[ignore]`. The CI workflow already runs on
 
 Ordered from prerequisites to completion. Each step should compile and pass `cargo
 test --lib` before the next step begins.
+
+### Step 0: Add `output_dir` to `RunResult`
+
+This step modifies T7 code on the T8 branch — it is a prerequisite for Step 8.
+
+In `src/scenarios/runner/result.rs`, add the `output_dir` field:
+
+```rust
+pub struct RunResult {
+    pub run_id: String,
+    pub output_dir: Option<std::path::PathBuf>, // None for dry-run; Some(path) for real runs
+    pub dry_run: bool,
+    pub stats: RunStats,
+    pub outcomes: Vec<IntentOutcome>,
+}
+```
+
+Update both `RunResult { ... }` construction sites in `src/scenarios/runner/mod.rs`:
+
+- The dry-run early return (search for `dry_run: true`): add `output_dir: None,`
+- The successful-run return (search for `dry_run: false`): add `output_dir: Some(run_dir.path().to_path_buf()),`
+
+Update `tests/integration/main.rs` — after the existing assertion `assert!(result.dry_run)`,
+add:
+
+```rust
+assert!(
+    result.output_dir.is_none(),
+    "dry-run must not populate output_dir"
+);
+```
+
+**Checkpoint:** `cargo test` passes (all 303+ tests, including the updated integration test).
 
 ### Step 1: Add dependencies to Cargo.toml
 
@@ -1070,8 +1267,9 @@ Write tests from Section 10.3.
 
 ### Step 7: Implement `run_command` in dry-run mode
 
-Implement the `run` handler for `dry_run: true` only first. This avoids needing a live Z3
-stack to test the command wiring.
+Implement `build_load_shape` (specified in Section 6.0) first — it is needed by both dry-run
+and live-run paths. Then implement the `run` handler for `dry_run: true` only. This avoids
+needing a live Z3 stack to test the command wiring.
 
 Write tests from Section 10.4 (dry-run tests).
 
@@ -1080,10 +1278,13 @@ Write tests from Section 10.4 (dry-run tests).
 ### Step 8: Implement `run_command` for live runs with Ctrl-C
 
 Add the `CancellationToken` setup, `ctrl_c()` task, and full `runner::run()` call.
-After `runner::run()` returns, check `token.is_cancelled()` to decide between
-`CliError::Interrupted` (→ exit 130) and reporting a genuine runner error (→ exit 1).
-Use `result.output_dir` (the new `RunResult` field) to print the output path.
-Add the cancellation unit test from Section 10.6.
+Store the `JoinHandle` returned by `tokio::spawn` and call `ctrl_c_handle.abort()` after
+`runner::run()` returns to prevent the task outliving this invocation. After aborting,
+check `token.is_cancelled()` to decide between `CliError::Interrupted` (→ exit 130) and
+reporting a genuine runner error (→ exit 1). If the run was cancelled AND teardown errored,
+log the teardown error at `tracing::error!` before returning `CliError::Interrupted`. Use
+`result.output_dir` (the `Option<PathBuf>` field added in Step 0) to print the output path
+when `Some`. Add the cancellation unit test from Section 10.6.
 
 **Checkpoint:** `cargo test --lib` passes. Binary can be built and executes `--help`.
 
@@ -1103,7 +1304,7 @@ pub async fn dispatch(cli: Cli) -> Result<(), CliError> {
 ```rust
 // src/main.rs
 #[tokio::main]
-async fn main() {
+async fn main() -> std::process::ExitCode {
     use z3_exchange_simulator::cli::{dispatch, init_tracing, Cli, CliError};
     use clap::Parser;
 
@@ -1111,14 +1312,15 @@ async fn main() {
     init_tracing(cli.verbose, cli.quiet);
 
     match dispatch(cli).await {
-        Ok(()) => {}
+        Ok(()) => std::process::ExitCode::SUCCESS,
         Err(CliError::Interrupted) => {
             // Teardown completed cleanly; exit 130 (128 + SIGINT).
-            std::process::exit(130);
+            // ExitCode::from(130) runs Rust destructors; std::process::exit would not.
+            std::process::ExitCode::from(130u8)
         }
         Err(e) => {
             eprintln!("error: {e}");
-            std::process::exit(1);
+            std::process::ExitCode::FAILURE
         }
     }
 }
@@ -1134,18 +1336,21 @@ Replace `echo TODO` bodies in `generate-fixtures` and `scenario-dry-run` targets
 Add a `validate-scenario` target.
 
 ```makefile
+# Also add validate-scenario to the existing .PHONY line at the top of the Makefile
+.PHONY: ... generate-fixtures scenario-dry-run validate-scenario clean
+
 generate-fixtures: ## Generate synthetic fixture data for tests
-	./target/debug/$(BINARY) generate-fixtures \
+	$(CARGO) run -- generate-fixtures \
 		--scenario configs/scenarios/smoke.yaml \
 		--out experiments/fixtures
 
 scenario-dry-run: ## Validate and summarise smoke scenario without starting Z3
-	./target/debug/$(BINARY) run \
+	$(CARGO) run -- run \
 		--scenario configs/scenarios/smoke.yaml \
 		--dry-run
 
 validate-scenario: ## Validate a scenario YAML file (usage: make validate-scenario SCENARIO=<path>)
-	./target/debug/$(BINARY) validate-scenario \
+	$(CARGO) run -- validate-scenario \
 		$(or $(SCENARIO),configs/scenarios/smoke.yaml)
 ```
 
@@ -1177,10 +1382,11 @@ writing a single line of T8 Rust.
 
 ### D2 — Output directory path
 
-**Decision:** Add `output_dir: PathBuf` to `RunResult` in `src/scenarios/runner/result.rs`.
-The CLI prints `result.output_dir` directly. This is a prerequisite T7 change (3 lines:
-field declaration + 2 construction sites). It removes hidden coupling between the CLI and
-T7's internal directory naming logic.
+**Decision:** Add `output_dir: Option<PathBuf>` to `RunResult` in `src/scenarios/runner/result.rs`.
+Real runs populate `Some(run_dir.path().to_path_buf())`; dry-run populates `None`. The CLI
+prints the path only when `Some`. This is applied as Step 0 on the T8 branch (4 lines:
+field declaration + 2 construction sites + dry-run `None`). It removes hidden coupling
+between the CLI and T7's internal directory naming logic.
 
 ### D3 — Cancellation during setup/warmup
 
@@ -1265,7 +1471,7 @@ T8 is complete when all of the following pass:
 | Default invocation | No log lines visible in normal successful run |
 | `--verbose` | DEBUG-level lines appear |
 | `--quiet` | No log lines unless an error occurs |
-| `RUST_LOG=trace` | Overrides `--verbose`/`--quiet` and enables trace-level output |
+| `RUST_LOG=trace z3sim ...` | Enables trace-level output regardless of `--verbose` or `--quiet` |
 
 ### AC4 — Graceful shutdown
 
@@ -1306,7 +1512,8 @@ The following checklist is for a human or agent reviewing this plan before imple
 - [ ] No business logic is proposed inside `src/cli/` or `src/main.rs`
 - [ ] All delegation paths correctly name the T4–T7 API they call
 - [ ] The `LoadShapeArg → LoadShape` conversion correctly maps all four variants
-- [ ] The only required T7 change (`output_dir` on `RunResult`) is clearly identified as a prerequisite
+- [ ] Step 0 adds `output_dir: Option<PathBuf>` to `RunResult` (not plain `PathBuf`; `None` for dry-run)
+- [ ] `build_load_shape` function is implemented; maps `LoadShapeArg::Steady` → `LoadShape::SteadyState` and `burst_multiplier` → `spike_multiplier`
 
 ### Command interface
 
@@ -1325,12 +1532,14 @@ The following checklist is for a human or agent reviewing this plan before imple
 - [ ] `run --dry-run`: no `CancellationToken` needed (synchronous from CLI perspective)
 - [ ] `generate-fixtures`: full scenario validation is run before population generation
 - [ ] `validate-scenario`: only calls `load_scenario` + `validate_scenario`, nothing else
-- [ ] CLI prints `result.output_dir` (not a reconstructed path) to show where output landed
+- [ ] CLI prints `result.output_dir` with `if let Some(dir) = ...` (not a reconstructed path; None for dry-run)
 
 ### Error handling
 
 - [ ] `CliError` has seven variants: `Scenario`, `Run`, `Fixture`, `Generator`, `InvalidArgs`, `Io`, `Interrupted`
 - [ ] `InvalidArgs` is used for bad flag combinations; `Io` is reserved for filesystem errors
+- [ ] `CliError::Display` includes a special arm for `ConfigError::ValidationErrors` that adds the `(N error(s)):` count prefix
+- [ ] Command handlers never call `eprintln!` — all error printing goes through `main()`
 - [ ] All errors go to stderr; all success output goes to stdout
 - [ ] Exit code policy: 0 success, 1 error, 130 SIGINT — all three cases handled in `main()`
 - [ ] The `ValidationErrors` formatting lists each field/message pair on a separate line
@@ -1364,6 +1573,7 @@ The following checklist is for a human or agent reviewing this plan before imple
 - [ ] Only `clap`, `tracing`, `tracing-subscriber` are added — no other new crates
 - [ ] `tokio-util` (for `CancellationToken`) is already in Cargo.toml — confirmed
 - [ ] No `anyhow`, no `thiserror`
+- [ ] `main()` returns `std::process::ExitCode` (not `std::process::exit()`), allowing destructors to run
 
 ### Makefile
 
