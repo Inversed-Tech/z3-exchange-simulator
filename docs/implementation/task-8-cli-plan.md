@@ -1,11 +1,12 @@
 # Task 8 — CLI: Implementation Plan
 
-> **Status:** Draft — Review Needed
-> **Date:** 2026-06-19
-> **Implementation branch:** `t8-cli`
-> **T7 baseline:** branch `t7-scenario-runner`, commit `18081f2` — all T7 API references in this plan are verified against that code
+> **Status:** Draft — Verified; Ready for Implementation
+> **Plan authored:** 2026-06-19
+> **Last verified:** 2026-06-22
+> **Implementation branch:** `t8-cli` (rebased onto `main` after T7 merge, commit `817b4b7`)
+> **T7 baseline:** merged into `main` at commit `18081f2` — all T7 API references in this plan have been re-verified against the merged code
 > **Output modules:** `src/main.rs`, `src/cli/mod.rs`
-> **Implementation prerequisite:** T7 merged into `main`; plan accuracy must be re-verified against the merged code before implementation begins. The plan file itself lives on `t8-cli` and does not depend on T7 merging first.
+> **Remaining prerequisite:** The D2 change (`output_dir: PathBuf` on `RunResult`) was not included in the T7 merge and must be applied as the first commit on the T8 implementation branch before implementing Step 8 (live `run_command`).
 
 ---
 
@@ -1328,7 +1329,7 @@ The following checklist is for a human or agent reviewing this plan before imple
 
 ### Error handling
 
-- [ ] `CliError` has six variants: `Scenario`, `Run`, `Fixture`, `Generator`, `InvalidArgs`, `Io`, `Interrupted`
+- [ ] `CliError` has seven variants: `Scenario`, `Run`, `Fixture`, `Generator`, `InvalidArgs`, `Io`, `Interrupted`
 - [ ] `InvalidArgs` is used for bad flag combinations; `Io` is reserved for filesystem errors
 - [ ] All errors go to stderr; all success output goes to stdout
 - [ ] Exit code policy: 0 success, 1 error, 130 SIGINT — all three cases handled in `main()`
