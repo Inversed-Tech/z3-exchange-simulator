@@ -6,7 +6,7 @@ BINARY := z3sim
 
 .DEFAULT_GOAL := help
 .PHONY: help setup clone-z3 build build-release test fmt fmt-check lint \
-        generate-fixtures scenario-dry-run clean
+        generate-fixtures scenario-dry-run validate-scenario clean
 
 help: ## Show this help message
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
@@ -40,11 +40,19 @@ fmt-check: ## Check formatting without modifying files (CI)
 lint: ## Run clippy lints (warnings treated as errors)
 	$(CARGO) clippy -- -D warnings
 
-generate-fixtures: ## Generate synthetic fixture data for tests
-	@echo "TODO: implement synthetic fixture generator (Week 2)"
+generate-fixtures: build ## Generate synthetic fixture data for tests
+	$(CARGO) run -- generate-fixtures \
+		--scenario configs/scenarios/smoke.yaml \
+		--out experiments/fixtures
 
-scenario-dry-run: ## Validate a scenario config without issuing RPC calls
-	@echo "TODO: implement scenario dry-run (Week 2)"
+scenario-dry-run: build ## Validate and summarise smoke scenario without starting Z3
+	$(CARGO) run -- run \
+		--scenario configs/scenarios/smoke.yaml \
+		--dry-run
+
+validate-scenario: build ## Validate a scenario YAML file (usage: make validate-scenario SCENARIO=<path>)
+	$(CARGO) run -- validate-scenario \
+		$(or $(SCENARIO),configs/scenarios/smoke.yaml)
 
 clean: ## Remove build artifacts and generated experiment run outputs
 	$(CARGO) clean

@@ -135,6 +135,7 @@ pub async fn run(scenario: ScenarioConfig, opts: RunOptions) -> Result<RunResult
         print_dry_run_summary(&scenario, &opts, &plan);
         return Ok(RunResult {
             run_id,
+            output_dir: None,
             dry_run: true,
             stats: RunStats::default(),
             outcomes: vec![],
@@ -238,6 +239,7 @@ pub async fn run(scenario: ScenarioConfig, opts: RunOptions) -> Result<RunResult
             }
             Ok(RunResult {
                 run_id,
+                output_dir: Some(run_dir.path.clone()),
                 dry_run: false,
                 stats,
                 outcomes,

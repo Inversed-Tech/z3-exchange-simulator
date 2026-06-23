@@ -47,6 +47,10 @@ async fn test_dry_run_does_not_start_z3() {
     };
     let result = run(scenario, opts).await.unwrap();
     assert!(result.dry_run, "expected dry_run=true in result");
+    assert!(
+        result.output_dir.is_none(),
+        "dry-run must not populate output_dir"
+    );
     assert_eq!(result.stats.total_attempted, 0);
     assert!(result.outcomes.is_empty());
 }

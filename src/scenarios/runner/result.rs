@@ -31,6 +31,8 @@ pub struct RunStats {
 #[derive(Debug)]
 pub struct RunResult {
     pub run_id: String,
+    /// `None` for dry-run (no directory created); `Some(path)` for real runs.
+    pub output_dir: Option<std::path::PathBuf>,
     pub dry_run: bool,
     pub stats: RunStats,
     pub outcomes: Vec<IntentOutcome>,
@@ -63,5 +65,32 @@ mod tests {
         assert_eq!(s.confirmed, 7);
         assert_eq!(s.failed, 2);
         assert_eq!(s.timed_out, 1);
+    }
+
+    #[test]
+    fn run_result_output_dir_none_for_dry_run() {
+        let r = RunResult {
+            run_id: "test-id".into(),
+            output_dir: None,
+            dry_run: true,
+            stats: RunStats::default(),
+            outcomes: vec![],
+        };
+        assert!(r.output_dir.is_none());
+        assert!(r.dry_run);
+    }
+
+    #[test]
+    fn run_result_output_dir_some_for_live_run() {
+        let path = std::path::PathBuf::from("/tmp/test-run");
+        let r = RunResult {
+            run_id: "test-id".into(),
+            output_dir: Some(path.clone()),
+            dry_run: false,
+            stats: RunStats::default(),
+            outcomes: vec![],
+        };
+        assert_eq!(r.output_dir.as_ref(), Some(&path));
+        assert!(!r.dry_run);
     }
 }
