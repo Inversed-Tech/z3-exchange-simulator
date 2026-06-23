@@ -2,7 +2,7 @@
 
 > **Status:** Draft — Verified; Ready for Implementation
 > **Plan authored:** 2026-06-19
-> **Last verified:** 2026-06-22
+> **Last verified:** 2026-06-23
 > **Implementation branch:** `t8-cli` (rebased onto `main` after T7 merge, commit `817b4b7`)
 > **T7 baseline:** merged into `main` at commit `18081f2` — all T7 API references in this plan have been re-verified against the merged code
 > **Output modules:** `src/main.rs`, `src/cli/mod.rs`
@@ -112,7 +112,7 @@ pub struct RunResult {
 
 `output_dir` is `Option<PathBuf>` (not plain `PathBuf`) because the dry-run early return in
 `runner::run()` never creates a run directory; there is no path to populate. Real runs set
-`output_dir: Some(run_dir.path().to_path_buf())`; dry-runs set `output_dir: None`.
+`output_dir: Some(run_dir.path.clone())`; dry-runs set `output_dir: None`.
 
 This is a four-line change to T7 (`result.rs` field declaration + two `RunResult { ... }`
 construction sites in `runner/mod.rs`). It lets the CLI print the exact output directory
@@ -276,7 +276,7 @@ The plan does not require that split now — do it when it helps readability.
 - `#[tokio::main]` entry point with `full` feature (already declared in Cargo.toml)
 - Call `cli::init_tracing(verbosity)` immediately after parsing argv
 - Call `cli::dispatch(cli_args).await`
-- Print errors to stderr and call `std::process::exit(1)` on failure
+- Print errors to stderr and return `std::process::ExitCode::FAILURE` on failure
 
 **`src/cli/mod.rs`:**
 
@@ -469,7 +469,7 @@ Key points:
   silently ignored for non-burst shapes. The `<= 0.0` guard is the one hard error, raised
   regardless of load shape.
 
-### 6.0b Unified `run_command` function structure (H3)
+### 6.0b Unified `run_command` function structure
 
 The `run` subcommand has two paths (dry-run and live) inside a single async function:
 
@@ -490,7 +490,7 @@ async fn run_command(args: RunArgs, cancel_override: Option<CancellationToken>) 
            cancel:          None,
            ..RunOptions::default()  // covers polling: None only
        }
-       runner::run(config, opts).await?   // T7 prints dry-run summary; CLI adds nothing
+       runner_run(config, opts).await.map_err(CliError::Run)?   // T7 prints dry-run summary; CLI adds nothing
        return Ok(())                      // no run ID printed (see R8 note in 6.2)
 
   5. else (live run):
@@ -517,7 +517,7 @@ async fn run_command(args: RunArgs, cancel_override: Option<CancellationToken>) 
            if let Err(e) = &result:
                tracing::error!("teardown error during cancellation: {e}")
            return Err(CliError::Interrupted)
-       let r = result?                   // propagates RunnerError as CliError::Run
+       let r = result.map_err(CliError::Run)?   // propagates RunnerError as CliError::Run
        println!("Run ID   : {}", r.run_id)
        if let Some(dir) = &r.output_dir:
            println!("Output   : {}", dir.display())
@@ -581,7 +581,7 @@ argv
 ```
 
 **Note on output directory path:** The CLI prints `result.output_dir` when `Some` — this
-field is populated by T7 from `run_dir.path()` as `Some(path)` for real runs and `None` for
+field is populated by T7 from `run_dir.path` as `Some(path)` for real runs and `None` for
 dry-runs. The prerequisite change is in Section 2.2 / Step 0. The CLI does not reconstruct
 the path itself.
 
@@ -611,9 +611,10 @@ warn-level log event at signal time regardless of which phase the runner is exec
 ```
 argv
  └─ Commands::Run { args, dry_run: true }
-     └─ cli::run_command(args).await
+     └─ cli::run_command(args, None).await
          1. load_scenario(&args.scenario)
          2. validate_scenario(&config)
+        2b. load_shape = build_load_shape(&args)?   → LoadShape | CliError::InvalidArgs
          3. Build RunOptions {
                 output_base:     args.output_base.clone(),
                 load_shape,
@@ -624,7 +625,7 @@ argv
                 ..RunOptions::default()  // covers polling: None only
             }
             No CancellationToken needed — dry-run is synchronous from the CLI perspective
-         4. scenarios::runner::run(config, opts).await
+         4. runner_run(config, opts).await.map_err(CliError::Run)?
             (T7 short-circuits at step 2: calls print_dry_run_summary, returns Ok)
          5. exit 0
 ```
@@ -864,7 +865,7 @@ pub fn init_tracing(verbose: bool, quiet: bool) {
 }
 ```
 
-`RUST_LOG` takes precedence (via `from_default_env()`), so operators can override the
+`RUST_LOG` takes precedence (via `from_env_lossy()`), so operators can override the
 level at any granularity without recompiling. The ANSI colour flag is derived from whether
 stderr is a real terminal — this means coloured output in local shells and clean plain text
 in CI logs and piped output, with zero configuration required.
@@ -1049,8 +1050,8 @@ match result {
 }
 ```
 
-`main()` then translates `CliError::Interrupted` to `std::process::exit(130)`. All other
-errors print to stderr and exit 1.
+`main()` then returns `std::process::ExitCode::from(130u8)` for `CliError::Interrupted`. All
+other errors print to stderr and return `std::process::ExitCode::FAILURE`.
 
 ### 9.6 API changes needed in T7
 
@@ -1089,10 +1090,10 @@ These tests live in `src/cli/mod.rs` under `#[cfg(test)]` and use `clap`'s built
 // Test: run_command with dry_run: true sets RunOptions::cancel to None (no CancellationToken)
 // Test: CliError::InvalidArgs("--burst-multiplier must be > 0.0".into()).to_string()
 //       starts with "invalid arguments:" (verifies Display prefix, not an I/O error message)
-// Round-trip: --max-in-flight 128 reaches RunOptions::max_in_flight (not silently defaulted to 64)
-// Round-trip: --output-base /custom/dir reaches RunOptions::output_base (not silently defaulted)
-// Round-trip: --hot-wallet-uuid abc123 reaches RunOptions::hot_wallet_uuid (Some("abc123"))
-// Round-trip: --hot-wallet-uuid omitted → RunOptions::hot_wallet_uuid is None
+// Round-trip: --max-in-flight 128 parses into RunArgs::max_in_flight (not silently defaulted to 64)
+// Round-trip: --output-base /custom/dir parses into RunArgs::output_base (not silently defaulted)
+// Round-trip: --hot-wallet-uuid abc123 parses into RunArgs::hot_wallet_uuid (Some("abc123"))
+// Round-trip: --hot-wallet-uuid omitted → RunArgs::hot_wallet_uuid is None
 ```
 
 All these tests call `Cli::try_parse_from(["z3sim", ...])` and assert on the parsed
@@ -1229,7 +1230,7 @@ pub struct RunResult {
 Update both `RunResult { ... }` construction sites in `src/scenarios/runner/mod.rs`:
 
 - The dry-run early return (search for `dry_run: true`): add `output_dir: None,`
-- The successful-run return (search for `dry_run: false`): add `output_dir: Some(run_dir.path().to_path_buf()),`
+- The successful-run return (search for `dry_run: false`): add `output_dir: Some(run_dir.path.clone()),`
 
 Update `tests/integration/main.rs` — after the existing assertion `assert!(result.dry_run)`,
 add:
@@ -1513,7 +1514,7 @@ writing a single line of T8 Rust.
 ### D2 — Output directory path
 
 **Decision:** Add `output_dir: Option<PathBuf>` to `RunResult` in `src/scenarios/runner/result.rs`.
-Real runs populate `Some(run_dir.path().to_path_buf())`; dry-run populates `None`. The CLI
+Real runs populate `Some(run_dir.path.clone())`; dry-run populates `None`. The CLI
 prints the path only when `Some`. This is applied as Step 0 on the T8 branch (4 lines:
 field declaration + 2 construction sites + dry-run `None`). It removes hidden coupling
 between the CLI and T7's internal directory naming logic.
@@ -1548,7 +1549,7 @@ for each run would be wasteful.
 ### D7 — Exit code for SIGINT interruption
 
 **Decision:** Exit 130. `CliError::Interrupted` is returned when `token.is_cancelled()` is
-true after `runner::run()` returns. `main()` maps it to `std::process::exit(130)`. All
+true after `runner::run()` returns. `main()` returns `std::process::ExitCode::from(130u8)`. All
 other errors exit 1. This follows the Unix convention (`128 + 2`) and allows CI scripts
 to distinguish interrupted from failed runs with `$? -eq 130`.
 
