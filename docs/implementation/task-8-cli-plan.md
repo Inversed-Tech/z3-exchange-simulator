@@ -133,9 +133,13 @@ let population = gen.generate_population()?;    // produces SyntheticPopulation
 write_fixtures(&population, out_dir)?;          // creates out_dir, overwrites existing
 ```
 
-`write_fixtures` is deterministic: same scenario seed → same output files. The generated
-population uses the same `accounts_count`, `accounts_active_fraction`, and
-`activity_profiles` fields from `ScenarioConfig` that the live runner uses.
+`write_fixtures` is structurally deterministic: same scenario seed → same account IDs,
+wallet IDs, statuses, and activity profiles. However, `created_at` timestamps on both
+`Account` and `Wallet` are set via `Utc::now()` in `generators.rs` (lines 57 and 64) and
+differ across separate `generate_population()` calls. Full-file byte equality is not
+guaranteed across separate runs. The generated population uses the same `accounts_count`,
+`accounts_active_fraction`, and `activity_profiles` fields from `ScenarioConfig` that the
+live runner uses.
 
 ### 2.4 Scenario loading and validation
 
@@ -286,6 +290,27 @@ The plan does not require that split now — do it when it helps readability.
   `generate_fixtures_command`, `validate_scenario_command`
 
 **No business logic in either file.** Every handler's body is: load → validate → call library → print result.
+
+### 4.4 Required imports for `src/cli/mod.rs`
+
+```rust
+// src/cli/mod.rs — required imports
+use crate::scenarios::runner::{
+    load_scenario, validate_scenario,
+    ConfigError, RunnerError, RunOptions, RunResult, LoadShape,
+};
+use crate::scenarios::runner::run as runner_run; // alias avoids shadowing the 'run' subcommand match arm
+use crate::synthetic::{write_fixtures, AccountGenerator, FixtureError, GeneratorError};
+use tokio_util::sync::CancellationToken;
+use clap::{Parser, Subcommand, ValueEnum};
+use std::path::{Path, PathBuf};
+```
+
+`PollingConfig` is intentionally absent — `..RunOptions::default()` sets `polling: None`
+without this import, preserving the architecture boundary. `ConfigError` appearing in this
+list also resolves the nested pattern match in `CliError::Display` (Section 7.1) — the arm
+`CliError::Scenario(ConfigError::ValidationErrors(errs))` requires `ConfigError` in scope
+at the module level.
 
 ---
 
@@ -456,7 +481,15 @@ async fn run_command(args: RunArgs, cancel_override: Option<CancellationToken>) 
   3. load_shape = build_load_shape(&args)?      → LoadShape | CliError::InvalidArgs
 
   4. if args.dry_run:
-       opts = RunOptions { dry_run: true, cancel: None, load_shape, ..RunOptions::default() }
+       opts = RunOptions {
+           output_base:     args.output_base.clone(),
+           load_shape,
+           max_in_flight:   args.max_in_flight,
+           dry_run:         true,
+           hot_wallet_uuid: args.hot_wallet_uuid.clone(),
+           cancel:          None,
+           ..RunOptions::default()  // covers polling: None only
+       }
        runner::run(config, opts).await?   // T7 prints dry-run summary; CLI adds nothing
        return Ok(())                      // no run ID printed (see R8 note in 6.2)
 
@@ -465,11 +498,19 @@ async fn run_command(args: RunArgs, cancel_override: Option<CancellationToken>) 
        cancel_clone = token.clone()
        ctrl_c_handle = tokio::spawn(async move {
            ctrl_c().await.ok();
-           tracing::warn!("interrupt signal received — cancelling load phase");
+           tracing::warn!("interrupt signal received; waiting for current phase to complete");
            cancel_clone.cancel();
        })
        eprintln!("Starting run — press Ctrl-C to interrupt")
-       opts = RunOptions { dry_run: false, cancel: Some(token.clone()), load_shape, ..RunOptions::default() }
+       opts = RunOptions {
+           output_base:     args.output_base.clone(),
+           load_shape,
+           max_in_flight:   args.max_in_flight,
+           dry_run:         false,
+           hot_wallet_uuid: args.hot_wallet_uuid.clone(),
+           cancel:          Some(token.clone()),
+           ..RunOptions::default()  // covers polling: None only
+       }
        result = runner::run(config, opts).await
        ctrl_c_handle.abort()             // prevent task outliving this invocation
        if token.is_cancelled():
@@ -490,13 +531,13 @@ async fn run_command(args: RunArgs, cancel_override: Option<CancellationToken>) 
 Sections 6.1 and 6.2 below detail each path; this unified view shows the branching logic
 and ensures a coding agent can implement the function without inference.
 
-**Note on `..RunOptions::default()`:** All `RunOptions` construction uses struct update
-syntax with `..RunOptions::default()` rather than enumerating every field. Do not enumerate
-all fields explicitly — the `polling` field has type `Option<PollingConfig>`, and
-`PollingConfig` lives in `scenarios::exchange`. Naming it in `cli/mod.rs` would couple
-the CLI to exchange internals, violating the architecture boundary in Section 4. The struct
-update syntax populates all remaining fields with project defaults without requiring any
-additional imports.
+**Note on `..RunOptions::default()`:** The struct update syntax `..RunOptions::default()`
+covers **only** the `polling` field (`Option<PollingConfig>`). `PollingConfig` lives in
+`scenarios::exchange` — naming it in `cli/mod.rs` would couple the CLI to exchange
+internals, violating the architecture boundary in Section 4. All other fields —
+`output_base`, `load_shape`, `max_in_flight`, `dry_run`, `hot_wallet_uuid`, `cancel` —
+are set explicitly from `args` or the call context. Do not use `..default()` to cover
+those fields: the operator-supplied flag values would be silently discarded.
 
 ### 6.1 `z3sim run --scenario <path>`
 
@@ -508,8 +549,16 @@ argv
              1. load_scenario(&args.scenario)           → ScenarioConfig | ConfigError
              2. validate_scenario(&config)              → () | ConfigError
              3. Build LoadShape from args.load_shape + companion flags
-             4. Build RunOptions { load_shape, dry_run: false, cancel: Some(token), ..RunOptions::default() }
-             5. Create CancellationToken
+             4. Create CancellationToken
+             5. Build RunOptions {
+                    output_base:     args.output_base.clone(),
+                    load_shape,
+                    max_in_flight:   args.max_in_flight,
+                    dry_run:         false,
+                    hot_wallet_uuid: args.hot_wallet_uuid.clone(),
+                    cancel:          Some(token.clone()),
+                    ..RunOptions::default()              // covers polling: None only
+                }
              6. Spawn Ctrl-C task: ctrl_c().await → token.cancel()
              7. eprintln!("Starting run — press Ctrl-C to interrupt")
                 // Direct stderr — always visible; not gated by log level.
@@ -553,9 +602,9 @@ internal validation is a no-op redundancy. This is the intended behaviour.
 
 **Ctrl-C during setup/warmup:** The cancellation token is checked only in the load phase
 loop. If the operator presses Ctrl-C during setup or warmup, those phases complete
-(or fail on their own timeout) first. Teardown then runs. The CLI prints:
-`"Interrupted — waiting for current phase to complete..."` when the cancel signal fires
-before the load phase begins.
+(or fail on their own timeout) first. Teardown then runs. The Ctrl-C task emits one
+warn-level log event at signal time regardless of which phase the runner is executing
+— the runner exposes no phase status to the CLI.
 
 ### 6.2 `z3sim run --scenario <path> --dry-run`
 
@@ -565,7 +614,15 @@ argv
      └─ cli::run_command(args).await
          1. load_scenario(&args.scenario)
          2. validate_scenario(&config)
-         3. Build RunOptions { dry_run: true, cancel: None, load_shape, ..RunOptions::default() }
+         3. Build RunOptions {
+                output_base:     args.output_base.clone(),
+                load_shape,
+                max_in_flight:   args.max_in_flight,
+                dry_run:         true,
+                hot_wallet_uuid: args.hot_wallet_uuid.clone(),
+                cancel:          None,
+                ..RunOptions::default()  // covers polling: None only
+            }
             No CancellationToken needed — dry-run is synchronous from the CLI perspective
          4. scenarios::runner::run(config, opts).await
             (T7 short-circuits at step 2: calls print_dry_run_summary, returns Ok)
@@ -689,6 +746,10 @@ impl std::fmt::Display for CliError {
 }
 ```
 
+**Import note:** The nested match arm `CliError::Scenario(ConfigError::ValidationErrors(errs))`
+requires `ConfigError` to be in scope at the module level. It is included in the import
+list in Section 4.4 — no additional import is needed at the `Display` impl site.
+
 **Error propagation style:** Do not add `From` trait implementations for `CliError`. Use
 explicit `.map_err()` at each call site: `.map_err(CliError::Scenario)`,
 `.map_err(CliError::Run)`, `.map_err(CliError::Generator)`, etc. This is consistent with
@@ -750,10 +811,10 @@ run from a failed one by testing `$? -eq 130`.
 
 | Path | What happens |
 |---|---|
-| Missing `--scenario` file | `load_scenario` returns `ConfigError::Io`; CLI prints path + OS error; exit 1 |
+| Missing `--scenario` file | `load_scenario` returns `ConfigError::Io`; CLI prints OS error only (file path not included in `ConfigError::Io` display); exit 1 |
 | Malformed YAML | `load_scenario` returns `ConfigError::Parse`; CLI prints YAML parse error; exit 1 |
 | Validation failure | `validate_scenario` returns `ConfigError::ValidationErrors`; CLI lists each violation; exit 1 |
-| `--out` dir creation failure | `write_fixtures` returns `FixtureError::Io`; CLI prints path + OS error; exit 1 |
+| `--out` dir creation failure | `write_fixtures` returns `FixtureError::Io`; CLI prints OS error only (file path not included in `FixtureError::Io` display); exit 1 |
 | Bad flag combination | `CliError::InvalidArgs(msg)`; CLI prints message; exit 1 |
 | Runner setup failure | `RunnerError::Setup(msg)`; CLI prints message; exit 1 |
 | Interrupted during load | cancellation token fires; load phase exits; teardown completes; `token.is_cancelled()` → exit 130 |
@@ -851,6 +912,11 @@ pub struct Cli { ... }
 The split between `println!` (stdout) and `eprintln!` (stderr) must be consistent. Tests
 can capture each stream independently to verify correctness.
 
+**Note on `--quiet` and structured output:** `--quiet` suppresses `tracing` log lines only
+(sets the default level to ERROR). It does not suppress structured `println!` output —
+`print_dry_run_summary` and the live-run statistics table are unaffected by `--quiet`.
+Operators who want truly silent stdout should redirect: `z3sim ... > /dev/null`.
+
 ### 8.5 Avoiding noisy logs
 
 Default log level is WARN, not INFO. Most operators running `z3sim run` should see no
@@ -876,13 +942,18 @@ let cancel_task_token = token.clone();
 
 let ctrl_c_handle = tokio::spawn(async move {
     tokio::signal::ctrl_c().await.ok();
-    tracing::warn!("interrupt signal received — cancelling load phase");
+    tracing::warn!("interrupt signal received; waiting for current phase to complete");
     cancel_task_token.cancel();
 });
 
 let opts = RunOptions {
-    cancel: Some(token.clone()),
-    ..RunOptions::default()
+    cancel:          Some(token.clone()),
+    output_base:     args.output_base.clone(),
+    load_shape,
+    max_in_flight:   args.max_in_flight,
+    dry_run:         false,
+    hot_wallet_uuid: args.hot_wallet_uuid.clone(),
+    ..RunOptions::default()  // covers polling: None only
 };
 let result = runner::run(config, opts).await;
 ctrl_c_handle.abort(); // prevent the task from outliving this invocation
@@ -917,9 +988,9 @@ This is checked on every TPS tick. Worst-case latency before the check: one tick
 5. Teardown runs normally.
 
 This means Ctrl-C during setup/warmup delays exit by up to the remaining setup/warmup
-duration. Operators should be informed: emit `tracing::warn!("interrupt signal received — \
-waiting for current phase to complete before shutting down")` from the Ctrl-C task
-immediately when the signal fires. This is accepted behaviour for the current scope.
+duration. Operators should be informed: emit `tracing::warn!("interrupt signal received; waiting \
+for current phase to complete")` from the Ctrl-C task immediately when the signal fires.
+This is accepted behaviour for the current scope.
 
 **Known limitation — documented, no code change required for T8:** Making setup and warmup
 cancellation-aware would require adding the token to `lifecycle.rs` and checking it between
@@ -1018,6 +1089,10 @@ These tests live in `src/cli/mod.rs` under `#[cfg(test)]` and use `clap`'s built
 // Test: run_command with dry_run: true sets RunOptions::cancel to None (no CancellationToken)
 // Test: CliError::InvalidArgs("--burst-multiplier must be > 0.0".into()).to_string()
 //       starts with "invalid arguments:" (verifies Display prefix, not an I/O error message)
+// Round-trip: --max-in-flight 128 reaches RunOptions::max_in_flight (not silently defaulted to 64)
+// Round-trip: --output-base /custom/dir reaches RunOptions::output_base (not silently defaulted)
+// Round-trip: --hot-wallet-uuid abc123 reaches RunOptions::hot_wallet_uuid (Some("abc123"))
+// Round-trip: --hot-wallet-uuid omitted → RunOptions::hot_wallet_uuid is None
 ```
 
 All these tests call `Cli::try_parse_from(["z3sim", ...])` and assert on the parsed
@@ -1045,7 +1120,10 @@ Use `tempfile::NamedTempFile` for invalid YAML paths (consistent with existing T
 ```rust
 // Test: valid scenario generates accounts.json and wallets.json in the given dir
 // Test: output dir is created if it does not exist
-// Test: same scenario + seed produces identical files (determinism)
+// Test: same scenario + seed produces identical account IDs (structural determinism)
+//   Generate two SyntheticPopulations with the same seeded config. Compare account_id
+//   values at corresponding indices. Do NOT compare full JSON output — created_at
+//   timestamps differ across calls (Utc::now() in generators.rs:57,64).
 // Test: account count in accounts.json matches scenario's accounts_count
 // Test: non-existent scenario file returns CliError
 ```
@@ -1063,7 +1141,8 @@ Use `tempfile::NamedTempFile` for invalid YAML paths (consistent with existing T
 These tests call `run_command` directly with `dry_run: true`. `run_command` returns
 `Result<(), CliError>` — the `RunResult` struct is consumed internally and its `output_dir`
 field cannot be asserted from outside. Use a `TempDir` as `output_base` and inspect its
-contents to verify the no-directory invariant. Tests do not require a live Z3 stack.
+contents to verify the no-directory invariant. `run_command` is `async fn` — all tests in
+this section must use `#[tokio::test]`. Tests do not require a live Z3 stack.
 
 ### 10.5 Golden / help output tests
 
@@ -1087,8 +1166,21 @@ on `run_command`, tests can inject a pre-cancelled token without requiring Z3:
 ```
 
 This tests the code path: `runner::run()` returns → `token.is_cancelled()` → `Err(CliError::Interrupted)`.
-Note: a run directory may be created before setup fails — do not assert on filesystem state
-in this test.
+
+Use a `TempDir` as `output_base` so any run directory created before setup fails is
+auto-cleaned when `tmp` drops:
+```rust
+let tmp = tempfile::TempDir::new().unwrap();
+// set RunArgs::output_base = tmp.path().to_path_buf()
+```
+
+This test is async (`run_command` is `async fn`) and must use `#[tokio::test]`.
+
+**Timing note:** In CI and in environments without a cloned Z3 stack (`external/z3` absent),
+`Z3Stack::start()` calls `check_preconditions()` which fails immediately — the test
+completes in milliseconds. In developer environments where `make clone-z3` has been run
+and Docker is running, setup may take up to 60 seconds before failing. The TempDir above
+also contains side effects in those slow-path runs.
 
 For a real mid-load cancellation test (Ctrl-C fired while the load phase is running): this
 requires the Z3 stack and belongs in integration tests (T9). Mark explicitly as `#[ignore]`
@@ -1100,6 +1192,8 @@ until a live stack is available.
 - `validate-scenario` and `generate-fixtures` tests use real temp files (consistent with
   existing project practice — see T7's config tests)
 - `run` command tests that don't start Z3 use `--dry-run` as the isolation mechanism
+- The cancellation test (Section 10.6) must use a `TempDir` as `output_base` to prevent
+  accumulating orphaned run directories in `experiments/runs/`
 
 ### 10.8 What must not require a live Z3 stack
 
