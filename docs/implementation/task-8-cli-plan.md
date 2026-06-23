@@ -282,8 +282,8 @@ The plan does not require that split now — do it when it helps readability.
 - Define `CliError` (typed enum, no `anyhow`)
 - Implement `init_tracing(verbose: bool, quiet: bool)` — builds the tracing subscriber
 - Implement `pub async fn dispatch(cli: Cli) -> Result<(), CliError>` — dispatches to handlers
-- Implement private per-command handler functions: `run_command`, `generate_fixtures_command`,
-  `validate_scenario_command`
+- Implement private per-command handler functions: `run_command(args: RunArgs, cancel_override: Option<CancellationToken>)`,
+  `generate_fixtures_command`, `validate_scenario_command`
 
 **No business logic in either file.** Every handler's body is: load → validate → call library → print result.
 
@@ -449,19 +449,19 @@ Key points:
 The `run` subcommand has two paths (dry-run and live) inside a single async function:
 
 ```
-async fn run_command(args: RunArgs) -> Result<(), CliError>:
+async fn run_command(args: RunArgs, cancel_override: Option<CancellationToken>) -> Result<(), CliError>:
   1. load_scenario(&args.scenario)              → ScenarioConfig | CliError::Scenario
   2. validate_scenario(&config)                 → () | CliError::Scenario
      (pre-flight; see M4 note in 6.1 for why CLI validates before calling runner::run)
   3. load_shape = build_load_shape(&args)?      → LoadShape | CliError::InvalidArgs
 
   4. if args.dry_run:
-       opts = RunOptions { dry_run: true, cancel: None, load_shape, ... }
+       opts = RunOptions { dry_run: true, cancel: None, load_shape, ..RunOptions::default() }
        runner::run(config, opts).await?   // T7 prints dry-run summary; CLI adds nothing
        return Ok(())                      // no run ID printed (see R8 note in 6.2)
 
   5. else (live run):
-       token = CancellationToken::new()
+       token = cancel_override.unwrap_or_else(CancellationToken::new)
        cancel_clone = token.clone()
        ctrl_c_handle = tokio::spawn(async move {
            ctrl_c().await.ok();
@@ -469,7 +469,7 @@ async fn run_command(args: RunArgs) -> Result<(), CliError>:
            cancel_clone.cancel();
        })
        eprintln!("Starting run — press Ctrl-C to interrupt")
-       opts = RunOptions { dry_run: false, cancel: Some(token.clone()), load_shape, ... }
+       opts = RunOptions { dry_run: false, cancel: Some(token.clone()), load_shape, ..RunOptions::default() }
        result = runner::run(config, opts).await
        ctrl_c_handle.abort()             // prevent task outliving this invocation
        if token.is_cancelled():
@@ -490,17 +490,25 @@ async fn run_command(args: RunArgs) -> Result<(), CliError>:
 Sections 6.1 and 6.2 below detail each path; this unified view shows the branching logic
 and ensures a coding agent can implement the function without inference.
 
+**Note on `..RunOptions::default()`:** All `RunOptions` construction uses struct update
+syntax with `..RunOptions::default()` rather than enumerating every field. Do not enumerate
+all fields explicitly — the `polling` field has type `Option<PollingConfig>`, and
+`PollingConfig` lives in `scenarios::exchange`. Naming it in `cli/mod.rs` would couple
+the CLI to exchange internals, violating the architecture boundary in Section 4. The struct
+update syntax populates all remaining fields with project defaults without requiring any
+additional imports.
+
 ### 6.1 `z3sim run --scenario <path>`
 
 ```
 argv
  └─ Cli::parse()
      └─ Commands::Run { args }
-         └─ cli::run_command(args).await
+         └─ cli::run_command(args, None).await
              1. load_scenario(&args.scenario)           → ScenarioConfig | ConfigError
              2. validate_scenario(&config)              → () | ConfigError
              3. Build LoadShape from args.load_shape + companion flags
-             4. Build RunOptions { load_shape, dry_run: false, cancel: Some(token), ... }
+             4. Build RunOptions { load_shape, dry_run: false, cancel: Some(token), ..RunOptions::default() }
              5. Create CancellationToken
              6. Spawn Ctrl-C task: ctrl_c().await → token.cancel()
              7. eprintln!("Starting run — press Ctrl-C to interrupt")
@@ -557,7 +565,7 @@ argv
      └─ cli::run_command(args).await
          1. load_scenario(&args.scenario)
          2. validate_scenario(&config)
-         3. Build RunOptions { dry_run: true, cancel: None, ... }
+         3. Build RunOptions { dry_run: true, cancel: None, load_shape, ..RunOptions::default() }
             No CancellationToken needed — dry-run is synchronous from the CLI perspective
          4. scenarios::runner::run(config, opts).await
             (T7 short-circuits at step 2: calls print_dry_run_summary, returns Ok)
@@ -681,6 +689,11 @@ impl std::fmt::Display for CliError {
 }
 ```
 
+**Error propagation style:** Do not add `From` trait implementations for `CliError`. Use
+explicit `.map_err()` at each call site: `.map_err(CliError::Scenario)`,
+`.map_err(CliError::Run)`, `.map_err(CliError::Generator)`, etc. This is consistent with
+the project's existing style throughout T7 (see `runner/mod.rs` for examples).
+
 **Error printing rule:** All command handler functions return `Err(CliError::...)` on
 failure. They never call `eprintln!` for errors. `main()` is the single site that calls
 `eprintln!("error: {e}")`, which triggers `CliError::Display`. The `→ exit 1` and
@@ -768,13 +781,15 @@ before any other library code runs:
 pub fn init_tracing(verbose: bool, quiet: bool) {
     use std::io::IsTerminal as _;
 
-    let level = if verbose { "debug" } else if quiet { "error" } else { "warn" };
+    let level = if verbose { tracing::Level::DEBUG }
+                else if quiet { tracing::Level::ERROR }
+                else { tracing::Level::WARN };
 
     // with_default_directive sets the fallback level; from_env_lossy() reads RUST_LOG
     // and overrides the default when set. This is the documented, version-stable pattern
     // for "flag sets default, RUST_LOG overrides."
     let filter = tracing_subscriber::EnvFilter::builder()
-        .with_default_directive(level.parse().expect("valid level directive"))
+        .with_default_directive(level.into())
         .from_env_lossy();
 
     tracing_subscriber::fmt()
@@ -855,7 +870,8 @@ Use `tokio::signal::ctrl_c()` (cross-platform; maps to SIGINT on Unix, Ctrl-C on
 Windows). Spawn a dedicated Tokio task before calling `runner::run`:
 
 ```rust
-let token = tokio_util::sync::CancellationToken::new();
+// cancel_override: Option<CancellationToken> — dispatch() passes None; tests pass a pre-cancelled token
+let token = cancel_override.unwrap_or_else(tokio_util::sync::CancellationToken::new);
 let cancel_task_token = token.clone();
 
 let ctrl_c_handle = tokio::spawn(async move {
@@ -866,7 +882,7 @@ let ctrl_c_handle = tokio::spawn(async move {
 
 let opts = RunOptions {
     cancel: Some(token.clone()),
-    ..
+    ..RunOptions::default()
 };
 let result = runner::run(config, opts).await;
 ctrl_c_handle.abort(); // prevent the task from outliving this invocation
@@ -1000,6 +1016,8 @@ These tests live in `src/cli/mod.rs` under `#[cfg(test)]` and use `clap`'s built
 // Test: LoadShapeArg::Ramp converts to LoadShape::Ramp { ramp_secs } with correct value
 // Test: LoadShapeArg::Burst with valid multiplier converts to LoadShape::Burst { spike_multiplier }
 // Test: run_command with dry_run: true sets RunOptions::cancel to None (no CancellationToken)
+// Test: CliError::InvalidArgs("--burst-multiplier must be > 0.0".into()).to_string()
+//       starts with "invalid arguments:" (verifies Display prefix, not an I/O error message)
 ```
 
 All these tests call `Cli::try_parse_from(["z3sim", ...])` and assert on the parsed
@@ -1036,12 +1054,16 @@ Use `tempfile::NamedTempFile` for invalid YAML paths (consistent with existing T
 
 ```rust
 // Test: dry-run with valid scenario returns Ok without creating run directory
-// Test: dry-run result.output_dir is None (not Some)
+// Test: dry-run with a custom output_base pointing to a TempDir creates no subdirectory
+//       inside that TempDir (verifies RunDir::create is not called; use tempfile::TempDir
+//       as output_base and assert the directory is empty after the call returns)
 // Test: dry-run with invalid scenario returns CliError (no run dir created)
 ```
 
-These tests call `run_command` directly with `dry_run: true` and assert on the `Result`.
-They do not require a live Z3 stack.
+These tests call `run_command` directly with `dry_run: true`. `run_command` returns
+`Result<(), CliError>` — the `RunResult` struct is consumed internally and its `output_dir`
+field cannot be asserted from outside. Use a `TempDir` as `output_base` and inspect its
+contents to verify the no-directory invariant. Tests do not require a live Z3 stack.
 
 ### 10.5 Golden / help output tests
 
@@ -1052,19 +1074,25 @@ from clap formatting changes across versions.
 
 ### 10.6 Ctrl-C / cancellation unit test
 
-A unit test for cancellation dispatch:
+A unit test for cancellation dispatch. With `cancel_override: Option<CancellationToken>`
+on `run_command`, tests can inject a pre-cancelled token without requiring Z3:
 
 ```rust
-// Create a CancellationToken
-// Call token.cancel() immediately
-// Verify that run_command with the token returns Ok (graceful exit, not panic)
-// Verify that no run directory was created (teardown was never invoked, or dry-run was used)
+// Create a CancellationToken and immediately cancel it
+// Call run_command(live_run_args, Some(pre_cancelled_token)).await
+// Verify the function returns Err(CliError::Interrupted)
+//   (runner::run() will fail at setup — no Z3 — but token.is_cancelled() is checked
+//    after runner::run() returns regardless of why it returned, so Interrupted takes
+//    precedence over Run(RunnerError::Setup(...)))
 ```
 
-This can be done with a dry-run invocation plus a pre-cancelled token, without starting Z3.
+This tests the code path: `runner::run()` returns → `token.is_cancelled()` → `Err(CliError::Interrupted)`.
+Note: a run directory may be created before setup fails — do not assert on filesystem state
+in this test.
 
-For a non-dry-run cancellation test: this requires the Z3 stack and belongs in integration
-tests (T9). Mark explicitly as `#[ignore]` until a live stack is available.
+For a real mid-load cancellation test (Ctrl-C fired while the load phase is running): this
+requires the Z3 stack and belongs in integration tests (T9). Mark explicitly as `#[ignore]`
+until a live stack is available.
 
 ### 10.7 What should be mocked
 
@@ -1269,7 +1297,10 @@ Write tests from Section 10.3.
 
 Implement `build_load_shape` (specified in Section 6.0) first — it is needed by both dry-run
 and live-run paths. Then implement the `run` handler for `dry_run: true` only. This avoids
-needing a live Z3 stack to test the command wiring.
+needing a live Z3 stack to test the command wiring. Give `run_command` the full signature
+`run_command(args: RunArgs, cancel_override: Option<CancellationToken>) -> Result<(), CliError>`
+from the start — the live-run branch can be left as `todo!()` in this step and completed in
+Step 8, but the parameter must be present so calling code and tests compile correctly.
 
 Write tests from Section 10.4 (dry-run tests).
 
@@ -1277,7 +1308,10 @@ Write tests from Section 10.4 (dry-run tests).
 
 ### Step 8: Implement `run_command` for live runs with Ctrl-C
 
-Add the `CancellationToken` setup, `ctrl_c()` task, and full `runner::run()` call.
+Add the `CancellationToken` setup, `ctrl_c()` task, and full `runner::run()` call. In
+the live-run path, acquire the token with
+`let token = cancel_override.unwrap_or_else(CancellationToken::new)` — `dispatch()` always
+passes `None`; tests pass a pre-cancelled token through this parameter (see Section 10.6).
 Store the `JoinHandle` returned by `tokio::spawn` and call `ctrl_c_handle.abort()` after
 `runner::run()` returns to prevent the task outliving this invocation. After aborting,
 check `token.is_cancelled()` to decide between `CliError::Interrupted` (→ exit 130) and
@@ -1294,7 +1328,7 @@ when `Some`. Add the cancellation unit test from Section 10.6.
 // src/cli/mod.rs
 pub async fn dispatch(cli: Cli) -> Result<(), CliError> {
     match cli.command {
-        Commands::Run(args) => run_command(args).await,
+        Commands::Run(args) => run_command(args, None).await,
         Commands::GenerateFixtures(args) => generate_fixtures_command(&args),
         Commands::ValidateScenario { path } => validate_scenario_command(&path),
     }
@@ -1336,8 +1370,10 @@ Replace `echo TODO` bodies in `generate-fixtures` and `scenario-dry-run` targets
 Add a `validate-scenario` target.
 
 ```makefile
-# Also add validate-scenario to the existing .PHONY line at the top of the Makefile
-.PHONY: ... generate-fixtures scenario-dry-run validate-scenario clean
+# Replace the existing .PHONY declaration at the top of the Makefile with the
+# complete line below (adds validate-scenario; preserves all existing targets):
+.PHONY: help setup clone-z3 build build-release test fmt fmt-check lint \
+        generate-fixtures scenario-dry-run validate-scenario clean
 
 generate-fixtures: ## Generate synthetic fixture data for tests
 	$(CARGO) run -- generate-fixtures \
@@ -1462,7 +1498,7 @@ T8 is complete when all of the following pass:
 | validate-scenario tests | Valid, Io error, Parse error, ValidationErrors covered |
 | generate-fixtures tests | Creates files, correct count, determinism verified |
 | Dry-run test | No run directory created |
-| Cancellation test | Pre-cancelled token returns Ok gracefully |
+| Cancellation test | Pre-cancelled token via cancel_override returns Err(CliError::Interrupted) |
 
 ### AC3 — Logging
 
@@ -1528,6 +1564,7 @@ The following checklist is for a human or agent reviewing this plan before imple
 ### Data flow
 
 - [ ] `run` command: cancellation token is created before `runner::run()` and passed via `RunOptions::cancel`
+- [ ] `run_command` signature accepts `cancel_override: Option<CancellationToken>`; `dispatch()` always passes `None`
 - [ ] After `runner::run()` returns, `token.is_cancelled()` is checked to select between exit 130 and exit 1
 - [ ] `run --dry-run`: no `CancellationToken` needed (synchronous from CLI perspective)
 - [ ] `generate-fixtures`: full scenario validation is run before population generation
@@ -1566,7 +1603,7 @@ The following checklist is for a human or agent reviewing this plan before imple
 - [ ] Parsing tests use `clap::Parser::try_parse_from` (no subprocess invocation)
 - [ ] Tests that require a live Z3 stack are marked `#[ignore]`
 - [ ] Determinism is tested for `generate-fixtures` (same seed → same output)
-- [ ] Ctrl-C test uses a pre-cancelled token (no signal injection needed)
+- [ ] Ctrl-C test uses a pre-cancelled token via `cancel_override` parameter (no signal injection needed)
 
 ### Dependencies
 
