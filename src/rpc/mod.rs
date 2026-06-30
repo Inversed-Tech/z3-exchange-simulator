@@ -174,6 +174,7 @@ pub struct AddressValidation {
 /// Zallet identifies accounts by UUID string, not a numeric index.
 #[derive(Debug, Clone, Deserialize)]
 pub struct AccountInfo {
+    #[serde(rename = "account_uuid")]
     pub account: String,
     pub name: Option<String>,
 }
@@ -182,6 +183,7 @@ pub struct AccountInfo {
 /// `address` is the Unified Address used as the deposit address.
 #[derive(Debug, Clone, Deserialize)]
 pub struct UnifiedAddress {
+    #[serde(rename = "account_uuid")]
     pub account: String,
     pub address: String,
     pub receiver_types: Vec<String>,
@@ -801,13 +803,22 @@ impl RpcClient {
             .await
     }
 
-    /// Derive a Unified Address (deposit address) for an account.
+    /// Derive a Unified Address for an account with the given receiver types.
+    ///
+    /// Always pass `receiver_types` explicitly. Use `&["orchard"]` for synthetic
+    /// accounts to avoid advancing Zallet's transparent address gap counter
+    /// (limit: 10 consecutive unfunded transparent derivations across the wallet).
     pub async fn z_get_address_for_account(
         &self,
         account: &str,
+        receiver_types: &[&str],
+        diversifier_index: Option<u64>,
     ) -> Result<UnifiedAddress, RpcError> {
-        self.call("z_getaddressforaccount", serde_json::json!([account]))
-            .await
+        let params = match diversifier_index {
+            Some(idx) => serde_json::json!([account, receiver_types, idx]),
+            None => serde_json::json!([account, receiver_types]),
+        };
+        self.call("z_getaddressforaccount", params).await
     }
 
     pub async fn z_list_accounts(&self) -> Result<Vec<AccountInfo>, RpcError> {
@@ -1406,7 +1417,7 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(matchers::method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "result": { "account": "uuid-1234", "name": null },
+                "result": { "account_uuid": "uuid-1234", "name": null },
                 "error": null, "id": 1
             })))
             .mount(&server)
@@ -1425,7 +1436,7 @@ mod tests {
         Mock::given(matchers::method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "result": {
-                    "account": "uuid-1234",
+                    "account_uuid": "uuid-1234",
                     "address": "u1depositaddress",
                     "receiver_types": ["orchard", "sapling", "p2pkh"]
                 },
@@ -1434,7 +1445,7 @@ mod tests {
             .mount(&server)
             .await;
         let ua = client(&server.uri())
-            .z_get_address_for_account("uuid-1234")
+            .z_get_address_for_account("uuid-1234", &["orchard"], None)
             .await
             .unwrap();
         assert_eq!(ua.address, "u1depositaddress");
@@ -1449,8 +1460,8 @@ mod tests {
         Mock::given(matchers::method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "result": [
-                    { "account": "uuid-1", "name": "Alice" },
-                    { "account": "uuid-2", "name": null }
+                    { "account_uuid": "uuid-1", "name": "Alice" },
+                    { "account_uuid": "uuid-2", "name": null }
                 ],
                 "error": null, "id": 1
             })))
@@ -2057,7 +2068,7 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(matchers::method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "result": [{ "account": "uuid-r", "name": "recovered" }],
+                "result": [{ "account_uuid": "uuid-r", "name": "recovered" }],
                 "error": null, "id": 1
             })))
             .mount(&server)

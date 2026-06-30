@@ -1,0 +1,46 @@
+name: ramp
+description: >
+  TPS climbs linearly from near-zero to target over the ramp window, then holds
+  steady. Same flow config as steady_state (100% T→T) so the only variable is
+  the changing arrival rate. Watch for the inflection point where latency jumps
+  or errors first appear — that is the Z3 stack's sustainable TPS ceiling under
+  transparent load.
+
+  Run with: z3sim run --scenario configs/scenarios/ramp.yaml \
+                      --load-shape ramp --ramp-secs 120
+
+  The ceiling TPS is set higher than steady_state to leave room to find the
+  degradation point. If no errors appear, raise load_target_tps and re-run.
+
+seed: 2002
+
+accounts_count: 100
+accounts_active_fraction: 0.5   # 50 active accounts — same pool as steady_state
+
+load_duration_seconds: 300      # 2-minute ramp then 3 minutes at ceiling
+load_target_tps: 10.0           # ceiling — ramp climbs to this value
+
+flows:
+  transparent_to_transparent: 1.0
+  transparent_to_shielded: 0.0
+  shielded_to_transparent: 0.0
+  shielded_to_shielded: 0.0
+
+confirmations_deposit_required: 1
+
+warmup_blocks: 110              # 100 for regtest coinbase maturity + 10 buffer
+
+observability:
+  record_rpc_calls: true
+  record_component_logs: true
+  metric_sampling_interval_secs: 5
+  mempool_saturation_threshold: 200
+
+activity_profiles:
+  low_fraction: 0.50
+  medium_fraction: 0.35
+  high_fraction: 0.15
+
+amounts:
+  min_zatoshis: 10000       # 0.0001 ZEC
+  max_zatoshis: 100000000   # 1 ZEC

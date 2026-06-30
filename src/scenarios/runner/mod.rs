@@ -34,8 +34,8 @@ pub use result::{IntentOutcome, RunResult, RunStats};
 pub use scheduler::LoadShape;
 
 use config::print_dry_run_summary;
-use dispatch::{build_intent_future, periodic_balance_check};
-use lifecycle::{setup, teardown, warmup, SetupState};
+use dispatch::{background_miner, build_intent_future, periodic_balance_check};
+use lifecycle::{setup, teardown, SetupState};
 use provisioner::{ProvisionedPopulation, ProvisionerError};
 use scheduler::{mixed_flow_config, Scheduler};
 
@@ -169,7 +169,11 @@ pub async fn run(scenario: ScenarioConfig, opts: RunOptions) -> Result<RunResult
     write_manifest(&run_dir.manifest_path(), &manifest)
         .map_err(|e| RunnerError::Metrics(e.to_string()))?;
 
-    // 6. Setup: start Z3, provision population.
+    // 6. Setup: start Z3, warmup, provision population.
+    //    Warmup (mining) now runs inside setup() before provisioning so the
+    //    hot wallet's transparent address is funded before synthetic accounts
+    //    are derived — this resets Zallet's transparent gap counter and allows
+    //    all N synthetic accounts to receive transparent receivers.
     let setup_state = setup(&scenario, &opts, &run_id, &run_dir, metrics.clone()).await?;
 
     let SetupState {
@@ -182,21 +186,7 @@ pub async fn run(scenario: ScenarioConfig, opts: RunOptions) -> Result<RunResult
 
     let provisioned = Arc::new(provisioned);
 
-    // 7. Warmup: mine blocks, verify responsiveness, check hot wallet balance.
-    if let Err(e) = warmup(&rpc, &scenario, &run_id, metrics.clone()).await {
-        let _ = teardown(
-            stack,
-            &run_dir,
-            &mut manifest,
-            &recorder,
-            &scenario.source_path,
-            false,
-        )
-        .await;
-        return Err(e);
-    }
-
-    // 8. Load phase.
+    // 7. Load phase.
     let load_result = load_phase(
         rpc.clone(),
         provisioned,
@@ -209,7 +199,7 @@ pub async fn run(scenario: ScenarioConfig, opts: RunOptions) -> Result<RunResult
     )
     .await;
 
-    // 9. Teardown always runs; propagate its error only when load succeeded.
+    // 8. Teardown always runs; propagate its error only when load succeeded.
     let load_succeeded = load_result.is_ok();
     let teardown_result = teardown(
         stack,
@@ -286,6 +276,7 @@ async fn load_phase(
     // Shutdown channels for background tasks.
     let (mempool_tx, mempool_rx) = tokio::sync::oneshot::channel::<()>();
     let (balance_tx, balance_rx) = tokio::sync::oneshot::channel::<()>();
+    let (miner_tx, miner_rx) = tokio::sync::oneshot::channel::<()>();
 
     // Start mempool watcher.
     let mempool_interval =
@@ -298,6 +289,13 @@ async fn load_phase(
         mempool_interval,
         metrics.clone(),
         mempool_rx,
+    ));
+
+    // Start background miner (mines 1 block every 2 s during the load phase).
+    tokio::spawn(background_miner(
+        rpc.clone(),
+        Duration::from_secs(2),
+        miner_rx,
     ));
 
     // Start periodic balance check.
@@ -357,6 +355,7 @@ async fn load_phase(
                 run_id.to_string(),
                 polling,
                 provisioned.zallet_uuids.clone(),
+                provisioned.zallet_addresses.clone(),
             );
             tasks.spawn(fut);
         }
@@ -365,6 +364,7 @@ async fn load_phase(
     // Signal background tasks to stop.
     let _ = mempool_tx.send(());
     let _ = balance_tx.send(());
+    let _ = miner_tx.send(());
 
     // Drain all in-flight tasks.
     let mut outcomes = Vec::with_capacity(tasks.len());

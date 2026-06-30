@@ -1,0 +1,41 @@
+name: steady_state
+description: >
+  Baseline exchange load at constant TPS. 100% transparent-to-transparent flows
+  keep the signal clean — no ZK proving latency — so this scenario isolates pure
+  RPC and mempool performance. Run this first to establish P50/P95/P99 baselines
+  before introducing load-shape or flow-mix variation.
+
+  Run with: z3sim run --scenario configs/scenarios/steady_state.yaml --load-shape steady
+
+seed: 1001
+
+accounts_count: 100
+accounts_active_fraction: 0.5   # 50 active accounts — sender and recipient pools
+
+load_duration_seconds: 300      # 5 minutes at target TPS → ~1 500 intents
+load_target_tps: 5.0
+
+flows:
+  transparent_to_transparent: 1.0
+  transparent_to_shielded: 0.0
+  shielded_to_transparent: 0.0
+  shielded_to_shielded: 0.0
+
+confirmations_deposit_required: 1
+
+warmup_blocks: 110              # 100 for regtest coinbase maturity + 10 buffer
+
+observability:
+  record_rpc_calls: true
+  record_component_logs: true
+  metric_sampling_interval_secs: 5
+  mempool_saturation_threshold: 200
+
+activity_profiles:
+  low_fraction: 0.50
+  medium_fraction: 0.35
+  high_fraction: 0.15
+
+amounts:
+  min_zatoshis: 10000       # 0.0001 ZEC
+  max_zatoshis: 100000000   # 1 ZEC

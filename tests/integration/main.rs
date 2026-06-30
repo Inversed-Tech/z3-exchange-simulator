@@ -13,7 +13,7 @@ use z3_exchange_simulator::scenarios::runner::{
 ///
 /// Run with: `cargo test -- --ignored test_smoke_scenario_via_runner`
 #[tokio::test]
-#[ignore]
+#[ignore = "requires live Z3 regtest stack; run with: cargo test -- --ignored test_smoke_scenario_via_runner"]
 async fn test_smoke_scenario_via_runner() {
     let scenario = load_scenario(Path::new("configs/scenarios/smoke.yaml")).unwrap();
     validate_scenario(&scenario).unwrap();
