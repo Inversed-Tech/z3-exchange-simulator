@@ -24,6 +24,14 @@ const ENV_FILE: &str = ".env.regtest";
 const DEFAULT_REGTEST_RPC_USER: &str = "zebra";
 const DEFAULT_REGTEST_RPC_PASSWORD: &str = "zebra";
 
+/// Returns the host to use for RPC connections. Defaults to `127.0.0.1` but
+/// can be overridden by `Z3_RPC_HOST` — useful when running from inside a
+/// devcontainer where the Docker daemon is on the macOS host (use
+/// `host.docker.internal`).
+fn rpc_host() -> String {
+    std::env::var("Z3_RPC_HOST").unwrap_or_else(|_| "127.0.0.1".into())
+}
+
 // ── Config ────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -53,7 +61,7 @@ impl Z3Config {
     pub fn for_run(run_id: &str, log_dir: PathBuf) -> Self {
         Self {
             compose_dir: PathBuf::from("external/z3"),
-            rpc_url: "http://127.0.0.1:8181".into(),
+            rpc_url: format!("http://{}:8181", rpc_host()),
             basic_auth: Some((
                 DEFAULT_REGTEST_RPC_USER.into(),
                 DEFAULT_REGTEST_RPC_PASSWORD.into(),
@@ -79,7 +87,7 @@ impl Z3Config {
         let contract = Z3Contract::from_compose_dir(&compose_dir)?;
         let net = contract.network(network)?;
 
-        let rpc_url = net.primary_rpc_url("127.0.0.1")?;
+        let rpc_url = net.primary_rpc_url(&rpc_host())?;
         let basic_auth = if net.uses_username_password_auth() {
             let (user, pass) = match &net.rpc_auth.credential_env_vars {
                 Some(vars) => (
@@ -310,9 +318,11 @@ async fn health_check(
         return false;
     };
 
+    // Zebra 5.x returns "test" for regtest (regtest inherits testnet defaults);
+    // accept both so the check works across Zebra versions.
     json.pointer("/result/chain")
         .and_then(|v| v.as_str())
-        .map(|chain| chain == "regtest")
+        .map(|chain| chain == "regtest" || chain == "test")
         .unwrap_or(false)
 }
 
@@ -486,7 +496,8 @@ mod tests {
 
     #[test]
     fn check_preconditions_missing_compose_dir() {
-        let config = Z3Config::for_run("test-run", PathBuf::from("/tmp/z3-test-logs"));
+        let mut config = Z3Config::for_run("test-run", PathBuf::from("/tmp/z3-test-logs"));
+        config.compose_dir = PathBuf::from("/nonexistent/z3-compose-dir-that-cannot-exist");
         let stack = Z3Stack::new(config, None);
         assert!(matches!(
             stack.check_preconditions(),
@@ -745,6 +756,24 @@ networks:
         Mock::given(wiremock::matchers::method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "result": {"chain": "regtest", "blocks": 1, "headers": 1},
+                "error": null,
+                "id": 1
+            })))
+            .mount(&server)
+            .await;
+
+        let client = reqwest::Client::new();
+        assert!(health_check(&client, &server.uri(), None).await);
+    }
+
+    #[tokio::test]
+    async fn health_check_returns_true_for_test_chain() {
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": {"chain": "test", "blocks": 2, "headers": 2},
                 "error": null,
                 "id": 1
             })))

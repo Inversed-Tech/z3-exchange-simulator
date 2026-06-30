@@ -276,7 +276,7 @@ mod tests {
                 serde_json::json!({"method": "z_getnewaccount"}),
             ))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "result": {"account": "uuid-1234", "name": null},
+                "result": {"account_uuid": "uuid-1234", "name": null},
                 "error": null, "id": 1
             })))
             .mount(server)
@@ -288,7 +288,7 @@ mod tests {
             ))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "result": {
-                    "account": "uuid-1234",
+                    "account_uuid": "uuid-1234",
                     "address": "u1testaddress",
                     "receiver_types": ["orchard", "sapling", "p2pkh"]
                 },

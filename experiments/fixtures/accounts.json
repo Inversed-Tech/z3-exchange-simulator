@@ -1,0 +1,72 @@
+[
+  {
+    "account_id": "a1b588c6-8c08-42f9-b0d8-9e5b1401840d",
+    "status": "inactive",
+    "activity_profile": "low",
+    "wallet_id": "00629883-28f7-439b-ad73-4d8eaaa0a43b",
+    "created_at": "2026-06-30T11:56:02.203423756Z"
+  },
+  {
+    "account_id": "fff00d60-b78e-452e-b984-42d104da97b4",
+    "status": "inactive",
+    "activity_profile": "medium",
+    "wallet_id": "71d8bd9a-a903-47eb-9748-370a179cec4a",
+    "created_at": "2026-06-30T11:56:02.203617881Z"
+  },
+  {
+    "account_id": "3022f94f-33c6-43f0-92bc-b14e4fe8cd3d",
+    "status": "active",
+    "activity_profile": "low",
+    "wallet_id": "fcf51390-0774-4e29-bee3-9ab2d28072f0",
+    "created_at": "2026-06-30T11:56:02.203619797Z"
+  },
+  {
+    "account_id": "8581b221-716f-4b03-a2b5-dd0ac39f48af",
+    "status": "active",
+    "activity_profile": "low",
+    "wallet_id": "a759a684-5cc6-449d-8509-9115fd950116",
+    "created_at": "2026-06-30T11:56:02.203630256Z"
+  },
+  {
+    "account_id": "e9f4d395-d329-4feb-921a-a42629100435",
+    "status": "inactive",
+    "activity_profile": "medium",
+    "wallet_id": "f8519d51-7429-4a79-9d36-d484143b2347",
+    "created_at": "2026-06-30T11:56:02.203631631Z"
+  },
+  {
+    "account_id": "cc455acf-4778-49a4-b655-9ee50e1091e1",
+    "status": "inactive",
+    "activity_profile": "low",
+    "wallet_id": "18240eac-e3e5-4aac-aede-73ddecf3b989",
+    "created_at": "2026-06-30T11:56:02.203641922Z"
+  },
+  {
+    "account_id": "59dc157e-442b-4b5c-88f3-4df6f5b3f061",
+    "status": "active",
+    "activity_profile": "low",
+    "wallet_id": "386f76d3-f2b1-4776-aef8-018c224797ab",
+    "created_at": "2026-06-30T11:56:02.203643172Z"
+  },
+  {
+    "account_id": "ca3cb975-27e2-4c57-af30-87d51d11dc7b",
+    "status": "inactive",
+    "activity_profile": "medium",
+    "wallet_id": "0860cf3f-3800-4236-bead-bf24ed7e1aff",
+    "created_at": "2026-06-30T11:56:02.203653422Z"
+  },
+  {
+    "account_id": "c44caca0-cac2-44bb-bed1-7ffc9a2de695",
+    "status": "active",
+    "activity_profile": "low",
+    "wallet_id": "b2a83869-00bd-4c4f-8f70-effb54694b84",
+    "created_at": "2026-06-30T11:56:02.203663714Z"
+  },
+  {
+    "account_id": "13c82968-99a5-4948-9a2c-79c8bba57bf5",
+    "status": "inactive",
+    "activity_profile": "medium",
+    "wallet_id": "5410a938-70f5-4a78-bf7b-5a8c87269ce1",
+    "created_at": "2026-06-30T11:56:02.203665006Z"
+  }
+]

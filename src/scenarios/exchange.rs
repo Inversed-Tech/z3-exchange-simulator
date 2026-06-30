@@ -961,7 +961,7 @@ mod tests {
             ))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "result": {
-                    "account": "uuid-1",
+                    "account_uuid": "uuid-1",
                     "address": "u1depositaddr",
                     "receiver_types": ["orchard"]
                 },
@@ -1053,7 +1053,7 @@ mod tests {
                 serde_json::json!({ "method": "z_getaddressforaccount" }),
             ))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "result": { "account": "uuid-1", "address": "u1addr", "receiver_types": [] },
+                "result": { "account_uuid": "uuid-1", "address": "u1addr", "receiver_types": [] },
                 "error": null, "id": 1
             })))
             .mount(&server)

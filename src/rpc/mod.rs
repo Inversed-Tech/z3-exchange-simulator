@@ -174,6 +174,7 @@ pub struct AddressValidation {
 /// Zallet identifies accounts by UUID string, not a numeric index.
 #[derive(Debug, Clone, Deserialize)]
 pub struct AccountInfo {
+    #[serde(rename = "account_uuid")]
     pub account: String,
     pub name: Option<String>,
 }
@@ -182,6 +183,7 @@ pub struct AccountInfo {
 /// `address` is the Unified Address used as the deposit address.
 #[derive(Debug, Clone, Deserialize)]
 pub struct UnifiedAddress {
+    #[serde(rename = "account_uuid")]
     pub account: String,
     pub address: String,
     pub receiver_types: Vec<String>,
@@ -329,7 +331,7 @@ pub struct NotesCount {
 #[derive(Debug, Clone, Deserialize)]
 pub struct WalletTransaction {
     pub txid: String,
-    #[serde(default)]
+    #[serde(rename = "account_uuid", default)]
     pub account: Option<String>,
 }
 
@@ -1406,7 +1408,7 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(matchers::method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "result": { "account": "uuid-1234", "name": null },
+                "result": { "account_uuid": "uuid-1234", "name": null },
                 "error": null, "id": 1
             })))
             .mount(&server)
@@ -1425,7 +1427,7 @@ mod tests {
         Mock::given(matchers::method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "result": {
-                    "account": "uuid-1234",
+                    "account_uuid": "uuid-1234",
                     "address": "u1depositaddress",
                     "receiver_types": ["orchard", "sapling", "p2pkh"]
                 },
@@ -1449,8 +1451,8 @@ mod tests {
         Mock::given(matchers::method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "result": [
-                    { "account": "uuid-1", "name": "Alice" },
-                    { "account": "uuid-2", "name": null }
+                    { "account_uuid": "uuid-1", "name": "Alice" },
+                    { "account_uuid": "uuid-2", "name": null }
                 ],
                 "error": null, "id": 1
             })))
@@ -1903,7 +1905,7 @@ mod tests {
         Mock::given(matchers::method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "result": [
-                    { "txid": "t1", "account": "uuid-1" },
+                    { "txid": "t1", "account_uuid": "uuid-1" },
                     { "txid": "t2" }
                 ],
                 "error": null, "id": 1
@@ -2057,7 +2059,7 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(matchers::method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "result": [{ "account": "uuid-r", "name": "recovered" }],
+                "result": [{ "account_uuid": "uuid-r", "name": "recovered" }],
                 "error": null, "id": 1
             })))
             .mount(&server)
