@@ -331,7 +331,7 @@ pub struct NotesCount {
 #[derive(Debug, Clone, Deserialize)]
 pub struct WalletTransaction {
     pub txid: String,
-    #[serde(default)]
+    #[serde(rename = "account_uuid", default)]
     pub account: Option<String>,
 }
 
@@ -1914,7 +1914,7 @@ mod tests {
         Mock::given(matchers::method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "result": [
-                    { "txid": "t1", "account": "uuid-1" },
+                    { "txid": "t1", "account_uuid": "uuid-1" },
                     { "txid": "t2" }
                 ],
                 "error": null, "id": 1

@@ -13,9 +13,17 @@
 # Rust build output
 target/
 
+# Cloned Z3 stack — a throwaway working copy pinned by z3-commits.lock and
+# populated by scripts/dev/clone-z3.sh. Never committed (not a submodule).
+external/
+
 # Experiment run outputs (generated data, not source)
 experiments/runs/*/
 !experiments/runs/.gitkeep
+
+# Generated fixtures (output of `z3sim generate-fixtures`, regenerable)
+experiments/fixtures/*
+!experiments/fixtures/.gitkeep
 
 # Local environment overrides
 configs/local/local.yaml
