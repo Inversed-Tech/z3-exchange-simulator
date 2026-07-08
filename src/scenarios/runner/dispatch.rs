@@ -42,11 +42,12 @@ pub async fn build_intent_future(
     sem: Arc<Semaphore>,
     active_count: Arc<AtomicUsize>,
     metrics: Arc<dyn MetricsRecorder>,
-    hot_wallet_uuid: String,
+    _hot_wallet_uuid: String,
     hot_wallet_address: String,
     run_id: String,
     polling: PollingConfig,
     zallet_uuids: Arc<HashMap<String, String>>,
+    zallet_addresses: Arc<HashMap<String, String>>,
 ) -> IntentOutcome {
     active_count.fetch_add(1, Ordering::Relaxed);
     let _guard = ActiveGuard(active_count.clone());
@@ -55,20 +56,10 @@ pub async fn build_intent_future(
     match intent.flow_type {
         // ── Transparent → Transparent: withdrawal ──────────────────────
         FlowType::TToT => {
-            let zallet_uuid = match zallet_uuids.get(&intent.account_id) {
-                Some(u) => u.clone(),
-                None => {
-                    return IntentOutcome::Failed {
-                        intent_id: intent.intent_id,
-                        flow_type: FlowType::TToT,
-                        error: format!("no Zallet UUID for account {}", intent.account_id),
-                    }
-                }
-            };
             match run_withdrawal(
                 &rpc,
                 &intent.account_id,
-                &zallet_uuid,
+                &hot_wallet_address,
                 &intent.recipient_address,
                 intent.amount_zatoshis,
                 Some(&intent.intent_id),
@@ -107,7 +98,7 @@ pub async fn build_intent_future(
                 &rpc,
                 &intent.account_id,
                 &zallet_uuid,
-                &hot_wallet_uuid,
+                &hot_wallet_address,
                 intent.amount_zatoshis,
                 1,
                 &run_id,
@@ -142,9 +133,20 @@ pub async fn build_intent_future(
                 }
             };
             // Step 1: sweep user's shielded notes into the hot wallet.
+            let zallet_address = match zallet_addresses.get(&intent.account_id) {
+                Some(a) => a.clone(),
+                None => {
+                    return IntentOutcome::Failed {
+                        intent_id: intent.intent_id,
+                        flow_type: FlowType::ZToT,
+                        error: format!("no Zallet address for account {}", intent.account_id),
+                    }
+                }
+            };
             match run_sweep(
                 &rpc,
                 &zallet_uuid,
+                &zallet_address,
                 &hot_wallet_address,
                 &run_id,
                 Some(metrics.clone()),
@@ -171,7 +173,7 @@ pub async fn build_intent_future(
             match run_withdrawal(
                 &rpc,
                 &intent.account_id,
-                &hot_wallet_uuid,
+                &hot_wallet_address,
                 &intent.recipient_address,
                 intent.amount_zatoshis,
                 Some(&intent.intent_id),
@@ -210,7 +212,7 @@ pub async fn build_intent_future(
                 &rpc,
                 &intent.account_id,
                 &zallet_uuid,
-                &hot_wallet_uuid,
+                &hot_wallet_address,
                 intent.amount_zatoshis,
                 1,
                 &run_id,
@@ -229,6 +231,31 @@ pub async fn build_intent_future(
                     flow_type: FlowType::ZToZ,
                     error: e.to_string(),
                 },
+            }
+        }
+    }
+}
+
+// ── background_miner ──────────────────────────────────────────────────────────
+
+/// Background task that mines one regtest block per `interval`.
+///
+/// This decouples block production from individual transaction flows so that
+/// per-transaction `generate()` calls are not needed. Mining failures are
+/// logged but do not stop the task — the caller will detect chain progress
+/// via confirmation-poll timeouts if the chain is truly broken.
+pub async fn background_miner(
+    rpc: Arc<RpcClient>,
+    interval: Duration,
+    mut shutdown: tokio::sync::oneshot::Receiver<()>,
+) {
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            _ = &mut shutdown => break,
+            _ = ticker.tick() => {
+                let _ = rpc.generate(1).await;
             }
         }
     }
@@ -462,6 +489,7 @@ mod tests {
         let active_count = Arc::new(AtomicUsize::new(0));
         let metrics: Arc<dyn MetricsRecorder> = Arc::new(NullRecorder);
         let zallet_uuids = Arc::new(HashMap::new()); // empty → immediate fail, no RPC calls
+        let zallet_addresses = Arc::new(HashMap::new());
 
         let outcome = build_intent_future(
             make_intent(FlowType::TToT, "acct-1"),
@@ -474,6 +502,7 @@ mod tests {
             "run".to_string(),
             fast_polling(),
             zallet_uuids,
+            zallet_addresses,
         )
         .await;
 
@@ -510,6 +539,10 @@ mod tests {
         uuid_map.insert("acct-1".to_string(), "zallet-uuid-1".to_string());
         let zallet_uuids = Arc::new(uuid_map);
 
+        let mut addr_map = HashMap::new();
+        addr_map.insert("acct-1".to_string(), "u1acct1address".to_string());
+        let zallet_addresses = Arc::new(addr_map);
+
         let outcome = build_intent_future(
             make_intent(FlowType::ZToT, "acct-1"),
             rpc,
@@ -521,6 +554,7 @@ mod tests {
             "run".to_string(),
             fast_polling(),
             zallet_uuids,
+            zallet_addresses,
         )
         .await;
 
@@ -547,6 +581,7 @@ mod tests {
         let active_count = Arc::new(AtomicUsize::new(0));
         let metrics: Arc<dyn MetricsRecorder> = Arc::new(NullRecorder);
         let zallet_uuids = Arc::new(HashMap::new()); // empty → immediate fail, no RPC calls
+        let zallet_addresses = Arc::new(HashMap::new());
 
         let mut tasks = tokio::task::JoinSet::new();
         for i in 0..5 {
@@ -561,6 +596,7 @@ mod tests {
                 "run".to_string(),
                 fast_polling(),
                 zallet_uuids.clone(),
+                zallet_addresses.clone(),
             ));
         }
 

@@ -1,0 +1,52 @@
+name: mixed
+description: >
+  Shielded-only load: 50% transparent-to-shielded (TToZ) and 50%
+  shielded-to-shielded (ZToZ). Both flows go through Zallet's ZK prover,
+  producing withdrawal_proving_time_ms samples that can be compared against
+  the steady_state transparent baseline. TPS is deliberately lower than
+  steady_state because each shielded transaction takes several seconds to prove.
+
+  Run with: z3sim run --scenario configs/scenarios/mixed.yaml --load-shape steady
+
+  Alternatively, --load-shape mixed ignores the YAML flow config and forces the
+  same 50/50 TToZ/ZToZ split — useful for running any scenario through the
+  shielded path without editing the YAML.
+
+  Key questions this scenario answers:
+  - What is the P50/P95/P99 ZK proving latency under sustained load?
+  - How does shielded throughput compare to transparent throughput?
+  - Does sustained shielded load surface any Zallet memory or CPU issues?
+
+seed: 4004
+
+accounts_count: 50
+accounts_active_fraction: 1.0   # all 50 accounts active — shielded flows need
+                                 # both a funded sender pool and a recipient pool
+
+load_duration_seconds: 300      # 5 minutes at 2 TPS → ~600 shielded intents
+load_target_tps: 2.0            # low — ZK proving takes 2–5 s per transaction
+
+flows:
+  transparent_to_transparent: 0.0
+  transparent_to_shielded: 0.5
+  shielded_to_transparent: 0.0
+  shielded_to_shielded: 0.5
+
+confirmations_deposit_required: 1
+
+warmup_blocks: 110              # 100 for regtest coinbase maturity + 10 buffer
+
+observability:
+  record_rpc_calls: true
+  record_component_logs: true
+  metric_sampling_interval_secs: 5
+  mempool_saturation_threshold: 100
+
+activity_profiles:
+  low_fraction: 0.50
+  medium_fraction: 0.35
+  high_fraction: 0.15
+
+amounts:
+  min_zatoshis: 10000       # 0.0001 ZEC
+  max_zatoshis: 10000000    # 0.1 ZEC — smaller ceiling for shielded; fees are higher

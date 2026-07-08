@@ -23,6 +23,8 @@ pub struct ProvisionedPopulation {
     pub population: SyntheticPopulation,
     /// Maps simulator `account_id` → Zallet account UUID.
     pub zallet_uuids: Arc<HashMap<String, String>>,
+    /// Maps simulator `account_id` → Unified Address (the `from` address for z_sendmany).
+    pub zallet_addresses: Arc<HashMap<String, String>>,
     pub hot_wallet_uuid: String,
 }
 
@@ -117,7 +119,7 @@ pub async fn provision(
             let _permit = permit;
             let account_info = rpc_clone.z_get_new_account(&account_id).await?;
             let zallet_uuid = account_info.account.clone();
-            let ua = rpc_clone.z_get_address_for_account(&zallet_uuid).await?;
+            let ua = rpc_clone.z_get_address_for_account(&zallet_uuid, &["orchard"], None).await?;
             Ok((account_id, zallet_uuid, ua.address))
         });
     }
@@ -133,9 +135,11 @@ pub async fn provision(
     // Step 5: for each provisioned account, add transparent and Orchard
     // address entries to the population's wallet.
     let mut zallet_uuids: HashMap<String, String> = HashMap::new();
+    let mut zallet_addresses: HashMap<String, String> = HashMap::new();
 
     for (account_id, zallet_uuid, ua_address) in &provisioned {
         zallet_uuids.insert(account_id.clone(), zallet_uuid.clone());
+        zallet_addresses.insert(account_id.clone(), ua_address.clone());
 
         let wallet_id = population
             .wallet_for_account(account_id)
@@ -187,6 +191,7 @@ pub async fn provision(
     Ok(ProvisionedPopulation {
         population,
         zallet_uuids: Arc::new(zallet_uuids),
+        zallet_addresses: Arc::new(zallet_addresses),
         hot_wallet_uuid,
     })
 }
@@ -276,7 +281,7 @@ mod tests {
                 serde_json::json!({"method": "z_getnewaccount"}),
             ))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "result": {"account": "uuid-1234", "name": null},
+                "result": {"account_uuid": "uuid-1234", "name": null},
                 "error": null, "id": 1
             })))
             .mount(server)
@@ -288,7 +293,7 @@ mod tests {
             ))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "result": {
-                    "account": "uuid-1234",
+                    "account_uuid": "uuid-1234",
                     "address": "u1testaddress",
                     "receiver_types": ["orchard", "sapling", "p2pkh"]
                 },

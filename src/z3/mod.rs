@@ -61,7 +61,7 @@ impl Z3Config {
             compose_project: "z3-regtest".into(),
             log_dir,
             run_id: run_id.into(),
-            health_check_timeout_secs: 60,
+            health_check_timeout_secs: 180,
             resource_sample_interval_secs: 5,
         }
     }
@@ -106,7 +106,7 @@ impl Z3Config {
             compose_project: net.compose_project.clone(),
             log_dir,
             run_id: run_id.into(),
-            health_check_timeout_secs: 60,
+            health_check_timeout_secs: 180,
             resource_sample_interval_secs: 5,
         })
     }
@@ -231,6 +231,10 @@ impl Z3Stack {
         let client = reqwest::Client::new();
         let timeout = self.config.health_check_timeout_secs;
         let deadline = time::Instant::now() + Duration::from_secs(timeout);
+        // rpc-router can be briefly UP during a Docker restart loop; require
+        // 3 consecutive successes so we only proceed when it is truly stable.
+        let mut consecutive = 0u32;
+        const REQUIRED: u32 = 3;
 
         loop {
             if time::Instant::now() >= deadline {
@@ -245,7 +249,12 @@ impl Z3Stack {
             )
             .await
             {
-                return Ok(());
+                consecutive += 1;
+                if consecutive >= REQUIRED {
+                    return Ok(());
+                }
+            } else {
+                consecutive = 0;
             }
             time::sleep(Duration::from_millis(500)).await;
         }
@@ -310,9 +319,11 @@ async fn health_check(
         return false;
     };
 
+    // Zebra implements regtest as Network::Testnet(Regtest) so getblockchaininfo
+    // returns "test", not "regtest". Accept both to guard against mainnet ("main").
     json.pointer("/result/chain")
         .and_then(|v| v.as_str())
-        .map(|chain| chain == "regtest")
+        .map(|chain| chain == "regtest" || chain == "test")
         .unwrap_or(false)
 }
 
@@ -486,7 +497,8 @@ mod tests {
 
     #[test]
     fn check_preconditions_missing_compose_dir() {
-        let config = Z3Config::for_run("test-run", PathBuf::from("/tmp/z3-test-logs"));
+        let mut config = Z3Config::for_run("test-run", PathBuf::from("/tmp/z3-test-logs"));
+        config.compose_dir = PathBuf::from("/tmp/z3-nonexistent-compose-dir-test");
         let stack = Z3Stack::new(config, None);
         assert!(matches!(
             stack.check_preconditions(),
@@ -506,7 +518,7 @@ mod tests {
             Some(("zebra".to_string(), "zebra".to_string()))
         );
         assert_eq!(cfg.compose_project, "z3-regtest");
-        assert_eq!(cfg.health_check_timeout_secs, 60);
+        assert_eq!(cfg.health_check_timeout_secs, 180);
         assert_eq!(cfg.resource_sample_interval_secs, 5);
         assert_eq!(cfg.run_id, "run-42");
         assert_eq!(cfg.log_dir, PathBuf::from("/tmp/logs"));
@@ -631,7 +643,7 @@ networks:
             compose_project: "z3-regtest".into(),
             log_dir: PathBuf::from("/tmp/z3-test-logs"),
             run_id: "t".into(),
-            health_check_timeout_secs: 60,
+            health_check_timeout_secs: 180,
             resource_sample_interval_secs: 5,
         };
         let stack = Z3Stack::new(config, None);
@@ -652,7 +664,7 @@ networks:
             compose_project: "z3-regtest".into(),
             log_dir: PathBuf::from("/tmp/z3-test-logs"),
             run_id: "t".into(),
-            health_check_timeout_secs: 60,
+            health_check_timeout_secs: 180,
             resource_sample_interval_secs: 5,
         };
         let stack = Z3Stack::new(config, None);
@@ -742,9 +754,10 @@ networks:
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let server = MockServer::start().await;
+        // Zebra regtest reports "test" (regtest is a Testnet variant in Zebra internals).
         Mock::given(wiremock::matchers::method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "result": {"chain": "regtest", "blocks": 1, "headers": 1},
+                "result": {"chain": "test", "blocks": 1, "headers": 1},
                 "error": null,
                 "id": 1
             })))

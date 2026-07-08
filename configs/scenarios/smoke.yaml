@@ -14,6 +14,8 @@ flows:
   shielded_to_transparent: 0.0
   shielded_to_shielded: 0.0
 
+warmup_blocks: 110              # 100 for regtest coinbase maturity + 10 buffer
+
 confirmations_deposit_required: 3
 
 observability:
