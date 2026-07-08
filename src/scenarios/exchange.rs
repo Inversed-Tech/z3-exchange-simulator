@@ -1,3 +1,4 @@
+
 //! Exchange workflow implementations.
 //!
 //! Four independently callable async functions that drive deposit, withdrawal,
@@ -245,7 +246,7 @@ pub async fn run_deposit(
 
     // Step 1: derive the deposit address for this account.
     let ua = rpc
-        .z_get_address_for_account(zallet_uuid)
+        .z_get_address_for_account(zallet_uuid, &["orchard"], None)
         .await
         .map_err(ExchangeError::Rpc)?;
     let deposit_address = ua.address;
@@ -287,18 +288,11 @@ pub async fn run_deposit(
     deposit.txid = Some(txid.clone());
     deposit.status = DepositStatus::Detected;
 
-    // Step 5: mine blocks to reach the required confirmation depth.
-    // Safe cast: required_confirmations will never approach u32::MAX in regtest.
-    rpc.generate(required_confirmations as u32)
-        .await
-        .map_err(ExchangeError::Rpc)?;
-
-    deposit.status = DepositStatus::Confirming;
-
-    // Step 6: verify confirmation depth via get_raw_transaction.
+    // Step 5: wait for the background miner to include the transaction.
     // `getaddresstxids` is a transparent-only Zebra API and rejects Unified
     // Addresses; `get_raw_transaction` works for all pool types and serves as
     // the on-chain presence check.
+    deposit.status = DepositStatus::Confirming;
     let confs = wait_for_tx_confirmations(rpc, &txid, required_confirmations, polling).await?;
 
     deposit.current_confirmations = confs;
@@ -389,9 +383,8 @@ pub async fn run_withdrawal(
     withdrawal.status = WithdrawalStatus::Broadcast;
     withdrawal.broadcast_at = Some(Utc::now());
 
-    // Mine one block to include the transaction, then verify on-chain.
+    // Wait for the background miner to include and confirm the transaction.
     let broadcast_start = Instant::now();
-    rpc.generate(1).await.map_err(ExchangeError::Rpc)?;
     wait_for_tx_confirmations(rpc, &txid, 1, polling).await?;
     let broadcast_ms = broadcast_start.elapsed().as_millis() as u64;
 
@@ -426,6 +419,7 @@ pub async fn run_withdrawal(
 pub async fn run_sweep(
     rpc: &RpcClient,
     from_account: &str,
+    from_address: &str,
     hot_wallet_address: &str,
     run_id: &str,
     metrics: Option<Arc<dyn MetricsRecorder>>,
@@ -487,7 +481,7 @@ pub async fn run_sweep(
     }];
 
     let op_id = rpc
-        .z_send_many(from_account, &recipients)
+        .z_send_many(from_address, &recipients)
         .await
         .map_err(ExchangeError::Rpc)?;
 
@@ -996,16 +990,6 @@ mod tests {
 
         Mock::given(matchers::method("POST"))
             .and(matchers::body_partial_json(
-                serde_json::json!({ "method": "generate" }),
-            ))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "result": ["h1", "h2", "h3"], "error": null, "id": 1
-            })))
-            .mount(&server)
-            .await;
-
-        Mock::given(matchers::method("POST"))
-            .and(matchers::body_partial_json(
                 serde_json::json!({ "method": "getrawtransaction" }),
             ))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -1142,16 +1126,6 @@ mod tests {
                     "result": { "txid": "wdltxid" }, "error": null
                 }],
                 "error": null, "id": 1
-            })))
-            .mount(&server)
-            .await;
-
-        Mock::given(matchers::method("POST"))
-            .and(matchers::body_partial_json(
-                serde_json::json!({ "method": "generate" }),
-            ))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "result": ["h1"], "error": null, "id": 1
             })))
             .mount(&server)
             .await;
@@ -1399,6 +1373,7 @@ mod tests {
         let sweep = run_sweep(
             &rpc(&server.uri()),
             "sweep-account",
+            "u1sweepfrom",
             "u1hotwallet",
             "run-1",
             Some(rec.clone() as Arc<dyn MetricsRecorder>),
@@ -1435,6 +1410,7 @@ mod tests {
         let err = run_sweep(
             &rpc(&server.uri()),
             "empty-account",
+            "u1sweepfrom",
             "u1hotwallet",
             "run-1",
             None,
@@ -1468,6 +1444,7 @@ mod tests {
         let err = run_sweep(
             &rpc(&server.uri()),
             "my-account",
+            "u1sweepfrom",
             "u1hotwallet",
             "run-1",
             None,
@@ -1549,6 +1526,7 @@ mod tests {
         let sweep = run_sweep(
             &rpc(&server.uri()),
             "my-account",
+            "u1sweepfrom",
             "u1hotwallet",
             "run-1",
             None,
@@ -1611,6 +1589,7 @@ mod tests {
         let err = run_sweep(
             &rpc(&server.uri()),
             "my-account",
+            "u1sweepfrom",
             "u1hotwallet",
             "run-1",
             None,

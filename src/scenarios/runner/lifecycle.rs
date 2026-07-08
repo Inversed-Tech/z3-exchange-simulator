@@ -4,12 +4,13 @@ use std::path::Path;
 use std::sync::Arc;
 
 use chrono::Utc;
+use tokio::time::{sleep, Duration};
 
 use crate::data_model::{MetricSample, ScenarioConfig};
 use crate::metrics::{
     generate_summary, write_manifest, JsonlRecorder, MetricsRecorder, RunDir, RunManifest,
 };
-use crate::rpc::RpcClient;
+use crate::rpc::{RpcClient, RpcError};
 use crate::scenarios::runner::provisioner::{provision, ProvisionedPopulation};
 use crate::scenarios::runner::RunOptions;
 use crate::scenarios::runner::RunnerError;
@@ -60,13 +61,50 @@ pub async fn setup(
     };
     let rpc = Arc::new(rpc);
 
-    // 4. Provision the synthetic population.
+    // 4. Ensure the hot wallet account exists in Zallet BEFORE mining warmup
+    //    blocks. Zallet tracks coinbase payments by scanning blocks for known
+    //    account addresses. If the account is only created after mining, Zallet
+    //    sets a birthday at the current tip and misses all prior coinbase outputs,
+    //    causing the warmup balance check to see 0 ZEC.
+    let hot_wallet_uuid = match opts.hot_wallet_uuid.clone() {
+        Some(uuid) => uuid,
+        None => {
+            // Find the account named "hot_wallet" created by init-regtest-fresh.sh.
+            // Do NOT take the first account from z_listaccounts: Zallet returns
+            // accounts sorted by UUID (not creation order), so synthetic accounts
+            // from earlier test runs appear first and have 0 balance.
+            let existing = rpc
+                .z_list_accounts()
+                .await
+                .map_err(|e| RunnerError::Setup(format!("z_list_accounts failed: {e}")))?;
+            if let Some(hw) = existing.into_iter().find(|a| a.name.as_deref() == Some("hot_wallet")) {
+                hw.account
+            } else {
+                // Fresh volumes with no named account: create one now.
+                // warmup blocks will fund it via the ZEBRA_MINING__MINER_ADDRESS.
+                rpc.z_get_new_account("hot_wallet")
+                    .await
+                    .map_err(|e| RunnerError::Setup(format!("z_get_new_account failed: {e}")))?
+                    .account
+            }
+        }
+    };
+
+    // 5. Warmup: mine blocks before provisioning. The hot wallet account was
+    //    created above so Zallet will credit coinbase outputs as blocks arrive.
+    if let Err(e) = warmup(&rpc, scenario, run_id, metrics.clone()).await {
+        let _ = stack.stop().await;
+        return Err(e);
+    }
+
+    // 6. Provision the synthetic population (pass the already-resolved hot
+    //    wallet UUID so provisioner skips its own z_list_accounts call).
     let provisioned = match provision(
         rpc.clone(),
         scenario,
         run_id,
         metrics.clone(),
-        opts.hot_wallet_uuid.clone(),
+        Some(hot_wallet_uuid.clone()),
     )
     .await
     {
@@ -77,9 +115,15 @@ pub async fn setup(
         }
     };
 
-    // 5. Derive the hot wallet's Unified Address.
+    // 7. Retrieve the hot wallet UA at diversifier_index=0. That address was
+    //    created by init-regtest-fresh.sh with receivers [orchard, p2pkh], and
+    //    its transparent receiver is ZEBRA_MINING__MINER_ADDRESS. Passing it as
+    //    the `from` parameter in z_sendmany lets Zallet spend the transparent
+    //    coinbase inputs without triggering the "legacy account" restriction.
+    //    diversifier_index=0 is explicit so we always get the funded address,
+    //    not a newly-created one at the next available index.
     let hot_wallet_address = match rpc
-        .z_get_address_for_account(&provisioned.hot_wallet_uuid)
+        .z_get_address_for_account(&hot_wallet_uuid, &["orchard", "p2pkh"], Some(0))
         .await
     {
         Ok(ua) => ua.address,
@@ -90,8 +134,6 @@ pub async fn setup(
             )));
         }
     };
-
-    let hot_wallet_uuid = provisioned.hot_wallet_uuid.clone();
 
     Ok(SetupState {
         stack,
@@ -111,10 +153,21 @@ pub async fn warmup(
     run_id: &str,
     metrics: Arc<dyn MetricsRecorder>,
 ) -> Result<(), RunnerError> {
-    // Mine warmup blocks.
-    rpc.generate(scenario.warmup_blocks as u32)
-        .await
-        .map_err(|e| RunnerError::Warmup(format!("generate failed: {e}")))?;
+    // Mine warmup blocks. Retry on transport errors: rpc-router can still be
+    // restarting (waiting on Zallet's rpc.discover) in the seconds after
+    // wait_until_ready() returns. generate() routes to Zebra and will succeed
+    // as soon as rpc-router stabilizes.
+    let mut attempts = 0u32;
+    loop {
+        attempts += 1;
+        match rpc.generate(scenario.warmup_blocks as u32).await {
+            Ok(_) => break,
+            Err(RpcError::Transport(_)) if attempts < 12 => {
+                sleep(Duration::from_secs(5)).await;
+            }
+            Err(e) => return Err(RunnerError::Warmup(format!("generate failed: {e}"))),
+        }
+    }
 
     // Confirm chain is advancing.
     rpc.get_blockchain_info()
@@ -126,16 +179,28 @@ pub async fn warmup(
         .await
         .map_err(|e| RunnerError::Warmup(format!("get_wallet_info failed: {e}")))?;
 
-    // Verify that warmup mining funded the hot wallet. A zero balance means
-    // Zebra's miner_address is not pointing at a Zallet account (check Z3's
-    // regtest-init.sh), or warmup_blocks is below the regtest coinbase maturity
-    // window (increase warmup_blocks in the scenario config).
-    let balance = rpc
-        .z_get_total_balance()
-        .await
-        .map_err(|e| RunnerError::Warmup(format!("balance check failed: {e}")))?;
-    let total_zec: f64 = balance.total.parse().unwrap_or(0.0);
-    if total_zec == 0.0 {
+    // Verify that warmup mining funded the hot wallet. generate() returns once
+    // Zebra has mined the blocks, but Zallet's sync is asynchronous: it pulls
+    // from Zaino's block cache in a background loop. Poll for up to 60 seconds
+    // so the check isn't racy against Zallet's sync lag.
+    //
+    // Persistent 0 balance means either Zebra's miner_address is not pointing
+    // at a Zallet account (check Z3's regtest-init.sh), or warmup_blocks is
+    // below the regtest coinbase maturity window.
+    let mut funded = false;
+    for _ in 0..30 {
+        let balance = rpc
+            .z_get_total_balance()
+            .await
+            .map_err(|e| RunnerError::Warmup(format!("balance check failed: {e}")))?;
+        let total_zec: f64 = balance.total.parse().unwrap_or(0.0);
+        if total_zec > 0.0 {
+            funded = true;
+            break;
+        }
+        sleep(Duration::from_secs(2)).await;
+    }
+    if !funded {
         return Err(RunnerError::Warmup(
             "hot wallet has 0 balance after warmup mining — verify that Z3's \
              regtest-init.sh configured Zebra's miner_address to a Zallet-managed \

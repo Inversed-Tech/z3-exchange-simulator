@@ -1,0 +1,53 @@
+name: burst
+description: >
+  Moderate sustained load punctuated by a sudden volume spike. Tests whether the
+  Z3 stack handles temporary overload gracefully — mempool saturation signal,
+  error rate during the spike, and recovery once load returns to baseline.
+
+  Run with: z3sim run --scenario configs/scenarios/burst.yaml \
+                      --load-shape burst \
+                      --burst-pre-secs 60 \
+                      --burst-secs 30 \
+                      --burst-multiplier 3.0
+
+  Timeline at the above flags:
+    0–60 s   baseline at 3 TPS
+    60–90 s  spike to 9 TPS (3× multiplier)
+    90–300 s return to 3 TPS and hold
+
+  mempool_saturation_threshold is set low (20) so saturation events appear in
+  metrics.jsonl during the spike — the saturation signal is a key finding for
+  the report.
+
+seed: 3003
+
+accounts_count: 50
+accounts_active_fraction: 0.8   # 40 active — wider pool absorbs burst intent variety
+
+load_duration_seconds: 300
+load_target_tps: 3.0            # base rate; burst multiplier is a CLI flag
+
+flows:
+  transparent_to_transparent: 1.0
+  transparent_to_shielded: 0.0
+  shielded_to_transparent: 0.0
+  shielded_to_shielded: 0.0
+
+confirmations_deposit_required: 1
+
+warmup_blocks: 110              # 100 for regtest coinbase maturity + 10 buffer
+
+observability:
+  record_rpc_calls: true
+  record_component_logs: true
+  metric_sampling_interval_secs: 5
+  mempool_saturation_threshold: 20   # intentionally low — surface saturation during burst
+
+activity_profiles:
+  low_fraction: 0.50
+  medium_fraction: 0.35
+  high_fraction: 0.15
+
+amounts:
+  min_zatoshis: 10000       # 0.0001 ZEC
+  max_zatoshis: 100000000   # 1 ZEC

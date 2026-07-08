@@ -803,13 +803,22 @@ impl RpcClient {
             .await
     }
 
-    /// Derive a Unified Address (deposit address) for an account.
+    /// Derive a Unified Address for an account with the given receiver types.
+    ///
+    /// Always pass `receiver_types` explicitly. Use `&["orchard"]` for synthetic
+    /// accounts to avoid advancing Zallet's transparent address gap counter
+    /// (limit: 10 consecutive unfunded transparent derivations across the wallet).
     pub async fn z_get_address_for_account(
         &self,
         account: &str,
+        receiver_types: &[&str],
+        diversifier_index: Option<u64>,
     ) -> Result<UnifiedAddress, RpcError> {
-        self.call("z_getaddressforaccount", serde_json::json!([account]))
-            .await
+        let params = match diversifier_index {
+            Some(idx) => serde_json::json!([account, receiver_types, idx]),
+            None => serde_json::json!([account, receiver_types]),
+        };
+        self.call("z_getaddressforaccount", params).await
     }
 
     pub async fn z_list_accounts(&self) -> Result<Vec<AccountInfo>, RpcError> {
@@ -1436,7 +1445,7 @@ mod tests {
             .mount(&server)
             .await;
         let ua = client(&server.uri())
-            .z_get_address_for_account("uuid-1234")
+            .z_get_address_for_account("uuid-1234", &["orchard"], None)
             .await
             .unwrap();
         assert_eq!(ua.address, "u1depositaddress");

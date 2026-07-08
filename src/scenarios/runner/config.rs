@@ -227,7 +227,7 @@ mod tests {
             },
             config_hash: String::new(),
             source_path: String::new(),
-            warmup_blocks: 10,
+            warmup_blocks: 110,
         }
     }
 
@@ -242,6 +242,66 @@ mod tests {
             let config = smoke_config();
             validate_scenario(&config).unwrap();
         }
+    }
+
+    #[test]
+    fn validate_scenario_accepts_steady_state_yaml() {
+        let path = std::path::Path::new("configs/scenarios/steady_state.yaml");
+        let config = load_scenario(path).unwrap();
+        validate_scenario(&config).unwrap();
+
+        assert_eq!(config.accounts_count, 100);
+        assert_eq!(config.load_target_tps, 5.0);
+        assert_eq!(config.flows.transparent_to_transparent, 1.0);
+        assert_eq!(config.flows.transparent_to_shielded, 0.0);
+        assert_eq!(config.warmup_blocks, 110);
+        assert!(config.config_hash.starts_with("sha256:"));
+    }
+
+    #[test]
+    fn validate_scenario_accepts_ramp_yaml() {
+        let path = std::path::Path::new("configs/scenarios/ramp.yaml");
+        let config = load_scenario(path).unwrap();
+        validate_scenario(&config).unwrap();
+
+        assert_eq!(config.accounts_count, 100);
+        assert_eq!(config.load_target_tps, 10.0);
+        assert_eq!(config.flows.transparent_to_transparent, 1.0);
+        assert_eq!(config.warmup_blocks, 110);
+        // ramp ceiling is double steady_state — room to find the degradation point
+        assert!(config.load_target_tps > 5.0);
+    }
+
+    #[test]
+    fn validate_scenario_accepts_burst_yaml() {
+        let path = std::path::Path::new("configs/scenarios/burst.yaml");
+        let config = load_scenario(path).unwrap();
+        validate_scenario(&config).unwrap();
+
+        assert_eq!(config.accounts_count, 50);
+        assert_eq!(config.load_target_tps, 3.0);
+        assert_eq!(config.warmup_blocks, 110);
+        // saturation threshold must be low enough to fire during the burst spike
+        assert!(
+            config.observability.mempool_saturation_threshold <= 50,
+            "burst scenario needs a low saturation threshold to surface mempool events"
+        );
+    }
+
+    #[test]
+    fn validate_scenario_accepts_mixed_yaml() {
+        let path = std::path::Path::new("configs/scenarios/mixed.yaml");
+        let config = load_scenario(path).unwrap();
+        validate_scenario(&config).unwrap();
+
+        assert_eq!(config.accounts_count, 50);
+        assert_eq!(config.accounts_active_fraction, 1.0);
+        assert_eq!(config.flows.transparent_to_shielded, 0.5);
+        assert_eq!(config.flows.shielded_to_shielded, 0.5);
+        assert_eq!(config.flows.transparent_to_transparent, 0.0);
+        assert_eq!(config.warmup_blocks, 110);
+        // TPS must be conservative — ZK proving takes seconds per transaction
+        assert!(config.load_target_tps <= 3.0);
     }
 
     #[test]
