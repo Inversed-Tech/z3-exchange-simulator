@@ -17,6 +17,10 @@ target/
 experiments/runs/*/
 !experiments/runs/.gitkeep
 
+# Generated fixtures (output of `z3sim generate-fixtures`, regenerable)
+experiments/fixtures/*
+!experiments/fixtures/.gitkeep
+
 # Local environment overrides
 configs/local/local.yaml
 .env
