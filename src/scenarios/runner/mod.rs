@@ -35,7 +35,7 @@ pub use scheduler::LoadShape;
 
 use config::print_dry_run_summary;
 use dispatch::{background_miner, build_intent_future, periodic_balance_check};
-use lifecycle::{setup, teardown, SetupState};
+use lifecycle::{finalize_run_artifacts, setup, teardown, SetupState};
 use provisioner::{ProvisionedPopulation, ProvisionerError};
 use scheduler::{mixed_flow_config, Scheduler};
 
@@ -180,7 +180,23 @@ pub async fn run(scenario: ScenarioConfig, opts: RunOptions) -> Result<RunResult
     //    hot wallet's transparent address is funded before synthetic accounts
     //    are derived — this resets Zallet's transparent gap counter and allows
     //    all N synthetic accounts to receive transparent receivers.
-    let setup_state = setup(&scenario, &opts, &run_id, &run_dir, metrics.clone()).await?;
+    let setup_state = match setup(&scenario, &opts, &run_id, &run_dir, metrics.clone()).await {
+        Ok(s) => s,
+        Err(e) => {
+            // setup() already stopped the stack on every failure path. Still
+            // finalize the run artifacts so an aborted setup doesn't leave a run
+            // dir with a null completed_at, unflushed latency samples, and no
+            // scenario copy. Best-effort: the setup error is the one we report.
+            let _ = finalize_run_artifacts(
+                &run_dir,
+                &mut manifest,
+                &recorder,
+                &scenario.source_path,
+                false,
+            );
+            return Err(e);
+        }
+    };
 
     let SetupState {
         stack,
