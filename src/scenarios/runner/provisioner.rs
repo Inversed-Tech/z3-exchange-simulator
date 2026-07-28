@@ -119,6 +119,13 @@ pub async fn provision(
             let _permit = permit;
             let account_info = rpc_clone.z_get_new_account(&account_id).await?;
             let zallet_uuid = account_info.account.clone();
+            // Orchard-only, deliberately: deriving a p2pkh receiver here would
+            // advance Zallet's transparent gap counter (limit: 10 consecutive
+            // unfunded transparent derivations across the whole wallet), which
+            // fails provisioning past ~10 synthetic accounts. See the docstring
+            // on RpcClient::z_get_address_for_account. This is the root of the
+            // KNOWN LIMITATION documented on the AddressType::Transparent entry
+            // below.
             let ua = rpc_clone.z_get_address_for_account(&zallet_uuid, &["orchard"], None).await?;
             Ok((account_id, zallet_uuid, ua.address))
         });
@@ -146,7 +153,21 @@ pub async fn provision(
             .map(|w| w.wallet_id.clone())
             .unwrap_or_default();
 
-        // Transparent entry
+        // Transparent entry.
+        //
+        // KNOWN LIMITATION: `ua_address` is an orchard-only Unified Address (see
+        // the derivation above), so it embeds no transparent (p2pkh) receiver.
+        // It is stored under AddressType::Transparent only so that TToT/ZToT
+        // flows have a recipient to resolve; a z_sendmany to this UA settles in
+        // the *shielded* pool, not transparent. Consequently the "transparent
+        // recipient" leg of TToT/ZToT flows does not currently exercise a true
+        // transparent output, and pool attribution for those flows is optimistic.
+        //
+        // This is a side effect of the single-hot-wallet Zallet workaround (all
+        // spends originate from one funded address) combined with the gap-counter
+        // constraint above. A faithful transparent recipient needs either the
+        // Zallet coinbase-selection fix (so per-account transparent funding is
+        // possible) or a funding rework — tracked as follow-up, not fixed here.
         population
             .add_address(
                 account_id,
