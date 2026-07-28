@@ -805,9 +805,22 @@ impl RpcClient {
 
     /// Derive a Unified Address for an account with the given receiver types.
     ///
-    /// Always pass `receiver_types` explicitly. Use `&["orchard"]` for synthetic
-    /// accounts to avoid advancing Zallet's transparent address gap counter
-    /// (limit: 10 consecutive unfunded transparent derivations across the wallet).
+    /// Always pass `receiver_types` explicitly.
+    ///
+    /// Note on the transparent gap limit: per librustzcash source it is 10 consecutive
+    /// *unfunded* external derivations per `(account, key scope)` — not wallet-global —
+    /// and it slides forward whenever a derived address receives a mined output. But a
+    /// recorded run in `experiments/runs/20260630T131145Z-smoke/` hit "index 10" while
+    /// deriving on *fresh* accounts, which that model does not explain, so do not assume
+    /// one `p2pkh` receiver per account is safe on our pin without testing it.
+    ///
+    /// Synthetic accounts use `&["orchard"]` for a separate and sufficient reason: on our
+    /// pinned Zallet a transparent recipient cannot be funded at all. See
+    /// `docs/zallet-transparent-gap-limit.md`.
+    ///
+    /// Always pass `diversifier_index` when you want an *existing* address: omitting
+    /// it derives a new one on every call, which is what exhausts an account's gap
+    /// window over repeated runs.
     pub async fn z_get_address_for_account(
         &self,
         account: &str,

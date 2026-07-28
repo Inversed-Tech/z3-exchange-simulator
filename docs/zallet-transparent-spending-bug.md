@@ -88,7 +88,34 @@ This holds regardless of:
 
 ---
 
-## Root cause hypothesis
+## Root cause — CONFIRMED (supersedes the hypotheses below)
+
+> **Resolved.** The `v0.1.0-beta.1` changelog (2026-07-12) states the cause directly:
+> `z_sendmany` "passed a shielded-only spend policy to the proposal builder, so no
+> transparent input could ever be selected, and the `AllowFullyTransparent` privacy policy
+> was unreachable." beta.1 also implements `InputSource::select_spendable_transparent_outputs`
+> and `WalletWrite::reserve_next_n_internal_addresses`, both previously `unimplemented!()`.
+> So this was hypothesis 3 below: transparent input selection was genuinely not wired up.
+>
+> **Two further facts change the fix path:**
+>
+> 1. **Coinbase still cannot be spent to a transparent output, even on beta.1 — that part is
+>    consensus, not a bug.** Transparent coinbase must be spent by a transaction with no
+>    transparent outputs ([ZIP-213](https://zips.z.cash/zip-0213); enforced by Zebra as
+>    `UnshieldedTransparentCoinbaseSpend`). Since regtest funds are entirely coinbase, the
+>    pipeline must be: mine → 100-block maturity → `z_shieldcoinbase` → `z_sendmany`.
+> 2. **`z_shieldcoinbase` was added in `v0.1.0-alpha.4`**, which also fixed coinbase
+>    `tx_index` recording so coinbase outputs can be identified at all. Our pin (alpha.3)
+>    has neither.
+>
+> Upgrading to `v0.1.0-beta.1` is therefore the fix, with the caveat that alpha.4 broke the
+> wallet database format (fresh datadir required). beta.1 is also the first release whose
+> zebra/zaino backends support regtest.
+>
+> See [`zallet-transparent-gap-limit.md`](zallet-transparent-gap-limit.md) for the full
+> analysis, including why the gap limit is *not* implicated.
+
+## Root cause hypothesis (original, superseded)
 
 Zallet's `z_sendmany` implementation calls `zcash_client_backend::propose_transaction`
 internally. The proposal engine selects inputs from the wallet's tracked pools. Based on

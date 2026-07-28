@@ -176,10 +176,15 @@ pub async fn run(scenario: ScenarioConfig, opts: RunOptions) -> Result<RunResult
         .map_err(|e| RunnerError::Metrics(e.to_string()))?;
 
     // 6. Setup: start Z3, warmup, provision population.
-    //    Warmup (mining) now runs inside setup() before provisioning so the
-    //    hot wallet's transparent address is funded before synthetic accounts
-    //    are derived — this resets Zallet's transparent gap counter and allows
-    //    all N synthetic accounts to receive transparent receivers.
+    //    Warmup (mining) runs inside setup() before provisioning so the hot
+    //    wallet account exists when coinbase blocks are mined — otherwise Zallet
+    //    sets the account birthday at the current tip and misses every prior
+    //    coinbase output, leaving the warmup balance check at 0. (An earlier
+    //    comment here credited this ordering with resetting a wallet-global
+    //    transparent gap counter and thereby letting all N synthetic accounts
+    //    receive transparent receivers. That is not what it does: synthetic
+    //    accounts are derived orchard-only and get no transparent receiver at
+    //    all. See docs/zallet-transparent-gap-limit.md.)
     let setup_state = match setup(&scenario, &opts, &run_id, &run_dir, metrics.clone()).await {
         Ok(s) => s,
         Err(e) => {

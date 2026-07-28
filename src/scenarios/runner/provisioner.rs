@@ -119,13 +119,22 @@ pub async fn provision(
             let _permit = permit;
             let account_info = rpc_clone.z_get_new_account(&account_id).await?;
             let zallet_uuid = account_info.account.clone();
-            // Orchard-only, deliberately: deriving a p2pkh receiver here would
-            // advance Zallet's transparent gap counter (limit: 10 consecutive
-            // unfunded transparent derivations across the whole wallet), which
-            // fails provisioning past ~10 synthetic accounts. See the docstring
-            // on RpcClient::z_get_address_for_account. This is the root of the
-            // KNOWN LIMITATION documented on the AddressType::Transparent entry
-            // below.
+            // Orchard-only, deliberately. The earlier comment here justified this by
+            // a wallet-global transparent gap counter; librustzcash source says the
+            // window is per (account, key scope), but a recorded run of ours hit the
+            // limit while deriving on fresh accounts, so the true behaviour on our
+            // pin is unresolved. Either way it is not the binding constraint.
+            //
+            // The sufficient reason is that on our pinned Zallet (v0.1.0-alpha.3) a
+            // transparent recipient cannot be funded at all: consensus forbids
+            // spending transparent coinbase to any transparent output, alpha.3 has
+            // no z_shieldcoinbase to convert it, and its z_sendmany passes a
+            // shielded-only spend policy so no transparent input is ever selected.
+            // Adding a p2pkh receiver would produce addresses that cannot receive.
+            //
+            // Lifting this needs a bump to Zallet v0.1.0-beta.1 plus a shielding
+            // step in setup(). See docs/zallet-transparent-gap-limit.md and the
+            // KNOWN LIMITATION on the AddressType::Transparent entry below.
             let ua = rpc_clone.z_get_address_for_account(&zallet_uuid, &["orchard"], None).await?;
             Ok((account_id, zallet_uuid, ua.address))
         });
@@ -163,11 +172,13 @@ pub async fn provision(
         // recipient" leg of TToT/ZToT flows does not currently exercise a true
         // transparent output, and pool attribution for those flows is optimistic.
         //
-        // This is a side effect of the single-hot-wallet Zallet workaround (all
-        // spends originate from one funded address) combined with the gap-counter
-        // constraint above. A faithful transparent recipient needs either the
-        // Zallet coinbase-selection fix (so per-account transparent funding is
-        // possible) or a funding rework — tracked as follow-up, not fixed here.
+        // Root cause is the pinned Zallet version, not the gap limit: transparent
+        // coinbase can only be spent to a fully-shielded transaction (consensus,
+        // ZIP-213), alpha.3 exposes no z_shieldcoinbase to escape that, and its
+        // z_sendmany cannot select transparent inputs. A faithful transparent
+        // recipient needs Zallet v0.1.0-beta.1 plus a z_shieldcoinbase step after
+        // warmup — tracked as follow-up, not fixed here. Full analysis in
+        // docs/zallet-transparent-gap-limit.md.
         population
             .add_address(
                 account_id,
