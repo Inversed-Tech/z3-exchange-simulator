@@ -29,6 +29,29 @@ impl Drop for ActiveGuard {
     }
 }
 
+// ── resolve_zallet_uuid ─────────────────────────────────────────────────────────
+
+/// Look up the Zallet account UUID for an intent's account. On a miss (the
+/// account was never provisioned) return a ready-made `Failed` outcome for the
+/// caller to `return`. Shared by the TToZ / ZToT / ZToZ flow arms.
+// `IntentOutcome` is deliberately passed by value throughout dispatch (it is the
+// normal success/failure return of every flow), so the large-Err lint does not
+// apply here.
+#[allow(clippy::result_large_err)]
+fn resolve_zallet_uuid(
+    zallet_uuids: &HashMap<String, String>,
+    intent: &TransactionIntent,
+) -> Result<String, IntentOutcome> {
+    zallet_uuids
+        .get(&intent.account_id)
+        .cloned()
+        .ok_or_else(|| IntentOutcome::Failed {
+            intent_id: intent.intent_id.clone(),
+            flow_type: intent.flow_type.clone(),
+            error: format!("no Zallet UUID for account {}", intent.account_id),
+        })
+}
+
 // ── build_intent_future ───────────────────────────────────────────────────────
 
 /// Build a `Future` that executes a single transaction intent against the Z3 stack.
@@ -42,7 +65,6 @@ pub async fn build_intent_future(
     sem: Arc<Semaphore>,
     active_count: Arc<AtomicUsize>,
     metrics: Arc<dyn MetricsRecorder>,
-    _hot_wallet_uuid: String,
     hot_wallet_address: String,
     run_id: String,
     polling: PollingConfig,
@@ -84,15 +106,9 @@ pub async fn build_intent_future(
 
         // ── Transparent → Shielded: deposit ───────────────────────────
         FlowType::TToZ => {
-            let zallet_uuid = match zallet_uuids.get(&intent.account_id) {
-                Some(u) => u.clone(),
-                None => {
-                    return IntentOutcome::Failed {
-                        intent_id: intent.intent_id,
-                        flow_type: FlowType::TToZ,
-                        error: format!("no Zallet UUID for account {}", intent.account_id),
-                    }
-                }
+            let zallet_uuid = match resolve_zallet_uuid(&zallet_uuids, &intent) {
+                Ok(u) => u,
+                Err(outcome) => return outcome,
             };
             match run_deposit(
                 &rpc,
@@ -122,15 +138,9 @@ pub async fn build_intent_future(
 
         // ── Shielded → Transparent: sweep then withdrawal ──────────────
         FlowType::ZToT => {
-            let zallet_uuid = match zallet_uuids.get(&intent.account_id) {
-                Some(u) => u.clone(),
-                None => {
-                    return IntentOutcome::Failed {
-                        intent_id: intent.intent_id,
-                        flow_type: FlowType::ZToT,
-                        error: format!("no Zallet UUID for account {}", intent.account_id),
-                    }
-                }
+            let zallet_uuid = match resolve_zallet_uuid(&zallet_uuids, &intent) {
+                Ok(u) => u,
+                Err(outcome) => return outcome,
             };
             // Step 1: sweep user's shielded notes into the hot wallet.
             let zallet_address = match zallet_addresses.get(&intent.account_id) {
@@ -198,15 +208,9 @@ pub async fn build_intent_future(
 
         // ── Shielded → Shielded: deposit ──────────────────────────────
         FlowType::ZToZ => {
-            let zallet_uuid = match zallet_uuids.get(&intent.account_id) {
-                Some(u) => u.clone(),
-                None => {
-                    return IntentOutcome::Failed {
-                        intent_id: intent.intent_id,
-                        flow_type: FlowType::ZToZ,
-                        error: format!("no Zallet UUID for account {}", intent.account_id),
-                    }
-                }
+            let zallet_uuid = match resolve_zallet_uuid(&zallet_uuids, &intent) {
+                Ok(u) => u,
+                Err(outcome) => return outcome,
             };
             match run_deposit(
                 &rpc,
@@ -255,7 +259,11 @@ pub async fn background_miner(
         tokio::select! {
             _ = &mut shutdown => break,
             _ = ticker.tick() => {
-                let _ = rpc.generate(1).await;
+                // Log (don't swallow) mining failures: without this, a broken
+                // chain surfaces only indirectly as confirmation-poll timeouts.
+                if let Err(e) = rpc.generate(1).await {
+                    tracing::warn!("background miner: generate(1) failed: {e}");
+                }
             }
         }
     }
@@ -497,7 +505,6 @@ mod tests {
             sem,
             active_count.clone(),
             metrics,
-            "hw-uuid".to_string(),
             "hw-addr".to_string(),
             "run".to_string(),
             fast_polling(),
@@ -549,7 +556,6 @@ mod tests {
             sem,
             active_count.clone(),
             metrics,
-            "hw-uuid".to_string(),
             "u1hotwallet".to_string(),
             "run".to_string(),
             fast_polling(),
@@ -591,7 +597,6 @@ mod tests {
                 sem.clone(),
                 active_count.clone(),
                 metrics.clone(),
-                "hw-uuid".to_string(),
                 "hw-addr".to_string(),
                 "run".to_string(),
                 fast_polling(),

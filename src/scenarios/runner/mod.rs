@@ -94,6 +94,11 @@ pub struct RunOptions {
     pub hot_wallet_uuid: Option<String>,
     /// Cancel token — signal this to abort the load phase early.
     pub cancel: Option<tokio_util::sync::CancellationToken>,
+    /// Interval between background regtest block-mining ticks during the load
+    /// phase. Block cadence bounds confirmation latency, so a value far above
+    /// the confirmation-poll interval quantizes (and inflates) measured latency;
+    /// tune it to the stack under test rather than measuring the miner's tick.
+    pub block_interval: Duration,
 }
 
 impl Default for RunOptions {
@@ -106,6 +111,7 @@ impl Default for RunOptions {
             polling: None,
             hot_wallet_uuid: None,
             cancel: None,
+            block_interval: Duration::from_secs(2),
         }
     }
 }
@@ -196,7 +202,9 @@ pub async fn run(scenario: ScenarioConfig, opts: RunOptions) -> Result<RunResult
         stack,
         rpc,
         provisioned,
-        hot_wallet_uuid,
+        // The resolved hot-wallet UUID is not needed by the load phase: every
+        // flow spends from `hot_wallet_address`.
+        hot_wallet_uuid: _,
         hot_wallet_address,
     } = setup_state;
 
@@ -209,7 +217,6 @@ pub async fn run(scenario: ScenarioConfig, opts: RunOptions) -> Result<RunResult
         &scenario,
         &opts,
         &run_id,
-        &hot_wallet_uuid,
         &hot_wallet_address,
         metrics.clone(),
     )
@@ -264,7 +271,6 @@ async fn load_phase(
     scenario: &ScenarioConfig,
     opts: &RunOptions,
     run_id: &str,
-    hot_wallet_uuid: &str,
     hot_wallet_address: &str,
     metrics: Arc<dyn MetricsRecorder>,
 ) -> Result<(u64, Vec<IntentOutcome>), RunnerError> {
@@ -307,12 +313,8 @@ async fn load_phase(
         mempool_rx,
     ));
 
-    // Start background miner (mines 1 block every 2 s during the load phase).
-    tokio::spawn(background_miner(
-        rpc.clone(),
-        Duration::from_secs(2),
-        miner_rx,
-    ));
+    // Start background miner (cadence configured via RunOptions::block_interval).
+    tokio::spawn(background_miner(rpc.clone(), opts.block_interval, miner_rx));
 
     // Start periodic balance check.
     tokio::spawn(periodic_balance_check(
@@ -366,7 +368,6 @@ async fn load_phase(
                 sem.clone(),
                 active_count.clone(),
                 metrics.clone(),
-                hot_wallet_uuid.to_string(),
                 hot_wallet_address.to_string(),
                 run_id.to_string(),
                 polling,
