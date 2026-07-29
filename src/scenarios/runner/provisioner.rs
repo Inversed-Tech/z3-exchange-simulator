@@ -126,7 +126,9 @@ pub async fn provision(
             // on RpcClient::z_get_address_for_account. This is the root of the
             // KNOWN LIMITATION documented on the AddressType::Transparent entry
             // below.
-            let ua = rpc_clone.z_get_address_for_account(&zallet_uuid, &["orchard"], None).await?;
+            let ua = rpc_clone
+                .z_get_address_for_account(&zallet_uuid, &["orchard"], None)
+                .await?;
             Ok((account_id, zallet_uuid, ua.address))
         });
     }

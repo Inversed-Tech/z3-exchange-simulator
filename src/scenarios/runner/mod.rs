@@ -23,6 +23,7 @@ use crate::synthetic::generators::TransactionIntentGenerator;
 
 pub mod config;
 pub mod dispatch;
+pub mod funding;
 pub mod lifecycle;
 pub mod provisioner;
 pub mod result;

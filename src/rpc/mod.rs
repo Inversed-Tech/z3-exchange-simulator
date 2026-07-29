@@ -177,6 +177,34 @@ pub struct AccountInfo {
     #[serde(rename = "account_uuid")]
     pub account: String,
     pub name: Option<String>,
+    /// Already-derived addresses (`z_listaccounts` includes them; the
+    /// `z_getnewaccount` response does not). Use these instead of deriving:
+    /// account creation always generates the diversifier-0 address with every
+    /// receiver type, and every `z_getaddressforaccount` call derives a NEW
+    /// address at the next Sapling-valid index — on an account with no funded
+    /// address the transparent gap window is indices 0..9, so a handful of
+    /// "get the address" calls exhausts it (`ReachedGapLimit` at index 10).
+    #[serde(default)]
+    pub addresses: Vec<AccountAddress>,
+}
+
+impl AccountInfo {
+    /// The account's primary address: the existing UA with the lowest
+    /// diversifier index (the one created with the account). Empty only if
+    /// this `AccountInfo` came from a call that omits addresses.
+    pub fn primary_address(&self) -> Option<&str> {
+        self.addresses
+            .iter()
+            .min_by_key(|a| a.diversifier_index)
+            .map(|a| a.ua.as_str())
+    }
+}
+
+/// One derived address inside `z_listaccounts`' `addresses` array.
+#[derive(Debug, Clone, Deserialize)]
+pub struct AccountAddress {
+    pub diversifier_index: u64,
+    pub ua: String,
 }
 
 /// Returned by `z_getaddressforaccount`.
@@ -273,6 +301,32 @@ pub struct Recipient {
     pub amount: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub memo: Option<String>,
+}
+
+/// Returned by `z_listunifiedreceivers`: the individual receivers inside a
+/// Unified Address. Each present pool maps to that pool's standalone address
+/// encoding (the `orchard` entry is itself a single-receiver UA).
+#[derive(Debug, Clone, Deserialize)]
+pub struct UnifiedReceivers {
+    pub orchard: Option<String>,
+    pub sapling: Option<String>,
+    pub p2pkh: Option<String>,
+    pub p2sh: Option<String>,
+}
+
+/// Returned by `z_shieldcoinbase`. `opid` is polled like a `z_sendmany`
+/// operation; the counts describe what the sweep selected.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ShieldCoinbaseResult {
+    #[serde(rename = "remainingUTXOs")]
+    pub remaining_utxos: u64,
+    #[serde(rename = "remainingValue")]
+    pub remaining_value: f64,
+    #[serde(rename = "shieldingUTXOs")]
+    pub shielding_utxos: u64,
+    #[serde(rename = "shieldingValue")]
+    pub shielding_value: f64,
+    pub opid: String,
 }
 
 // ── Additional stress-test response types ─────────────────────────────────────
@@ -376,8 +430,12 @@ fn routing_table() -> HashMap<&'static str, Backend> {
         // Zebra — smoke / compatibility
         ("validateaddress", Backend::Zebra),
         ("z_validateaddress", Backend::Zebra),
-        ("z_listunifiedreceivers", Backend::Zebra),
         // Zallet — stress-test
+        // z_listunifiedreceivers is served by Zallet (it appears in Zallet's
+        // own method list); it was previously mislabelled Backend::Zebra here,
+        // which skewed per-backend metrics attribution.
+        ("z_listunifiedreceivers", Backend::Zallet),
+        ("z_shieldcoinbase", Backend::Zallet),
         ("z_getnewaccount", Backend::Zallet),
         ("z_getaddressforaccount", Backend::Zallet),
         ("z_listaccounts", Backend::Zallet),
@@ -843,6 +901,17 @@ impl RpcClient {
     /// Send funds to one or more recipients. Fee is always `null` (auto-computed
     /// via ZIP 317 — the simulator must not pre-specify fees).
     /// Returns an operation ID string — poll with `z_get_operation_status`.
+    ///
+    /// Semantics of `from` (measured on Zallet v0.1.0-beta.1):
+    /// - a Unified Address draws the account's SHIELDED funds only (zallet#644,
+    ///   by design) — use it for ZToZ/ZToT sends;
+    /// - a bare t-addr draws that address's own transparent UTXOs — the only
+    ///   form that works for TToT/TToZ sends;
+    /// - `ANY_TADDR` requires `features.legacy_pool_seed_fingerprint`.
+    ///
+    /// Inputs (notes and transparent UTXOs alike) need ~10 confirmations before
+    /// the proposal engine selects them; younger funds yield error -4
+    /// "Insufficient balance (have 0, ...)" even when the balance shows them.
     pub async fn z_send_many(
         &self,
         from: &str,
@@ -851,6 +920,56 @@ impl RpcClient {
         self.call(
             "z_sendmany",
             serde_json::json!([from, recipients, null, null]),
+        )
+        .await
+    }
+
+    /// `z_send_many` with an explicit ZIP 315 privacy policy (e.g.
+    /// `"AllowRevealedRecipients"` for a shielded source paying transparent
+    /// receivers, `"AllowFullyTransparent"` for t-to-t). The plain
+    /// [`Self::z_send_many`] leaves the policy at the server default
+    /// (`FullPrivacy`), which rejects any transaction that reveals value.
+    pub async fn z_send_many_with_policy(
+        &self,
+        from: &str,
+        recipients: &[Recipient],
+        privacy_policy: &str,
+    ) -> Result<String, RpcError> {
+        self.call(
+            "z_sendmany",
+            serde_json::json!([from, recipients, null, null, privacy_policy]),
+        )
+        .await
+    }
+
+    /// Sweep mature transparent coinbase into the shielded pool. Zallet's
+    /// proposal engine refuses to spend coinbase UTXOs to transparent outputs
+    /// even on regtest (where consensus allows it), so this is the only exit
+    /// for transparent coinbase. Available from Zallet v0.1.0-alpha.4.
+    ///
+    /// `from` must be an account UUID or a wallet-owned t-addr; Zallet rejects
+    /// zcashd's `"*"` wildcard. `to` is a shielded address (a UA works).
+    /// Poll the returned `opid` like a `z_sendmany` operation.
+    pub async fn z_shield_coinbase(
+        &self,
+        from: &str,
+        to: &str,
+    ) -> Result<ShieldCoinbaseResult, RpcError> {
+        self.call("z_shieldcoinbase", serde_json::json!([from, to]))
+            .await
+    }
+
+    /// Split a Unified Address into its per-pool receivers. Needed to extract
+    /// the transparent receiver for TToT/TToZ recipients (paying the UA itself
+    /// would settle shielded) and the Orchard receiver for Zebra's
+    /// `mining.miner_address`.
+    pub async fn z_list_unified_receivers(
+        &self,
+        unified_address: &str,
+    ) -> Result<UnifiedReceivers, RpcError> {
+        self.call(
+            "z_listunifiedreceivers",
+            serde_json::json!([unified_address]),
         )
         .await
     }

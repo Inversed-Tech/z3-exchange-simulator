@@ -1,7 +1,11 @@
-# Funding the Simulator in Regtest: Zallet Upgrade and Funding Strategy
+# Funding the Simulator in Regtest: Measured Findings and Funding Strategy
 
-**Status:** Plan. No code changes yet — this document is the design record for the
-work that follows.
+**Status:** Measured. Every claim about stack behaviour below was produced by
+[`scripts/experiments/funding-probe.sh`](../scripts/experiments/funding-probe.sh) and
+[`scripts/experiments/fanout-probe.sh`](../scripts/experiments/fanout-probe.sh) against
+freshly initialised regtest stacks: the pinned versions (2026-07-28) and the working
+override set Zebra v6.0.0 + Zaino 0.6.0 + Zallet v0.1.0-beta.1 (2026-07-29; see
+`z3-commits.lock` overrides).
 **Depends on:** [`zallet-transparent-gap-limit.md`](zallet-transparent-gap-limit.md),
 [`zallet-transparent-spending-bug.md`](zallet-transparent-spending-bug.md)
 
@@ -9,25 +13,156 @@ work that follows.
 
 ## Why this document exists
 
-Every transaction the simulator issues must be funded, and in regtest the only source of
-value is mining coinbase. Two facts make the path from "coinbase" to "N funded accounts
-that can transact in both pools" non-obvious:
+Every transaction the simulator issues must be funded, and on a regtest chain the only
+source of value is mining coinbase — there is no premine, no funded genesis, and no
+import/faucet RPC. Coinbase can be paid into three different pools, and each has to survive
+three independent layers before it is usable:
 
-1. **Transparent coinbase cannot be spent to a transparent output.** This is consensus, not
-   a wallet limitation, and no Zallet version changes it.
-2. **Our pinned Zallet (`v0.1.0-alpha.3`) cannot spend transparent funds at all**, and has
-   no `z_shieldcoinbase` to escape fact 1.
+1. **Zebra** must build the coinbase and accept the resulting block.
+2. **Zallet** must detect the output and credit the account.
+3. **Zallet's `z_sendmany`** must select it as an input.
 
-Together these mean the current runs confirm 0 transactions. Fixing it requires a version
-bump *and* a funding pipeline designed around the consensus rule.
+The probe script walks one pool through all three layers and prints a verdict per layer.
+The answer on the current pins is that **no pool survives all three**, which is why runs
+confirm 0 transactions.
+
+## What this document previously got wrong
+
+Two rounds of correction, both load-bearing, recorded here rather than quietly edited away:
+
+1. The first version asserted the binding constraint was consensus: "transparent coinbase
+   cannot be spent to a transparent output … no Zallet version changes it," and that a
+   `z_shieldcoinbase` step was therefore mandatory. **The consensus rule is off on regtest**
+   (hardcoded in Zebra's `Parameters::new_regtest()`; see below), so that reasoning was
+   wrong.
+2. The second version then concluded shielding was unnecessary. **Also wrong, for a
+   different reason:** Zallet's proposal engine enforces the coinbase-to-shielded rule
+   *client-side*, on every version, regardless of what regtest consensus allows. Measured
+   on beta.1: 209 mature coinbase UTXOs, every `from` form refused with "Insufficient
+   balance (have 0)". Transparent coinbase can only leave the wallet via
+   `z_shieldcoinbase` — or be avoided entirely by mining shielded coinbase (§4).
 
 ---
 
-## 1. The pin bump
+## 1. Measured results
+
+Probed on a fresh datadir at the pinned versions (Zebra `v5.0.0`, Zaino `0.4.0-rc.2`,
+Zallet `v0.1.0-alpha.3`). "Detects" means `z_gettotalbalance` credited the account; "Spends"
+means `z_sendmany` built a proposal.
+
+| Coinbase pool | Zebra mines | Zallet detects | `z_sendmany` spends |
+|---|---|---|---|
+| **Transparent** | yes | yes — 662.50 ZEC, 105+ confirmations | **no** — `Insufficient balance (have 0, need 1010000)` |
+| **Sapling** (ZIP-213) | yes | yes — 12.50 ZEC, 4 notes, credited within ~6 blocks | **no** — `Insufficient balance (have 0)` |
+| **Orchard** (ZIP-213) | **no** — `could not validate orchard proof` | — | — |
+
+The transparent row is the important one: the funds were **mature** (105 confirmations,
+well past the 100-block rule), **owned by the sending account**, and **visible to
+`z_listunspent`** — and `z_sendmany` still selected zero inputs. Every `from` form fails the
+same way:
+
+| `from` | Result |
+|---|---|
+| Account UA | `-4 Insufficient balance (have 0, need …)` |
+| Bare t-addr that holds the UTXOs | `-5 Invalid from address, no payment source found for address.` |
+| `ANY_TADDR` | `-11 The legacy account is currently unsupported for spending from` |
+
+**Conclusion: `v0.1.0-alpha.3` cannot spend from any pool, so the beta.1 bump is not an
+optimisation — it is the only route to a non-zero confirmation rate.**
+
+### The consensus rule is off on regtest
+
+Zebra hardcodes the exemption when it constructs Regtest parameters —
+`zebra-chain/src/parameters/network/testnet.rs`, `Parameters::new_regtest()`:
+
+```rust
+let mut parameters = Self::build()
+    .with_disable_pow(true)
+    .with_unshielded_coinbase_spends(true)
+```
+
+and the enforcement site honours it (`zebra-chain/src/transaction.rs`):
+
+```rust
+if self.outputs().is_empty() || network.should_allow_unshielded_coinbase_spends() {
+    CheckCoinbaseMaturity { spend_height }
+} else {
+    DisallowCoinbaseSpend
+}
+```
+
+It is not a config knob; it is unconditional for Regtest. So on our chain transparent
+coinbase spends are subject to **maturity only** (100 blocks). The wallet layer imposes no
+extra restriction either: `zcash_client_sqlite`'s transparent queries carry a
+`CoinbaseFilter` (all / coinbase-only / non-coinbase-only) and exclude only *immature*
+coinbase.
+
+Consequences: **`z_shieldcoinbase` is not required**, and strategy D's "shield first, then
+fan out to create non-coinbase UTXOs" is unnecessary indirection. Once `z_sendmany` can
+select transparent inputs, mature transparent coinbase can fund transparent recipients
+directly.
+
+Zebra's two sanctioned regtest cheats are exactly this exemption and disabled PoW. There is
+no third one — no premine, no `importprivkey`, no faucet.
+
+### Shielded coinbase has no maturity, but is only half-usable
+
+[ZIP 213](https://zips.z.cash/zip-0213) amends the maturity rule "to only apply to
+transparent coinbase outputs", and the probe confirms it: Sapling coinbase was credited
+within ~6 blocks, against 100 for transparent. That would make shielded coinbase the
+cheapest possible warmup — if it worked.
+
+- **Orchard is unusable.** Zebra v5.0.0 builds the block and then **rejects its own block**:
+  `submit block failed verification error=… "could not validate orchard proof"`. Zebra
+  accepts the address (it logs `miner_address=…` parsed as `Unified(Address([Orchard(…)]))`)
+  and then fails verification. This looks like an upstream defect worth reporting; see
+  [Upstream issues to file](#upstream-issues-to-file).
+- **Sapling mines and is detected, but poisons `z_listunspent`**, which fails for the whole
+  wallet with `-20 WalletDb::get_memo failed / Invalid UTF-8: invalid utf-8 sequence`.
+  Zallet assumes memo bytes are UTF-8; the coinbase memo is not. One shielded coinbase note
+  therefore breaks a method the simulator uses for balance verification.
+
+---
+
+## 2. Other defects the probe exposed
+
+These are independent of the funding question and three of them are **ours**, not upstream.
+
+1. **Coinbase was landing in the wrong account.** `regtest-init.sh` creates a dedicated
+   `miner` account (zip32 index 0) and points `ZEBRA_MINING__MINER_ADDRESS` at *its*
+   transparent address, while the simulator resolves and spends from an account named
+   `hot_wallet` (index 11 in the pre-existing datadir). All 151 UTXOs / 943.75 ZEC belonged
+   to `miner`; `hot_wallet` held nothing. So the historical `Insufficient balance (have 0)`
+   was, in part, **literally correct** — the simulator was spending from an empty account.
+   This confound is why the earlier diagnosis in
+   [`zallet-transparent-spending-bug.md`](zallet-transparent-spending-bug.md) could not be
+   trusted; the probe re-confirms the alpha.3 defect cleanly, with coinbase paid directly to
+   `hot_wallet`.
+
+2. **Requesting a narrow receiver set at diversifier index 0 always fails.** Creating an
+   account already generates its index-0 address with **all three** receiver types, so
+   `z_getaddressforaccount(uuid, ["orchard","p2pkh"], 0)` returns
+   `-4 address at diversifier index 0 was already generated with different receiver types`.
+   The simulator asks for exactly that. Omitting the index lets Zallet pick a workable one.
+
+3. **Sapling receivers are not available at every diversifier index.** Roughly half of all
+   indices yield no valid Sapling diversifier, and index 0 typically does not:
+   `-4 diversifier index 0 cannot generate an address with the requested receivers`. Any
+   code that wants a Sapling receiver must let Zallet choose the index. This directly
+   contradicts the "always pass `diversifier_index`" guidance added to
+   `z_get_address_for_account`'s docstring, which should be softened to "pin the index only
+   when you need a *specific*, already-generated address."
+
+4. **`getwalletinfo` is a stub.** It returns all-zero fields and logs
+   `TODO: Implement getwalletinfo`. It must not be used for balance verification.
+
+---
+
+## 3. The pin bump
 
 | Entity | Current | Target |
 |---|---|---|
-| Zallet image | `electriccoinco/zallet:v0.1.0-alpha.3` | `electriccoinco/zallet:v0.1.0-beta.1` |
+| Zallet image | `electriccoinco/zallet:v0.1.0-alpha.3` | `v0.1.0-beta.1` (**no published image — see below**) |
 | Zallet commit | `6fc85f68cf5ebe456160c6518255a83129e7d21c` | `5be0f4861feedc47978102c627c6293dea2d7838` |
 | Released | 2025-12-15 | 2026-07-12 |
 
@@ -39,223 +174,182 @@ From the `v0.1.0-beta.1` changelog:
 
 - **`z_sendmany` can spend transparent funds.** Previously it "passed a shielded-only spend
   policy to the proposal builder, so no transparent input could ever be selected, and the
-  `AllowFullyTransparent` privacy policy was unreachable." This is the direct cause of our
-  100%-failure runs.
+  `AllowFullyTransparent` privacy policy was unreachable." This matches the probe exactly.
 - `InputSource::select_spendable_transparent_outputs` and
   `WalletWrite::reserve_next_n_internal_addresses` are implemented; both previously
   defaulted to `unimplemented!()`.
-- **The `zebra` and `zaino` backends support regtest.** Earlier releases rejected regtest at
-  startup. Worth noting our stack works today only because of the backend mode it happens to
-  use; beta.1 removes that constraint.
+- The `zebra` and `zaino` backends support regtest.
 
-From `v0.1.0-alpha.4` (included transitively):
+From `v0.1.0-alpha.4` (included transitively): `z_shieldcoinbase` exists, and coinbase
+`tx_index` is recorded — the latter matters even though we no longer need shielding, because
+`zcash_client_sqlite` defaults an unknown `tx_index` to *non-coinbase*
+(`IFNULL(t.tx_index, 1)`), which silently skips the maturity check for such outputs.
 
-- **`z_shieldcoinbase` exists.** Required to escape the consensus rule below.
-- Coinbase `tx_index` is now recorded, "enabling `z_shieldcoinbase` (and any other consumer
-  of `TransparentOutputFilter::CoinbaseOnly`) to correctly identify coinbase outputs."
-  Without this the shielding step could not find the coinbase UTXOs.
+### There is no published beta.1 image
 
-### Cost and mechanics
+This is the open blocker on the bump, and it invalidates the first version of this document,
+which said the bump "is expressed by writing `Z3_ZALLET_IMAGE` into
+`external/z3/.env.regtest`". Probed registries:
 
-- **`alpha.4` broke the wallet database format — a fresh datadir is required.** Accepted.
-  In practice this means the full reset: `docker compose down -v`, reset the `pwhash`
-  placeholder in `config/regtest/zallet.toml`, reset the miner address in `.env.regtest`,
-  re-run `regtest-init.sh`, then bring the stack up.
-- `external/` is **gitignored**, so the image tag cannot be committed from this repo. The
-  compose file already reads `${Z3_ZALLET_IMAGE:-electriccoinco/zallet:v0.1.0-alpha.3}`, so
-  the bump is expressed by writing `Z3_ZALLET_IMAGE` into `external/z3/.env.regtest`.
-  `scripts/dev/regtest-miner-setup.sh` already sets a precedent for our repo writing into
-  that file.
-- `z3-commits.lock` records the pin for run attribution and must be updated in step with it,
-  along with the version table in `README.md`.
-- `z3-commits.lock` says pins are "frozen for the duration of the engagement". This bump is
-  a deliberate, recorded exception — the frozen pin cannot produce a non-zero
-  confirmation rate, so it cannot produce the findings the engagement is for.
-- The repo also still cites `https://github.com/zcash/wallet`; that repository is now
-  [`zcash/zallet`](https://github.com/zcash/zallet), and the book moved to
-  https://zcash.github.io/zallet/.
+| Reference | Result |
+|---|---|
+| `electriccoinco/zallet` | newest tag `v0.1.0-alpha.3`, dated 2025-12-15 |
+| `electriccoinco/zallet:v0.1.0-alpha.4` / `:v0.1.0-beta.1` | absent |
+| `ghcr.io/zcash/zallet`, `ghcr.io/zcash/wallet`, `zcash/zallet` | absent |
 
----
+Source releases and prebuilt binaries do exist. Two routes:
 
-## 2. The `z_shieldcoinbase` step
+- **(a) Source build.** `external/z3/docker-compose.build.yml` already defines a `zallet`
+  service building `./vendor/zallet` (`target: runtime`, tagged `z3_zallet:local`), fed by
+  `scripts/vendor.sh` — whose pin must move from `v0.1.0-alpha.3` to `v0.1.0-beta.1`. Note
+  `vendor.sh` still clones `https://github.com/zcash/wallet`. Sanctioned by the Z3 repo, but
+  a full Rust build, and `external/` is gitignored so it is not reproducible from this repo
+  alone.
+- **(b) Release tarball.** `zallet-v0.1.0-beta.1-linux-{amd64,arm64}.tar.gz` (~140 MB, with
+  `.asc`, provenance, and SBOM) wrapped in a thin image. Faster, and the `arm64` asset
+  yields a **native** image — the current `electriccoinco/zallet:v0.1.0-alpha.3` is
+  `linux/amd64` and runs under emulation on this aarch64 host.
 
-### Why it is mandatory
-
-Transparent coinbase outputs may only be spent by a transaction with **no transparent
-outputs** ([ZIP-213](https://zips.z.cash/zip-0213) narrowed the rule to transparent
-coinbase; it did not remove it). Zebra v5.0.0 enforces it as
-`UnshieldedTransparentCoinbaseSpend`. A 100-block maturity requirement applies separately.
-
-beta.1's changelog states the consequence plainly: "Coinbase outputs are not spendable this
-way: consensus requires them to be spent to a single shielded output, which remains
-`z_shieldcoinbase`'s job. A transparent spend therefore requires a non-coinbase UTXO."
-
-So **every** funding strategy below must pass through a shielding step. There is no
-configuration or version that avoids it.
-
-### Where it goes
-
-In `lifecycle.rs::setup()`, between warmup and provisioning:
-
-```
-start stack
-  → resolve hot wallet account          (must exist before mining, or Zallet's account
-                                         birthday is set at the tip and misses coinbase)
-  → warmup: mine warmup_blocks          (110 = 100 maturity + 10 buffer)
-  → z_shieldcoinbase                    NEW — converts mature transparent coinbase to Orchard
-  → poll operation to completion        (z_sendmany-style async op: z_getoperationstatus,
-                                         then z_getoperationresult)
-  → mine a few blocks to confirm the shielding tx
-  → verify shielded balance > 0         (replaces today's z_gettotalbalance check, which is
-                                         a false positive: it counts unspendable coinbase)
-  → provision population
-```
-
-### Maturity arithmetic — a real constraint
-
-`warmup_blocks: 110` is documented in every scenario as "100 for regtest coinbase maturity
-+ 10 buffer". At height 110 only the coinbase of blocks 1–10 is mature, so **roughly 10
-coinbase outputs are shieldable at handoff**, not all 110. The remainder mature during the
-load phase as the background miner advances the chain.
-
-Consequences to design for:
-
-- The shielded balance available at provisioning time is bounded by ~10 coinbase outputs.
-  Scenario amount ranges and account counts must fit inside that, or `warmup_blocks` must
-  rise (mining is cheap in regtest — raising it is the simpler lever).
-- `z_shieldcoinbase` may need to be **re-run during the load phase** as more coinbase
-  matures, if a scenario's total value exceeds the initial mature set.
-- Today's warmup check (`z_gettotalbalance > 0`) must be replaced. It passes on coinbase
-  that cannot be spent — the exact false positive that let 100%-failure runs look healthy.
-
-### RPC surface to add
-
-Neither method has a wrapper in `src/rpc/mod.rs` today:
-
-- **`z_shieldcoinbase`** — absent entirely (it appears only in comments).
-- **`z_listunifiedreceivers`** — present only in the backend-routing table, and routed to
-  `Backend::Zebra`, which is questionable for a wallet method. Needed to extract a UA's
-  transparent receiver.
-
-Both return async operation IDs or plain results consistent with existing wrappers;
-`z_get_operation_status` / `z_get_operation_result` already exist for the polling half.
+Either way the datadir must be fresh: alpha.4 broke the wallet database format.
 
 ---
 
-## 3. Funding strategies
+## 4. The working pipeline — measured end to end
 
-Four candidates, all of which must respect the consensus rule.
+Established step by step by [`scripts/experiments/fanout-probe.sh`](../scripts/experiments/fanout-probe.sh),
+which prints an OK/FAIL verdict per operation. On the override stack (**Zebra v6.0.0 +
+Zaino 0.6.0 + Zallet v0.1.0-beta.1**, fresh datadir, 2026-07-29) all 12 steps pass:
 
-### A. Single hot wallet, shielded (minimum viable)
+| # | Operation | alpha.3 stack | beta.1 stack |
+|---|---|---|---|
+| 1 | resolve source account, reuse its existing UA | OK | OK |
+| 2 | point `miner_address` at its p2pkh receiver | OK | OK |
+| 3 | mine 105 blocks | OK | OK |
+| 4 | wallet credits the coinbase | OK | OK |
+| 5 | UTXOs reach 100-conf maturity | OK | OK |
+| 6 | create 5 sink accounts, reuse their receivers | OK | OK |
+| 7 | `z_shieldcoinbase` (account-UUID `from`) | n/a (method absent) | OK |
+| 8 | shielding op completes; mine 10 anchor confs | — | OK |
+| 9 | `z_sendmany` UA → 5 transparent receivers | **FAIL** (have 0) | OK |
+| 10 | fan-out op completes with txid | — | OK |
+| 11 | all 5 sinks hold non-coinbase transparent UTXOs | — | OK |
+| 12 | sink spends back via its t-addr `from` | — | OK |
 
-Shield the hot wallet's coinbase; every flow spends from the hot wallet's shielded balance.
+### The cheaper variant: mine shielded coinbase (no maturity, no shielding)
 
-- **Pros:** smallest change; only needs the shielding step. Confirmation rate goes from 0%
-  to meaningful immediately.
-- **Cons:** every transaction's *source* is one shielded account. TToT and TToZ flows have
-  no genuine transparent input, so "transparent sender" is fiction and per-pool latency
-  attribution stays optimistic on the sending side. Also serialises all spends through one
-  account's note set, which is itself a bottleneck that could dominate the measurement.
+With **NU6.2 activated** in the regtest params, coinbase can be mined directly to the hot
+wallet's **Orchard receiver**, and the whole front half of the pipeline collapses:
 
-### B. Rotate `ZEBRA_MINING__MINER_ADDRESS` per account
+- ZIP 213 limits the 100-block maturity rule to *transparent* coinbase — Orchard coinbase
+  was credited within ~6 blocks and spendable at ~10.
+- No `z_shieldcoinbase`: the wallet's client-side coinbase rule concerns transparent
+  coinbase only. Measured: `z_sendmany` from the UA spent Orchard coinbase directly, to
+  both shielded (`FullPrivacy`) and transparent (`AllowRevealedRecipients`) recipients.
+- Warmup drops from ~105 blocks to ~16 (a few to fund + 10 anchor confirmations).
 
-Mine coinbase directly to each account's transparent address.
+NU6.2 is the key: it activates the **fixed Orchard Action circuit** with a per-epoch
+verifying key (Zebra 5.0.0 changelog). Without it, Zebra's miner builds Orchard coinbase
+proofs with the new circuit and then **rejects its own block** ("could not validate orchard
+proof") because a pre-NU6.2 height verifies against the old key. This — not a mining bug —
+is why mining to Orchard failed on the original pins. It also requires Zallet ≥ beta.1:
+alpha.3's `zcash_protocol 0.7.2` cannot parse the NU6.2 branch id (`5437f330`).
 
-- **Pros:** funds N transparent addresses with no spend at all.
-- **Cons:** Zebra has **no `generatetoaddress`** (confirmed: the v5.0.0 RPC surface has 39
-  methods; `generate` takes only a block count and always pays `mining.miner_address`), and
-  `miner_address` is read at startup with no RPC to change it — so this costs **one Zebra
-  restart per account**. Unusable beyond trivial N. And the funds arrive as *coinbase*, so
-  they still cannot be spent transparently — it does not even solve the problem.
+Config (both files; heights must match — Zaino 0.6.0 takes heights from the validator, so
+Zebra's file is the source of truth):
 
-### C. `getblocktemplate` + custom coinbase + `submitblock`
+```toml
+# external/z3/config/regtest/zebra.toml
+[network.testnet_parameters.activation_heights]
+NU5 = 2
+NU6 = 2
+"NU6.1" = 3
+"NU6.2" = 3
 
-Build our own coinbase paying an arbitrary address and submit the block.
-
-- **Pros:** no restarts; Zebra explicitly sanctions it ("Miners can make arbitrary changes
-  to blocks, as long as the data sent to `submitblock` is a valid Zcash block"), and regtest
-  disables PoW so no Equihash solution is needed.
-- **Cons:** significant implementation cost (coinbase construction, merkle root, block
-  serialisation) and, again, **the funds are coinbase** and cannot be spent transparently.
-  Solves address targeting, not spendability.
-
-### D. Shield once, then fan out to per-account transparent receivers (recommended)
-
+# external/z3/config/regtest/zallet.toml
+regtest_nuparams = [ …, "4dec4df0:3", "5437f330:3" ]
 ```
-mine 110+ blocks                     coinbase → hot wallet transparent
-z_shieldcoinbase                     coinbase → hot wallet Orchard (consensus-legal)
-z_sendmany (shielded → per-account
-  transparent receivers)             creates NON-COINBASE transparent UTXOs
-                                     ↑ this is the step that unlocks everything
-now: TToT / TToZ can genuinely spend transparent inputs from those accounts
-     ZToT / ZToZ spend from shielded as before
-```
 
-- **Pros:** the only option that produces **genuinely spendable transparent funds**, because
-  the resulting UTXOs are not coinbase — exactly what beta.1's "a transparent spend
-  therefore requires a non-coinbase UTXO" calls for. Fixes TToT/ZToT recipient fidelity
-  *and* TToT/TToZ sender fidelity, so per-pool attribution becomes real. Costs one extra
-  fan-out transaction per account at setup, which is a one-time provisioning cost rather
-  than a per-intent cost.
-- **Cons / open risks:**
-  - Requires per-account `p2pkh` receivers, which reopens the **unresolved gap-limit
-    question** — hence step 3 of the plan (the experiment) runs before this is implemented.
-  - [zallet#644](https://github.com/zcash/zallet/issues/644) (open): a UA source is
-    shielded-only by design, and a bare t-addr source draws only *that address's* UTXOs;
-    gathering across multiple addresses in one transaction needs
-    `features.legacy_pool_seed_fingerprint`. **Per-account funding sidesteps this** — each
-    account has one transparent address holding its own UTXO, so `from` = that t-addr is
-    sufficient. Worth confirming empirically.
-  - Sending to a UA that has both receivers will prefer the **shielded** one. The fan-out
-    and any TToT/ZToT recipient must therefore target the **extracted transparent
-    receiver**, not the UA — hence the `z_listunifiedreceivers` wrapper.
-  - Change outputs: `reserve_next_n_internal_addresses` consumes the **internal** scope,
-    whose gap limit is **5** — tighter than external's 10. Worth watching.
+### Rules the pipeline encodes (all measured)
 
-### Recommendation
+1. **Never call `z_getaddressforaccount` to "get" an address** — it always *derives* a new
+   one at the next Sapling-valid diversifier index, which advances in jumps. On an account
+   with no funded address the transparent gap window is indices 0–9, so two or three such
+   calls exhaust it and every later one fails with `ReachedGapLimit` at index 10. **This
+   resolves the June smoke-run mystery** (fresh accounts erroring at "index 10"): the
+   provisioner derived per account and per intent. Read existing addresses from
+   `z_listaccounts` instead; account creation always generates the diversifier-0 address
+   with every receiver type.
+2. **`from` semantics** (beta.1): a UA draws the account's *shielded* funds only
+   ([zallet#644](https://github.com/zcash/zallet/issues/644), by design); a bare t-addr
+   draws that address's own transparent UTXOs — the only working form for TToT/TToZ;
+   `ANY_TADDR` requires `features.legacy_pool_seed_fingerprint`.
+3. **~10 confirmations before any input is selectable**, shielded notes and transparent
+   UTXOs alike (refused at 3, accepted at ≥ 10 — a 10-conf anchor policy). Younger funds
+   produce `-4 Insufficient balance (have 0, …)` while `z_gettotalbalance` plainly shows
+   them. Sends must retry while blocks are mined; the wallet's scan can also trail the
+   chain, so "have 0" right after mining is normal for a few seconds.
+4. **Recipients that must hold transparent value are paid at their extracted p2pkh
+   receiver** (`z_listunifiedreceivers`), never at their UA — paying a UA settles shielded.
+5. **`z_gettotalbalance` > 0 is not spendability.** The only honest check is a successful
+   proposal.
 
-**D**, reached in two stages so value lands early and risk stays isolated:
+### Where this lives in the simulator
 
-1. Bump to beta.1 and add shielding → strategy **A** works, confirmation rate becomes
-   non-zero, and the upgrade is validated independently of any address-derivation change.
-2. Run the gap-limit experiment, then add the per-account transparent fan-out → **D**.
-
-B and C are rejected: both target *where coinbase lands*, which is not the constraint. The
-constraint is that coinbase must be shielded before it can fund anything transparent.
+- `src/scenarios/runner/funding.rs` — the common helper: `resolve_account` (reuse existing
+  addresses; never derive), `fund_accounts` (shield-if-needed → one fan-out transaction →
+  txid), `wait_operation`, and the anchor-retry send.
+- `src/rpc/mod.rs` — wrappers added: `z_shield_coinbase`, `z_list_unified_receivers`,
+  `z_send_many_with_policy`; `AccountInfo` now carries the `addresses` array so callers can
+  reuse instead of derive.
+- `scripts/dev/regtest-miner-setup.sh` — points `miner_address` at the hot wallet (the
+  account the runner spends from), not a separate `miner` account. Coinbase previously
+  landed in an account the simulator never spent from, which made alpha.3's real defect
+  much harder to see.
 
 ---
 
-## 4. Open questions to settle by measurement
+## 5. Questions, resolved
 
-1. **Gap limit scope on the pinned release.** Upstream source says per-`(account, key
-   scope)`; our own artifact
-   (`experiments/runs/20260630T131145Z-smoke/rpc_calls.jsonl`) hit "index 10" while deriving
-   on fresh accounts. Unresolved — see
-   [`zallet-transparent-gap-limit.md`](zallet-transparent-gap-limit.md). **Decisive
-   experiment:** on a fresh datadir, create accounts A and B; derive `["p2pkh"]` on A until
-   it errors; then derive once on B. B succeeds ⇒ per-account. B fails ⇒ shared. This gates
-   strategy D and is step 3 of the plan.
-2. **How many accounts can hold transparent receivers**, given the answer to (1) and the
-   internal-scope limit of 5 for change.
-3. **Whether a bare t-addr `from` works per-account** on beta.1, or whether zallet#644's
-   legacy-pool workaround is unavoidable.
-4. **Whether `z_shieldcoinbase` needs re-running mid-load** as coinbase matures, or whether
-   a higher `warmup_blocks` covers a full scenario's value.
-5. **Whether the load phase should assert a minimum confirmation rate.** Today the
-   integration test asserts only that the runner returns `Ok`, which is why 0/60 confirmed
-   passed CI-visible checks. This should become a real assertion once funding works —
-   otherwise the next regression of this class is equally invisible.
+1. **Does beta.1 spend transparent coinbase?** No — client-side rule (§ corrections). It
+   spends *shielded* coinbase and *non-coinbase* transparent UTXOs; `z_shieldcoinbase`
+   bridges the gap when coinbase is transparent.
+2. **Gap-limit scope.** Resolved — not an account-scope question at all. The window is per
+   account and per scope as upstream documents, but *derivation-index jumps* (Sapling
+   diversifier validity) burn ~3–5 indices per call, so ~2–3 unfunded derivations reach
+   index 10. Reuse addresses; the limit is then never hit.
+3. **Bare t-addr `from`?** Works on beta.1 for non-coinbase UTXOs (probe step 12); rejected
+   on alpha.3. The legacy-pool feature is not needed for per-account spending.
+4. **Minimum confirmation-rate assertion in the integration test** — still worth doing;
+   now unblocked because a working pipeline exists to assert against.
+
+## Upstream issues to file
+
+Per the standing decision, drafted here and **not** filed:
+
+1. **Zebra:** with NU6.2 not yet active, `generate` to an Orchard `miner_address` builds a
+   block that fails Zebra's own verification ("could not validate orchard proof") — the
+   template builder uses the fixed circuit while verification uses the pre-NU6.2 key. The
+   miner should either build with the epoch-correct circuit or refuse the configuration.
+   Reproducer: `funding-probe.sh orchard` with no NU6.2 in the regtest params.
+2. **Zallet (beta.1):** one shielded coinbase note breaks `z_listunspent` wallet-wide with
+   `WalletDb::get_memo failed / Invalid UTF-8` (memo bytes are not required to be UTF-8).
+   Measured on alpha.3 (Sapling note) and still present on beta.1 (Orchard note).
+3. **Zallet (docs/ergonomics):** account creation pre-generates diversifier 0 with all
+   receiver types, so a later narrower request at index 0 fails with a message that reads
+   like caller error; and repeated "get an address" calls silently walk the gap window (see
+   rule 1 above) — an API for *reading* the primary address would remove the footgun.
+4. **Zallet/Zaino (packaging):** no container image is published past v0.1.0-alpha.3, and
+   the zaino-backend binary requires Zebra ≥ 6.0.0 (queries the `ironwood` subtree pool)
+   with no compatibility note in the release.
 
 ---
 
-## 5. Sequencing
+## 6. Status
 
-| Step | Work | Validation |
+| Step | Work | State |
 |---|---|---|
-| 1 | This document | — |
-| 2 | Bump Zallet to beta.1; fresh datadir; `z_shieldcoinbase` + `z_listunifiedreceivers` wrappers; shielding step in `setup()`; replace the warmup balance check | Live smoke run; confirmation rate > 0 |
-| 3 | Gap-limit experiment against beta.1 | Answers open question 1 |
-| 4 | Reevaluate, then implement the chosen funding strategy (D unless the experiment says otherwise); fix `exchange.rs::run_deposit`'s per-intent address derivation | Live run; per-pool attribution checks |
-
-Steps 2–4 are separate PRs. Step 2 cannot be validated without a running stack and a fresh
-datadir.
+| 1 | Probe scripts (`funding-probe.sh`, `fanout-probe.sh`) | done — this document's evidence |
+| 2 | beta.1 runtime (release-tarball image, `scripts/dev/zallet-release-image/`) | done — `z3sim/zallet:v0.1.0-beta.1` |
+| 3 | Stack bump (Zebra 6.0.0, Zaino 0.6.0, NU6.2 config) + fresh datadir | done — recorded in `z3-commits.lock` overrides |
+| 4 | Common funding helper (`src/scenarios/runner/funding.rs`) + RPC wrappers | done — unit-tested; wiring into `lifecycle.rs`/provisioner pending |
+| 5 | Wire the runner: orchard-coinbase warmup, fan-out provisioning, per-flow `from` forms, confirmation-rate assertion | next |
