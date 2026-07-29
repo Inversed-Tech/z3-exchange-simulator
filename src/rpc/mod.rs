@@ -861,11 +861,30 @@ impl RpcClient {
             .await
     }
 
-    /// Derive a Unified Address for an account with the given receiver types.
+    /// Derive a NEW Unified Address for an account with the given receiver types.
     ///
-    /// Always pass `receiver_types` explicitly. Use `&["orchard"]` for synthetic
-    /// accounts to avoid advancing Zallet's transparent address gap counter
-    /// (limit: 10 consecutive unfunded transparent derivations across the wallet).
+    /// This method always *derives* — there is no "get the existing address" mode.
+    /// To reuse an address that already exists (the usual need), read it from
+    /// [`Self::z_list_accounts`] via [`AccountInfo::primary_address`] instead;
+    /// account creation always generates the diversifier-0 address with every
+    /// receiver type.
+    ///
+    /// The transparent gap limit is 10 consecutive *unfunded* external derivations
+    /// per `(account, key scope)` — not wallet-global — sliding forward whenever a
+    /// derived address receives a mined output. The trap (measured on beta.1, and
+    /// the resolution of the "index 10 on fresh accounts" failure in
+    /// `experiments/runs/20260630T131145Z-smoke/`): each call without an explicit
+    /// `diversifier_index` derives at the next *Sapling-valid* index, which
+    /// advances in jumps, so an unfunded account's 0..9 transparent window is
+    /// exhausted within a few calls when `receiver_types` includes `p2pkh`.
+    /// Failures interleave per-account (one account erring while others derive
+    /// fine), confirming the per-account scope. See
+    /// `docs/zallet-transparent-gap-limit.md`.
+    ///
+    /// Pinning `diversifier_index` is not a way to fetch an existing address
+    /// either: index 0 is pre-generated with *all* receiver types (a narrower
+    /// request errors with "already generated with different receiver types"),
+    /// and only ~half of all indices have a valid Sapling diversifier.
     pub async fn z_get_address_for_account(
         &self,
         account: &str,
