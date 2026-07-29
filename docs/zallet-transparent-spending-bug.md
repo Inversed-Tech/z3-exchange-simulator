@@ -99,11 +99,16 @@ This holds regardless of:
 >
 > **Two further facts change the fix path:**
 >
-> 1. **Coinbase still cannot be spent to a transparent output, even on beta.1 — that part is
->    consensus, not a bug.** Transparent coinbase must be spent by a transaction with no
->    transparent outputs ([ZIP-213](https://zips.z.cash/zip-0213); enforced by Zebra as
->    `UnshieldedTransparentCoinbaseSpend`). Since regtest funds are entirely coinbase, the
->    pipeline must be: mine → 100-block maturity → `z_shieldcoinbase` → `z_sendmany`.
+> 1. **Coinbase still cannot be spent to a transparent output, even on beta.1 — but on
+>    regtest that is Zallet's client-side policy, not consensus.** On mainnet the rule is
+>    consensus (transparent coinbase must be spent by a transaction with no transparent
+>    outputs; [ZIP-213](https://zips.z.cash/zip-0213)); on Regtest Zebra hardcodes the
+>    exemption (`.with_unshielded_coinbase_spends(true)` in `Parameters::new_regtest()`),
+>    yet Zallet's proposal engine excludes transparent coinbase from transparent-output
+>    proposals regardless — measured on beta.1 with 209 mature UTXOs. Since regtest funds
+>    are entirely coinbase, the pipeline is: mine → 100-block maturity →
+>    `z_shieldcoinbase` → `z_sendmany` — or mine shielded (Orchard) coinbase and skip both
+>    the maturity wait and the shielding (see `regtest-funding-plan.md`).
 > 2. **`z_shieldcoinbase` was added in `v0.1.0-alpha.4`**, which also fixed coinbase
 >    `tx_index` recording so coinbase outputs can be identified at all. Our pin (alpha.3)
 >    has neither.

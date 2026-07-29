@@ -1,6 +1,9 @@
 # Zallet's Transparent Address Gap Limit at Exchange Scale
 
-**Status:** Analysis. Corrects an earlier, inaccurate claim in this repo's source comments.
+**Status:** Analysis, updated with measurements. Corrects an earlier, inaccurate claim in
+this repo's source comments; the discrepancy that the first revision left unresolved has
+since been **resolved by measurement on `v0.1.0-beta.1`** (2026-07-29; see
+[`regtest-funding-plan.md`](regtest-funding-plan.md) for the probe evidence).
 **Applies to:** Zallet `v0.1.0-alpha.3` (our pin) through `v0.1.0-beta.1`; `librustzcash` `main`
 **Relevant to:** per-account transparent deposit addresses, TToT/ZToT flow fidelity
 
@@ -11,11 +14,12 @@
 | Question | Answer |
 |---|---|
 | What is the limit? | `GapLimits { external: 10, internal: 5, ephemeral: 10 }` |
-| Scope of the limit | Per **(account, key scope)** upstream — but a run of ours contradicts this on `alpha.3`; [unresolved](#the-discrepancy) |
+| Scope of the limit | Per **(account, key scope)** — measured on beta.1: failures interleave per account; [resolved](#the-discrepancy--resolved) |
 | What advances the gap | Consecutive derived addresses with no output in a **mined** transaction |
 | What resets it | A mined UTXO to a derived address slides the window forward |
 | Configurable? | **No.** Zallet never calls `WalletDb::with_gap_limits`; no `zallet.toml` key exists |
-| Is it *the* blocker for per-account transparent addresses? | No — a consensus rule blocks them regardless; see [The real blocker](#the-real-blocker-is-consensus-not-the-gap-limit) |
+| Is it *the* blocker for per-account transparent addresses? | No — Zallet's client-side coinbase policy and alpha.3's spend policy block them regardless; see [The real blocker](#the-real-blocker-is-wallet-policy-not-the-gap-limit) |
+| Why did fresh accounts hit "index 10"? | Derivation-index jumps: each derive lands on the next *Sapling-valid* index, so an unfunded account's 0–9 window is gone in 2–3 calls; [resolved](#the-discrepancy--resolved) |
 
 ---
 
@@ -31,7 +35,7 @@ Three sites in this repo asserted a wallet-global gap counter:
 **Per current librustzcash source, "across the wallet" is wrong**: the window is maintained
 per `(account_id, key_scope)`. All three comments have been corrected.
 
-### The discrepancy
+### The discrepancy — resolved
 
 Current upstream source says per-account. But this repo holds a run artifact that a naive
 per-account reading cannot explain —
@@ -51,30 +55,37 @@ set, which includes `p2pkh`, was used) and no diversifier index, and `provision(
 created** account. Under a strict per-account window, each fresh account would derive at
 index 0, and "index 10" should be unreachable.
 
-**This cannot be resolved from the evidence available.** `rpc_calls.jsonl` records
-`params: null`, so we cannot tell whether those eight derivations hit eight distinct
-account UUIDs or one. Candidate explanations, none verified:
+**Resolution (measured on `v0.1.0-beta.1`, 2026-07-29).** The per-account model is
+correct; what the naive reading missed is the *derivation step size*. A
+`z_getaddressforaccount` call without an explicit diversifier index derives at the next
+**Sapling-valid** diversifier index, and only about half of all indices have a valid
+Sapling diversifier, so the index advances in jumps (observed: 0 → 1, 2, 4, 6, 9, 14 …
+varying per account key). On an account with **no funded address**, `gap_start` stays at 0
+and the transparent window is indices 0–9 only — so **two or three unfunded derivations
+put the next candidate index past 9**, and the call fails with exactly the recorded error:
+"reached the transparent gap limit … at index 10".
 
-1. Zallet `alpha.3` pins an older `zcash_client_backend` whose gap accounting was
-   effectively wallet-wide (a single global `GAP_LIMIT` existed until 0.22.0).
-2. The derivations shared one account or one transparent key scope for a reason not visible
-   in the artifact.
-3. Pre-generated address rows from prior runs on shared volumes interacted with the window
-   in a way the per-account model doesn't capture.
+Observed live during the fan-out probe runs: after one explicit derivation per account in
+one run, the *next* run's single derivation failed at index 10 on two of five fresh
+accounts, while derivations on other accounts (and on the funded source account, whose
+window had slid forward) kept succeeding. Failures interleaving with successes across
+accounts is per-account scoping, measured — the decisive experiment sketched in the first
+revision of this document effectively ran itself.
 
-**A decisive experiment** would be: on a fresh datadir, create two accounts, derive
-`["p2pkh"]` addresses on account A until it errors, then attempt one derivation on account
-B. If B succeeds, the window is per-account; if it fails, it is shared. This has not been
-run.
+For the June artifact specifically, the derivation-jump mechanism (possibly compounded by
+address rows left by earlier runs on the reused volumes) accounts for "index 10" on fresh
+accounts. No wallet-global counter is needed to explain it, and the librustzcash history
+below shows the global constant was removed well before our pin.
 
 ### What this means for the claims in this document
 
 The upstream-source claims below (values, per-scope filtering, reset semantics) are
-confirmed against librustzcash `main`. But **the prediction that "one `p2pkh` receiver per
-synthetic account sits comfortably inside the limit" is inference from current upstream
-source, not a measured property of our pinned `alpha.3`** — and the artifact above is
-evidence against it. Treat it as a hypothesis to test, not a settled fact, and run the
-experiment above before relying on it.
+confirmed against librustzcash `main` **and now against measured behaviour**. The practical
+rule for any client: **derive an address once and reuse it** (read existing addresses back
+from `z_listaccounts`; account creation already generates the diversifier-0 address with
+every receiver type). One `p2pkh` receiver per account is safe under that rule — it is
+*repeated* derivation on unfunded accounts that is unsafe, and it fails within a handful of
+calls, not at the 10th account.
 
 > The `docker compose down -v` reset that recovered this state is recorded in the
 > maintainer's working notes, not in any repo script or doc. The subsequent run
@@ -149,27 +160,40 @@ rows. A raised limit therefore cannot retroactively unstick an already-exhausted
 
 ---
 
-## The real blocker is consensus, not the gap limit
+## The real blocker is wallet policy, not the gap limit
 
-Even setting the gap limit aside — and per the discrepancy above we cannot yet claim it is
-harmless on our pin — there is a second, independent blocker that no gap-limit change would
-lift.
+Even setting the gap limit aside, there is a second, independent blocker that no gap-limit
+change would lift. The first revision of this document attributed it to consensus; the
+measurements corrected that in two steps (full trail in
+[`regtest-funding-plan.md`](regtest-funding-plan.md)):
 
-It is a **consensus rule**. Transparent coinbase outputs may only be
-spent by a transaction with **no transparent outputs**. Zebra v5.0.0 enforces this
-(`zebra-state/src/service/check/utxo.rs`), quoting the protocol spec:
+**On mainnet it is a consensus rule.** Transparent coinbase outputs may only be spent by a
+transaction with **no transparent outputs** (protocol spec: "A transaction with one or more
+transparent inputs from coinbase transactions MUST have no transparent outputs");
+[ZIP-213](https://zips.z.cash/zip-0213) narrowed it to *transparent* coinbase but did not
+remove it, and a 100-block maturity requirement applies separately.
 
-> A transaction with one or more transparent inputs from coinbase transactions MUST have
-> no transparent outputs (i.e. `tx_out_count` MUST be 0).
+**On regtest that consensus rule is off** — Zebra hardcodes the exemption in
+`Parameters::new_regtest()` (`.with_unshielded_coinbase_spends(true)`, not configurable),
+so mature transparent coinbase is consensus-legal to spend to transparent outputs on our
+chain.
 
-[ZIP-213](https://zips.z.cash/zip-0213) narrowed this rule to apply only to *transparent*
-coinbase outputs — it did not remove it. A 100-block maturity requirement also applies.
-
-In regtest our entire balance originates as mining coinbase. So **no version of Zallet can
-distribute coinbase funds to transparent addresses directly.** The supported pipeline is:
+**But Zallet enforces the rule client-side anyway, on every version.** Measured on beta.1:
+209 mature coinbase UTXOs on the sending account, and every `from` form is refused with
+"Insufficient balance (have 0)" — the proposal engine excludes transparent coinbase from
+transparent-output proposals regardless of network. For an exchange simulation this is
+arguably the *right* behaviour to exercise (mainnet has the consensus rule), but it means:
 
 ```
 mine → wait 100 blocks (maturity) → z_shieldcoinbase → z_sendmany from the shielded balance
+```
+
+or, cheaper on regtest — skip transparent coinbase entirely (measured 12/12 in
+`scripts/experiments/fanout-probe.sh`, and directly spendable with no maturity and no
+shielding step when NU6.2 is active):
+
+```
+mine to the hot wallet's ORCHARD receiver → z_sendmany fan-out to per-account t-receivers
 ```
 
 `z_shieldcoinbase` first appears in Zallet `v0.1.0-alpha.4`; our pin is `alpha.3`, which
@@ -180,12 +204,14 @@ Separately, `z_sendmany` on our pin could **never** select a transparent input: 
 `v0.1.0-beta.1` changelog it "passed a shielded-only spend policy to the proposal builder."
 That is the true root cause of the failure recorded in
 [`zallet-transparent-spending-bug.md`](zallet-transparent-spending-bug.md), and it is fixed
-in beta.1.
+in beta.1 — confirmed by measurement: on beta.1 a sink account spent its (non-coinbase)
+transparent UTXO with a bare t-addr `from` (fan-out probe step 12).
 
-Also relevant before designing t→t payouts:
-[zallet#644](https://github.com/zcash/zallet/issues/644) (open) — even on beta.1, gathering
-a wallet's own transparent funds across multiple addresses in a single transaction requires
-the `legacy_pool_seed_fingerprint` legacy-pool workaround.
+Also relevant for t→t payouts, now measured: a **UA `from` draws shielded funds only**
+([zallet#644](https://github.com/zcash/zallet/issues/644), by design), and a bare t-addr
+`from` draws that address's own UTXOs — sufficient for per-account spending, so the
+`legacy_pool_seed_fingerprint` workaround is only needed to *gather across* multiple
+t-addrs in one transaction.
 
 ---
 
@@ -279,34 +305,44 @@ Draft — for the Foundation to forward or file upstream if it agrees.
    set — the three have different remedies. See
    [librustzcash#2594](https://github.com/zcash/librustzcash/issues/2594).
 
+5. **Give `z_getaddressforaccount` a read-only sibling.** The RPC always *derives*, at the
+   next Sapling-valid diversifier index — so a client that calls it to "get the address"
+   walks the transparent gap window in jumps and exhausts an unfunded account within a few
+   calls (measured; this was our June failure). The workaround is scraping
+   `z_listaccounts`' `addresses` array. An explicit "return the existing address at the
+   lowest (or a given) diversifier index" API — or documenting the derive-on-every-call
+   semantics prominently — would remove the footgun.
+
 ---
 
 ## Implications for this simulator
 
-1. The orchard-only derivation in `provisioner.rs` is retained because on our `alpha.3` pin
-   the funding path to a transparent recipient does not exist at all (no
-   `z_shieldcoinbase`, and `z_sendmany` cannot select transparent inputs). Whether the gap
-   limit would *additionally* obstruct per-account `p2pkh` receivers is unresolved — see
-   [the discrepancy](#the-discrepancy).
+1. The orchard-only derivation in `provisioner.rs` is retained for now: on the `alpha.3`
+   pin the funding path to a transparent recipient does not exist (no `z_shieldcoinbase`,
+   and `z_sendmany` cannot select transparent inputs). The gap-limit question is resolved:
+   per-account `p2pkh` receivers are safe **if derived once and reused** — the planned
+   replacement is `funding::resolve_account`, which reads the account's creation-time
+   address instead of deriving.
 2. TToT/ZToT "transparent" recipients currently settle in the **shielded** pool, so pool
    attribution for those flows is optimistic. `provisioner.rs` stores the *same*
    orchard-only UA string for both the `Transparent` and `Orchard` address entries; the
    `KNOWN LIMITATION` annotation is on the `Transparent` entry, with a cross-reference from
    the derivation site.
-3. True TToT/ZToT fidelity requires a Zallet bump to **`v0.1.0-beta.1`** plus a
-   `z_shieldcoinbase` step in `setup()` after warmup, and sending to the UA's *transparent
-   receiver* rather than the UA itself (a `z_sendmany` to a UA with both receivers will
-   prefer the shielded one). Neither `z_shieldcoinbase` nor `z_listunifiedreceivers` has an
-   RPC wrapper in `src/rpc/mod.rs` yet — `z_listunifiedreceivers` appears only in the
-   backend-routing table. `alpha.4` broke the wallet database format, so this needs a fresh
-   datadir. Tracked separately from this document.
+3. True TToT/ZToT fidelity requires the beta.1 override stack (see
+   [`regtest-funding-plan.md`](regtest-funding-plan.md) — Zebra ≥ 6.0.0 is required by
+   beta.1, and a fresh datadir by alpha.4's DB format break), and sending to the UA's
+   *transparent receiver* rather than the UA itself (paying a UA settles shielded). The
+   `z_shieldcoinbase` / `z_listunifiedreceivers` / policy-aware `z_sendmany` wrappers now
+   exist in `src/rpc/mod.rs`, and `src/scenarios/runner/funding.rs` implements the fan-out;
+   wiring it into the runner is the next PR.
 4. **Latent address accumulation.** Two call sites still omit `diversifier_index`, so they
    mint a new address on every call: `provisioner.rs` (once per account, at provisioning)
    and `src/scenarios/exchange.rs` in `run_deposit` (once per **deposit intent**, i.e.
    repeatedly on the same account during a run). Both request `["orchard"]` only, so
-   neither should consume a transparent index today — but if `p2pkh` is added to either
-   without also pinning a diversifier index, they will exhaust the transparent window
-   quickly. Fix the `exchange.rs` call site as part of any such change.
+   neither consumes a transparent index today — but the measured derivation-jump behaviour
+   makes the failure mode concrete: adding `p2pkh` to either call site would exhaust the
+   account's transparent window within a few calls, not after ten. Both sites should move
+   to read-and-reuse (`funding::resolve_account`) rather than derive.
 
 ---
 
@@ -317,6 +353,8 @@ Draft — for the Foundation to forward or file upstream if it agrees.
 - [`zcash_client_sqlite::WalletDb`](https://docs.rs/zcash_client_sqlite/latest/zcash_client_sqlite/struct.WalletDb.html) — `with_gap_limits`
 - [Zallet CHANGELOG @ v0.1.0-beta.1](https://raw.githubusercontent.com/zcash/zallet/v0.1.0-beta.1/CHANGELOG.md) — transparent spend fix; coinbase exclusion
 - [ZIP-213: Shielded Coinbase](https://zips.z.cash/zip-0213)
+- [`scripts/experiments/fanout-probe.sh`](../scripts/experiments/fanout-probe.sh) — the measurements resolving the discrepancy (12/12 on the beta.1 override stack)
+- [`docs/regtest-funding-plan.md`](regtest-funding-plan.md) — full measured funding pipeline and override-stack rationale
 - [Zcash Protocol Specification — Transaction Consensus Rules](https://zips.z.cash/protocol/protocol.pdf#txnconsensus)
 - [zallet#637](https://github.com/zcash/zallet/issues/637) — gap limit exhausted on zcashd migration
 - [zallet#638](https://github.com/zcash/zallet/pull/638) — configurable gap limits (closed unmerged)
