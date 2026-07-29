@@ -223,18 +223,29 @@ fn emit(
 
 /// Simulate an inbound deposit for a Zallet account in regtest.
 ///
-/// Funds are sent from `from_account` (the simulator's pre-funded hot wallet or
-/// miner account) to the Unified Address derived for `zallet_uuid`. After the
-/// ZK async operation completes, `required_confirmations` regtest blocks are
-/// mined and the deposit is credited.
+/// Funds are sent from `from_account` to `deposit_address`. After the ZK async
+/// operation completes, `required_confirmations` regtest blocks are mined and
+/// the deposit is credited.
+///
+/// `deposit_address` is the recipient account's stored, creation-time address —
+/// deliberately NOT derived here. Deriving per deposit intent mints a new
+/// address on every call, and on an account with no funded address the
+/// transparent gap window (indices 0..9) is exhausted within a few derivations
+/// (docs/zallet-transparent-gap-limit.md).
+///
+/// `privacy_policy` must match the pools involved: `FullPrivacy` for a shielded
+/// source paying a UA, `AllowRevealedSenders` for a transparent source paying a
+/// UA. The `from` form determines the source pool: a UA draws shielded funds
+/// only; a bare t-addr draws that address's transparent UTXOs.
 ///
 /// Emits `deposit_confirmation_time_ms` to the metrics recorder.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_deposit(
     rpc: &RpcClient,
     account_id: &str,
-    zallet_uuid: &str,
+    deposit_address: &str,
     from_account: &str,
+    privacy_policy: &str,
     amount_zatoshis: u64,
     required_confirmations: u64,
     run_id: &str,
@@ -243,12 +254,7 @@ pub async fn run_deposit(
 ) -> Result<Deposit, ExchangeError> {
     let start = Instant::now();
 
-    // Step 1: derive the deposit address for this account.
-    let ua = rpc
-        .z_get_address_for_account(zallet_uuid, &["orchard"], None)
-        .await
-        .map_err(ExchangeError::Rpc)?;
-    let deposit_address = ua.address;
+    let deposit_address = deposit_address.to_string();
 
     let mut deposit = Deposit {
         deposit_id: Uuid::new_v4().to_string(),
@@ -263,18 +269,18 @@ pub async fn run_deposit(
         credited_at: None,
     };
 
-    // Step 2: send funds from the hot wallet to the deposit address.
+    // Send funds from the source to the deposit address.
     let recipients = [Recipient {
         address: deposit_address.clone(),
         amount: zat_to_zec(amount_zatoshis),
         memo: None,
     }];
     let op_id = rpc
-        .z_send_many(from_account, &recipients)
+        .z_send_many_with_policy(from_account, &recipients, privacy_policy)
         .await
         .map_err(ExchangeError::Rpc)?;
 
-    // Step 3: wait for ZK proving to complete and extract the txid.
+    // Wait for ZK proving to complete and extract the txid.
     let op = poll_operation_until_complete(rpc, &op_id, polling).await?;
     let txid = op
         .txid()
@@ -283,11 +289,11 @@ pub async fn run_deposit(
         })?
         .to_string();
 
-    // Step 4: record the txid and mark the deposit as detected.
+    // Record the txid and mark the deposit as detected.
     deposit.txid = Some(txid.clone());
     deposit.status = DepositStatus::Detected;
 
-    // Step 5: wait for the background miner to include the transaction.
+    // Wait for the background miner to include the transaction.
     // `getaddresstxids` is a transparent-only Zebra API and rejects Unified
     // Addresses; `get_raw_transaction` works for all pool types and serves as
     // the on-chain presence check.
@@ -317,12 +323,19 @@ pub async fn run_deposit(
 /// `z_send_many`. Mines one regtest block after the operation proves, then waits
 /// for confirmation. Emits `withdrawal_proving_time_ms` and
 /// `withdrawal_broadcast_latency_ms` to the metrics recorder.
+///
+/// `privacy_policy` must match the pools involved: `AllowFullyTransparent` for
+/// a t-addr `from` paying a t-addr, `AllowRevealedRecipients` for a UA
+/// (shielded) `from` paying a t-addr. The `from` form determines the source
+/// pool: a UA draws shielded funds only; a bare t-addr draws that address's
+/// transparent UTXOs.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_withdrawal(
     rpc: &RpcClient,
     account_id: &str,
     from_account: &str,
     destination_address: &str,
+    privacy_policy: &str,
     amount_zatoshis: u64,
     intent_id: Option<&str>,
     run_id: &str,
@@ -353,7 +366,7 @@ pub async fn run_withdrawal(
     // Measure proving time from z_send_many call to operation completion.
     let prove_start = Instant::now();
     let op_id = rpc
-        .z_send_many(from_account, &recipients)
+        .z_send_many_with_policy(from_account, &recipients, privacy_policy)
         .await
         .map_err(ExchangeError::Rpc)?;
 
@@ -1002,8 +1015,9 @@ mod tests {
         let deposit = run_deposit(
             &rpc(&server.uri()),
             "acc-1",
-            "uuid-1",
-            "hot-wallet-uuid",
+            "uregtest1depositaddr",
+            "hot-wallet-ua",
+            "FullPrivacy",
             1_000_000,
             3,
             "run-1",
@@ -1015,7 +1029,7 @@ mod tests {
 
         assert_eq!(deposit.status, DepositStatus::Credited);
         assert_eq!(deposit.txid.as_deref(), Some("deptxid"));
-        assert_eq!(deposit.deposit_address, "u1depositaddr");
+        assert_eq!(deposit.deposit_address, "uregtest1depositaddr");
         assert_eq!(deposit.amount_zatoshis, 1_000_000);
         assert_eq!(deposit.required_confirmations, 3);
         assert!(deposit.credited_at.is_some());
@@ -1069,8 +1083,9 @@ mod tests {
         let err = run_deposit(
             &rpc(&server.uri()),
             "acc-1",
-            "uuid-1",
-            "hot-wallet-uuid",
+            "uregtest1depositaddr",
+            "hot-wallet-ua",
+            "FullPrivacy",
             999_999_999_999,
             3,
             "run-1",
@@ -1146,6 +1161,7 @@ mod tests {
             "acc-1",
             "from-uuid",
             "t1destaddr",
+            "AllowFullyTransparent",
             500_000,
             Some("intent-1"),
             "run-1",
@@ -1204,6 +1220,7 @@ mod tests {
             "acc-1",
             "from-uuid",
             "t1dest",
+            "AllowFullyTransparent",
             100,
             None,
             "run-1",
@@ -1281,6 +1298,7 @@ mod tests {
             "acc-1",
             "from-uuid",
             "t1dest",
+            "AllowFullyTransparent",
             100,
             None,
             "run-1",

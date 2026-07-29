@@ -11,6 +11,7 @@ use crate::metrics::{
     generate_summary, write_manifest, JsonlRecorder, MetricsRecorder, RunDir, RunManifest,
 };
 use crate::rpc::{RpcClient, RpcError};
+use crate::scenarios::runner::funding::{self, FundedAccount, ANCHOR_CONFIRMATIONS};
 use crate::scenarios::runner::provisioner::{provision, ProvisionedPopulation};
 use crate::scenarios::runner::RunOptions;
 use crate::scenarios::runner::RunnerError;
@@ -69,37 +70,47 @@ pub async fn setup(
     };
     let rpc = Arc::new(rpc);
 
-    // 4. Ensure the hot wallet account exists in Zallet BEFORE mining warmup
-    //    blocks. Zallet tracks coinbase payments by scanning blocks for known
-    //    account addresses. If the account is only created after mining, Zallet
-    //    sets a birthday at the current tip and misses all prior coinbase outputs,
-    //    causing the warmup balance check to see 0 ZEC.
-    let hot_wallet_uuid = match opts.hot_wallet_uuid.clone() {
-        Some(uuid) => uuid,
-        None => {
-            // Find the account named "hot_wallet" created by init-regtest-fresh.sh.
-            // Do NOT take the first account from z_listaccounts: Zallet returns
-            // accounts sorted by UUID (not creation order), so synthetic accounts
-            // from earlier test runs appear first and have 0 balance.
-            let existing = rpc
-                .z_list_accounts()
-                .await
-                .map_err(|e| RunnerError::Setup(format!("z_list_accounts failed: {e}")))?;
-            if let Some(hw) = existing
-                .into_iter()
-                .find(|a| a.name.as_deref() == Some("hot_wallet"))
-            {
-                hw.account
-            } else {
-                // Fresh volumes with no named account: create one now.
-                // warmup blocks will fund it via the ZEBRA_MINING__MINER_ADDRESS.
-                rpc.z_get_new_account("hot_wallet")
-                    .await
-                    .map_err(|e| RunnerError::Setup(format!("z_get_new_account failed: {e}")))?
-                    .account
+    // 4. Resolve the hot wallet account BEFORE mining warmup blocks. Zallet
+    //    tracks coinbase payments by scanning blocks for known account
+    //    addresses; if the account were only created after mining, Zallet would
+    //    set its birthday at the current tip and miss all prior coinbase.
+    //
+    //    funding::resolve_account reads the account's creation-time address
+    //    instead of deriving a new one — deriving here would both hand out an
+    //    address that is NOT the one regtest-miner-setup.sh pointed Zebra's
+    //    miner_address at, and walk the transparent gap window (see
+    //    docs/zallet-transparent-gap-limit.md).
+    //    This is the FIRST Zallet call after stack start, so it retries
+    //    transient failures: rpc-router can still be restarting (waiting on
+    //    Zallet's rpc.discover) in the seconds after wait_until_ready()
+    //    returns, which surfaces as transport errors or as unparseable
+    //    (router-error) response bodies.
+    let hot_wallet = {
+        let mut attempts = 0u32;
+        loop {
+            attempts += 1;
+            let resolved = match opts.hot_wallet_uuid.as_deref() {
+                Some(uuid) => funding::resolve_account_by_uuid(&rpc, uuid).await,
+                None => funding::resolve_account(&rpc, "hot_wallet").await,
+            };
+            match resolved {
+                Ok(hw) => break hw,
+                Err(funding::FundingError::Rpc {
+                    source: RpcError::Transport(_) | RpcError::Parse(_),
+                    ..
+                }) if attempts < 12 => {
+                    sleep(Duration::from_secs(5)).await;
+                }
+                Err(e) => {
+                    let _ = stack.stop().await;
+                    return Err(RunnerError::Setup(format!(
+                        "failed to resolve hot wallet: {e}"
+                    )));
+                }
             }
         }
     };
+    let hot_wallet_uuid = hot_wallet.uuid.clone();
 
     // 5. Warmup: mine blocks before provisioning. The hot wallet account was
     //    created above so Zallet will credit coinbase outputs as blocks arrive.
@@ -126,33 +137,26 @@ pub async fn setup(
         }
     };
 
-    // 7. Retrieve a hot wallet UA to use as the `from` parameter in z_sendmany.
-    //    A UA source avoids the "legacy account is currently unsupported for
-    //    spending from" error that a bare t-addr or ANY_TADDR produces.
-    //
-    //    Both the receiver set and the diversifier index are left to Zallet,
-    //    which is not merely a preference: creating an account already generates
-    //    its diversifier-0 address with *every* receiver type, so asking for a
-    //    narrower set at index 0 fails outright with "address at diversifier
-    //    index 0 was already generated with different receiver types". Pinning
-    //    index 0 also cannot yield a Sapling receiver, because only about half
-    //    of all indices have a valid Sapling diversifier.
-    //
-    //    Which diversifier we get does not affect funding: z_sendmany selects
-    //    inputs per *account*, not per address, so any UA of the account can
-    //    spend coinbase paid to any of its addresses.
-    let hot_wallet_address = match rpc
-        .z_get_address_for_account(&hot_wallet_uuid, &["orchard", "p2pkh"], None)
-        .await
-    {
-        Ok(ua) => ua.address,
-        Err(e) => {
-            let _ = stack.stop().await;
-            return Err(RunnerError::Setup(format!(
-                "failed to get hot wallet address: {e}"
-            )));
-        }
-    };
+    // 7. Fund the active accounts from the hot wallet, in both pools, with one
+    //    fan-out transaction. Without this, every intent whose SOURCE is a
+    //    synthetic account (all four flow types after the per-flow rework in
+    //    dispatch.rs) fails with "Insufficient balance" — the exact 0%-confirmed
+    //    failure mode the measured funding pipeline exists to prevent. This is
+    //    also the real spendability proof for the warmup coinbase: the send
+    //    retries while the wallet catches up, and fails loudly if the hot
+    //    wallet's funds cannot actually be spent.
+    if let Err(e) = fund_active_accounts(&rpc, scenario, &hot_wallet, &provisioned).await {
+        let _ = stack.stop().await;
+        return Err(RunnerError::Setup(format!(
+            "failed to fund synthetic accounts: {e}"
+        )));
+    }
+
+    // 8. The `from` for hot-wallet-sourced z_sendmany calls is the account's
+    //    creation-time UA, resolved (not derived) in step 4. A UA source draws
+    //    the account's shielded funds, which is what the hot wallet holds after
+    //    warmup (orchard coinbase) or shielding (transparent coinbase).
+    let hot_wallet_address = hot_wallet.address.clone();
 
     Ok(SetupState {
         stack,
@@ -161,6 +165,136 @@ pub async fn setup(
         hot_wallet_uuid,
         hot_wallet_address,
     })
+}
+
+// ── mining ────────────────────────────────────────────────────────────────────
+
+/// Blocks per `generate` call in [`mine_blocks`]. With an Orchard (shielded)
+/// `miner_address`, every block carries a halo2 coinbase proof — measured at
+/// ~2.2 s per block on an emulated (linux/amd64-on-aarch64) Zebra — so a chunk
+/// must fit comfortably inside the RPC client's 30 s HTTP timeout. 5 blocks
+/// ≈ 11 s worst-case. Transparent-coinbase chunks are near-instant either way.
+const MINE_CHUNK_BLOCKS: u32 = 5;
+
+/// Mine `total` blocks in chunks of [`MINE_CHUNK_BLOCKS`].
+///
+/// A single `generate(total)` call cannot work for a large `total` with a
+/// shielded miner address: Zebra keeps proving and submitting blocks
+/// server-side while the HTTP request times out client-side, the retry
+/// re-issues the full request, and the chain over-mines while the caller only
+/// ever sees transport errors (measured: 188 blocks accepted server-side while
+/// warmup "failed"). Chunking keeps every call well inside the timeout.
+///
+/// Transport errors are retried a few times per chunk: right after stack
+/// startup the rpc-router can still be restarting, and an emulated prover can
+/// occasionally push a chunk past the deadline.
+async fn mine_blocks(rpc: &RpcClient, total: u32) -> Result<(), RunnerError> {
+    let mut remaining = total;
+    while remaining > 0 {
+        let chunk = remaining.min(MINE_CHUNK_BLOCKS);
+        let mut attempts = 0u32;
+        loop {
+            attempts += 1;
+            match rpc.generate(chunk).await {
+                Ok(_) => break,
+                Err(RpcError::Transport(_)) if attempts < 12 => {
+                    sleep(Duration::from_secs(5)).await;
+                }
+                Err(e) => {
+                    return Err(RunnerError::Setup(format!(
+                        "generate({chunk}) failed with {} of {} blocks left: {e}",
+                        remaining, total
+                    )))
+                }
+            }
+        }
+        remaining -= chunk;
+    }
+    Ok(())
+}
+
+// ── funding ───────────────────────────────────────────────────────────────────
+
+/// Fund every ACTIVE synthetic account from the hot wallet, sized to the
+/// scenario's expected spend, then mine the confirmations that make the funds
+/// spendable before the load phase begins.
+async fn fund_active_accounts(
+    rpc: &Arc<RpcClient>,
+    scenario: &ScenarioConfig,
+    hot_wallet: &FundedAccount,
+    provisioned: &ProvisionedPopulation,
+) -> Result<(), RunnerError> {
+    let active_ids = &provisioned.population.active_account_ids;
+    if active_ids.is_empty() {
+        return Ok(());
+    }
+
+    // Per-account budget: the run issues ~tps × duration intents spread over
+    // the active accounts, each at most `max_zatoshis`, plus ZIP-317 fees.
+    // Double the per-intent expectation for headroom (an account can be picked
+    // more often than the mean).
+    //
+    // The transparent side is COUNT-based, not just value-based: a transparent
+    // spend consumes its whole UTXO and its change returns to the account's
+    // shielded pool, so each expected transparent intent needs its own UTXO
+    // (see FundingPlan). The shielded side is one output; shielded change
+    // stays in the account's own pool.
+    // All amount arithmetic is in ZATOSHIS: float multiplication produces
+    // values with more than 8 decimals (0.1 × 1.5 = 0.15000000000000002),
+    // which Zallet rejects with `-3 Invalid amount`.
+    let expected_intents =
+        (scenario.load_target_tps * scenario.load_duration_seconds as f64).ceil();
+    let per_account_intents = ((expected_intents / active_ids.len() as f64).ceil() as u64).max(1);
+    let max_zat = scenario.amounts.max_zatoshis;
+    // Each UTXO covers one intent at the maximum amount plus fee headroom.
+    let transparent_zat_each = (max_zat + max_zat / 2).max(1_000_000);
+    let shielded_zat = (per_account_intents * max_zat * 2).max(100_000_000);
+    let plan = funding::FundingPlan {
+        transparent_outputs: (per_account_intents * 2) as u32,
+        transparent_zec_each: funding::zat_to_zec(transparent_zat_each),
+        shielded_zec: funding::zat_to_zec(shielded_zat),
+    };
+
+    let sinks: Vec<FundedAccount> = active_ids
+        .iter()
+        .map(|account_id| {
+            let uuid = provisioned
+                .zallet_uuids
+                .get(account_id)
+                .cloned()
+                .ok_or_else(|| {
+                    RunnerError::Setup(format!("no Zallet UUID for active account {account_id}"))
+                })?;
+            let address = provisioned
+                .zallet_addresses
+                .get(account_id)
+                .cloned()
+                .ok_or_else(|| {
+                    RunnerError::Setup(format!("no address for active account {account_id}"))
+                })?;
+            let transparent_receiver = provisioned
+                .zallet_transparent_receivers
+                .get(account_id)
+                .cloned();
+            Ok(FundedAccount {
+                uuid,
+                address,
+                transparent_receiver,
+                orchard_receiver: None,
+            })
+        })
+        .collect::<Result<_, RunnerError>>()?;
+
+    funding::fund_accounts(rpc, hot_wallet, &sinks, plan)
+        .await
+        .map_err(|e| RunnerError::Setup(e.to_string()))?;
+
+    // The fan-out outputs need anchor confirmations before the accounts can
+    // spend them; mine those now so the first intents of the load phase do not
+    // all stall (the background miner only advances one block per tick).
+    mine_blocks(rpc, ANCHOR_CONFIRMATIONS).await?;
+
+    Ok(())
 }
 
 // ── warmup ────────────────────────────────────────────────────────────────────
@@ -172,21 +306,11 @@ pub async fn warmup(
     run_id: &str,
     metrics: Arc<dyn MetricsRecorder>,
 ) -> Result<(), RunnerError> {
-    // Mine warmup blocks. Retry on transport errors: rpc-router can still be
-    // restarting (waiting on Zallet's rpc.discover) in the seconds after
-    // wait_until_ready() returns. generate() routes to Zebra and will succeed
-    // as soon as rpc-router stabilizes.
-    let mut attempts = 0u32;
-    loop {
-        attempts += 1;
-        match rpc.generate(scenario.warmup_blocks as u32).await {
-            Ok(_) => break,
-            Err(RpcError::Transport(_)) if attempts < 12 => {
-                sleep(Duration::from_secs(5)).await;
-            }
-            Err(e) => return Err(RunnerError::Warmup(format!("generate failed: {e}"))),
-        }
-    }
+    // Mine warmup blocks in chunks — see mine_blocks for why a single
+    // generate(warmup_blocks) call cannot work with shielded coinbase.
+    mine_blocks(rpc, scenario.warmup_blocks as u32)
+        .await
+        .map_err(|e| RunnerError::Warmup(format!("warmup mining failed: {e}")))?;
 
     // Confirm chain is advancing.
     rpc.get_blockchain_info()
@@ -234,28 +358,44 @@ pub async fn warmup(
     // 662.50 ZEC in 105-confirmation coinbase UTXOs, visible to z_listunspent and
     // owned by the sending account, while every z_sendmany still answered
     // "Insufficient balance (have 0)". Treating receipt as spendability is how a
-    // 0%-confirmation run came to look healthy, so require maturity too.
+    // 0%-confirmation run came to look healthy, so also require an output old
+    // enough to be selectable. The threshold is pool-aware: the 100-block
+    // coinbase maturity applies to TRANSPARENT coinbase only (ZIP 213); shielded
+    // coinbase — the preferred warmup route, mined to the hot wallet's Orchard
+    // receiver — only needs the ~10-confirmation anchor policy.
     //
-    // This still cannot prove spendability — only a successful proposal does, and
-    // Zallet exposes no dry-run — so the load phase remains the real check. What
-    // this rules out is the specific false positive of counting immature coinbase.
-    // See docs/regtest-funding-plan.md.
-    let utxos = rpc
-        .z_list_unspent(1, None)
-        .await
-        .map_err(|e| RunnerError::Warmup(format!("z_listunspent failed: {e}")))?;
-    let mature = utxos
-        .iter()
-        .filter(|u| u.confirmations >= COINBASE_MATURITY_BLOCKS)
-        .count();
-    if mature == 0 {
-        return Err(RunnerError::Warmup(format!(
-            "hot wallet holds a balance but no output has reached the {COINBASE_MATURITY_BLOCKS}-block \
-             regtest coinbase maturity window ({} unspent output(s), highest confirmations {}) — \
-             raise warmup_blocks",
-            utxos.len(),
-            utxos.iter().map(|u| u.confirmations).max().unwrap_or(0),
-        )));
+    // The definitive spendability proof is the account fan-out that follows in
+    // setup(): it retries while the wallet catches up and fails loudly if the
+    // funds cannot actually be spent. That is also why a z_listunspent failure
+    // here degrades to a log instead of failing setup — one shielded coinbase
+    // note breaks z_listunspent wallet-wide on beta.1 (`get_memo` UTF-8, an
+    // upstream defect recorded in docs/regtest-funding-plan.md), which would
+    // otherwise make the healthiest warmup configuration fail this check.
+    match rpc.z_list_unspent(1, None).await {
+        Ok(utxos) => {
+            let spendable_age = |u: &crate::rpc::UnspentNote| match u.pool.as_deref() {
+                // Missing pool defaults to the stricter transparent reading.
+                Some("transparent") | None => u.confirmations >= COINBASE_MATURITY_BLOCKS,
+                Some(_) => u.confirmations >= ANCHOR_CONFIRMATIONS as u64,
+            };
+            if !utxos.iter().any(spendable_age) {
+                return Err(RunnerError::Warmup(format!(
+                    "hot wallet holds a balance but no output is old enough to spend \
+                     (transparent coinbase needs {COINBASE_MATURITY_BLOCKS} confirmations, \
+                     shielded needs {ANCHOR_CONFIRMATIONS}; {} unspent output(s), highest \
+                     confirmations {}) — raise warmup_blocks",
+                    utxos.len(),
+                    utxos.iter().map(|u| u.confirmations).max().unwrap_or(0),
+                )));
+            }
+        }
+        Err(e) => {
+            eprintln!(
+                "warmup: z_listunspent failed ({e}); skipping the output-age check — \
+                 known Zallet beta.1 defect when shielded coinbase notes exist \
+                 (WalletDb::get_memo UTF-8). The account fan-out will prove spendability."
+            );
+        }
     }
 
     // Record warmup metric.

@@ -351,5 +351,47 @@ Per the standing decision, drafted here and **not** filed:
 | 1 | Probe scripts (`funding-probe.sh`, `fanout-probe.sh`) | done — this document's evidence |
 | 2 | beta.1 runtime (release-tarball image, `scripts/dev/zallet-release-image/`) | done — `z3sim/zallet:v0.1.0-beta.1` |
 | 3 | Stack bump (Zebra 6.0.0, Zaino 0.6.0, NU6.2 config) + fresh datadir | done — recorded in `z3-commits.lock` overrides |
-| 4 | Common funding helper (`src/scenarios/runner/funding.rs`) + RPC wrappers | done — unit-tested; wiring into `lifecycle.rs`/provisioner pending |
-| 5 | Wire the runner: orchard-coinbase warmup, fan-out provisioning, per-flow `from` forms, confirmation-rate assertion | next |
+| 4 | Common funding helper (`src/scenarios/runner/funding.rs`) + RPC wrappers | done — unit-tested |
+| 5 | Wire the runner: orchard-coinbase warmup, fan-out provisioning, per-flow `from` forms, confirmation-rate assertion | done — see below |
+
+### How the runner is wired (step 5)
+
+- **Warmup** mines to the hot wallet's **Orchard receiver** (written into
+  `ZEBRA_MINING__MINER_ADDRESS` by `scripts/dev/regtest-miner-setup.sh`); the spendability
+  check is pool-aware (100-conf maturity for transparent coinbase, ~10-conf anchor for
+  shielded) and degrades to a log when `z_listunspent` hits the beta.1 memo defect.
+- **Provisioning never derives**: accounts are created, then their creation-time UAs are
+  read back in one `z_listaccounts` call and each UA's p2pkh receiver extracted. The
+  population's transparent address entries carry the REAL t-addrs, so intent generation
+  resolves genuine per-pool sender/recipient addresses.
+- **Funding**: one fan-out transaction from the hot wallet funds every active account in
+  both pools. The transparent side is COUNT-based — a transparent spend consumes its whole
+  UTXO and change returns to the account's *shielded* pool, so each expected transparent
+  intent gets its own UTXO (`FundingPlan`).
+- **Per-flow `from` forms** in dispatch: TToT = sender's t-addr → t-addr
+  (`AllowFullyTransparent`); TToZ = sender's t-addr → recipient UA (`AllowRevealedSenders`);
+  ZToT = sweep sender UA → hot wallet, then hot wallet UA → t-addr
+  (`AllowRevealedRecipients`); ZToZ = sender UA → recipient UA (`FullPrivacy`).
+- **The integration test asserts a minimum confirmation rate** (>0 confirmed and ≥50%),
+  closing the "0/60 confirmed looked healthy" hole for good.
+
+Validated end to end on a fresh datadir (2026-07-29): the smoke scenario confirms
+**59/60 intents (98.3%)** on the override stack — the single failure is same-account
+UTXO contention between concurrent intents, itself a finding. Five more constraints were
+measured while wiring (each one produced a distinct live failure first):
+
+1. **`generate` must be chunked** (≤5 blocks/call here): with an Orchard `miner_address`
+   every block carries a ~2 s halo2 coinbase proof (emulated host), so one
+   `generate(110)` call outlives the 30 s HTTP timeout while Zebra keeps mining
+   server-side — the client sees only transport errors and the chain over-mines.
+2. **`z_sendmany` rejects duplicate recipient addresses in one transaction**
+   (`-8 duplicated recipient address`), so K UTXOs at one address take K sequential
+   fan-out rounds.
+3. **A transparent spend consumes its whole UTXO and the change returns to the account's
+   shielded pool**, so transparent funding is COUNT-based: one UTXO per expected
+   transparent intent.
+4. **ZEC amounts must be computed in integer zatoshis**: `0.1_f64 × 1.5 =
+   0.15000000000000002`, which Zallet rejects (`-3 Invalid amount`, >8 decimals).
+5. **Zebra ≥ 6.0.0 requires `getrawtransaction`'s verbosity as a NUMBER** (v5 tolerated a
+   JSON boolean; v6 answers `-32602 Invalid params`), which silently broke every
+   confirmation wait — sends succeeded while all 60 intents were reported failed.
