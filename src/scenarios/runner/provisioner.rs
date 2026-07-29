@@ -119,23 +119,31 @@ pub async fn provision(
             let _permit = permit;
             let account_info = rpc_clone.z_get_new_account(&account_id).await?;
             let zallet_uuid = account_info.account.clone();
-            // Orchard-only, deliberately. The earlier comment here justified this by
-            // a wallet-global transparent gap counter; librustzcash source says the
-            // window is per (account, key scope), but a recorded run of ours hit the
-            // limit while deriving on fresh accounts, so the true behaviour on our
-            // pin is unresolved. Either way it is not the binding constraint.
+            // Orchard-only, deliberately, for two measured reasons (both in
+            // docs/regtest-funding-plan.md; gap-limit analysis in
+            // docs/zallet-transparent-gap-limit.md):
             //
-            // The sufficient reason is that on our pinned Zallet (v0.1.0-alpha.3) a
-            // transparent recipient cannot be funded at all: consensus forbids
-            // spending transparent coinbase to any transparent output, alpha.3 has
-            // no z_shieldcoinbase to convert it, and its z_sendmany passes a
-            // shielded-only spend policy so no transparent input is ever selected.
-            // Adding a p2pkh receiver would produce addresses that cannot receive.
+            // 1. This derive call should not exist at all in its current form —
+            //    account creation above already generated the diversifier-0 UA
+            //    with every receiver type, and each z_getaddressforaccount call
+            //    DERIVES a new address at the next Sapling-valid diversifier
+            //    index. On an unfunded account the transparent gap window is
+            //    indices 0..9, so repeated derives that include p2pkh exhaust it
+            //    within a few calls (ReachedGapLimit "index 10" — the June smoke
+            //    failure). Orchard-only derivation sidesteps the window; reading
+            //    the existing address (funding::resolve_account) removes the
+            //    problem entirely and is the planned replacement.
             //
-            // Lifting this needs a bump to Zallet v0.1.0-beta.1 plus a shielding
-            // step in setup(). See docs/zallet-transparent-gap-limit.md and the
-            // KNOWN LIMITATION on the AddressType::Transparent entry below.
-            let ua = rpc_clone.z_get_address_for_account(&zallet_uuid, &["orchard"], None).await?;
+            // 2. On the pinned Zallet (v0.1.0-alpha.3) a transparent recipient
+            //    could not be funded anyway: its z_sendmany passes a
+            //    shielded-only spend policy, so no input is ever selected. The
+            //    beta.1 override stack fixes the spend; the fan-out that funds
+            //    per-account transparent receivers (funding::fund_accounts) is
+            //    wired in the next PR. See the KNOWN LIMITATION on the
+            //    AddressType::Transparent entry below.
+            let ua = rpc_clone
+                .z_get_address_for_account(&zallet_uuid, &["orchard"], None)
+                .await?;
             Ok((account_id, zallet_uuid, ua.address))
         });
     }
