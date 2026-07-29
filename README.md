@@ -136,6 +136,16 @@ see [`docs/integration/pinned-commits.md`](docs/integration/pinned-commits.md).
 | Zaino | `0.4.0-rc.2` (`zingodevops/zainod:0.4.0-rc.2`) | `0cf4fd5008a7536e3495e3e377073faac1cb28f3` |
 | Zallet | `v0.1.0-alpha.3` (`electriccoinco/zallet:v0.1.0-alpha.3`) | `6fc85f68cf5ebe456160c6518255a83129e7d21c` |
 
+**Regtest override set.** The frozen Zallet pin cannot spend from any pool (its
+`z_sendmany` passes a shielded-only spend policy to the proposal builder), so no scenario
+can confirm a transaction on the pins above. Live runs use the upstream-coherent override
+set recorded in the `overrides:` section of [`z3-commits.lock`](z3-commits.lock) — Zebra
+`v6.0.0` + Zaino `0.6.0` + Zallet `v0.1.0-beta.1` (built locally by
+[`scripts/dev/zallet-release-image/build.sh`](scripts/dev/zallet-release-image/build.sh);
+upstream publishes no image past alpha.3) — applied via `Z3_*_IMAGE` variables in
+`external/z3/.env.regtest`. The full evidence trail is in
+[`docs/regtest-funding-plan.md`](docs/regtest-funding-plan.md).
+
 ## Development commands
 
 ```sh
@@ -209,6 +219,7 @@ Run directories are gitignored and are not tracked by version control.
 | [`docs/rpc/method-scope.md`](docs/rpc/method-scope.md) | Confirmed method list: stress vs smoke split |
 | [`docs/rpc/proposed-method-scope.md`](docs/rpc/proposed-method-scope.md) | Proposed method list for Foundation confirmation |
 | [`docs/scenarios/scenario-design.md`](docs/scenarios/scenario-design.md) | Scenario library design |
+| [`docs/regtest-funding-plan.md`](docs/regtest-funding-plan.md) | How regtest funding works, the Zallet beta.1 bump, and the shielding step |
 
 ---
 

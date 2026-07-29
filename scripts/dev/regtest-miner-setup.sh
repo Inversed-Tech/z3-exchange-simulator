@@ -9,9 +9,26 @@
 # (z3-commits.lock) ships a static placeholder `ZEBRA_MINING__MINER_ADDRESS`
 # that no wallet owns, so coinbase is unspendable and warmup sees 0 ZEC.
 #
-# This script creates a dedicated Zallet "miner" account, derives its P2PKH
-# receiver, and writes it into `external/z3/.env.regtest` so every subsequent
-# `docker compose up -d` mines coinbase into the Zallet wallet.
+# This script points Zebra's coinbase at the **Orchard receiver** of the
+# **hot_wallet** account — the same account the scenario runner spends from — and
+# writes it into `external/z3/.env.regtest` so every subsequent
+# `docker compose up -d` mines coinbase into that account.
+#
+# Orchard (not P2PKH) because shielded coinbase is strictly better on regtest
+# (measured; see docs/regtest-funding-plan.md §4): no 100-block maturity
+# (ZIP 213 limits that rule to transparent coinbase) and no z_shieldcoinbase
+# round-trip (Zallet refuses to spend TRANSPARENT coinbase to transparent
+# outputs on every version, even though regtest consensus allows it). Requires
+# NU6.2 active in the regtest params (fixed Orchard circuit) and Zallet >=
+# v0.1.0-beta.1 — both part of the override stack in z3-commits.lock. Set
+# Z3_MINER_POOL=p2pkh to fall back to transparent coinbase mining.
+#
+# It deliberately does NOT create a separate "miner" account, which is what this
+# script and the stack's own regtest-init.sh both used to do. Coinbase landed in
+# `miner` while the runner spent from `hot_wallet`, so every send failed with
+# "Insufficient balance (have 0)" — a correct answer to the wrong question, and
+# a confound that made a genuine Zallet defect much harder to diagnose. Funding
+# the account we spend from removes a whole class of false diagnosis.
 #
 # It is a *simulator-owned* post-clone step, deliberately kept out of the Z3
 # stack repo: external/z3 is a throwaway clone pinned (and currently frozen) via
@@ -82,7 +99,7 @@ rpc() {
 
 cd "$Z3_DIR"
 
-log "==> Bringing the stack up to create the miner account..."
+log "==> Bringing the stack up to resolve the hot_wallet account..."
 $COMPOSE up -d
 
 log "   Waiting for the RPC router..."
@@ -92,15 +109,28 @@ until rpc getblockchaininfo '[]' | grep -q '"result"'; do
 done
 log "   Router is ready."
 
-log "==> Creating Zallet 'miner' account..."
-MINER_UUID="$(rpc z_getnewaccount '["miner"]' | jq -r '.result.account_uuid // .result.account')"
-[ -n "$MINER_UUID" ] && [ "$MINER_UUID" != "null" ] || { $COMPOSE down; die "failed to create miner account"; }
-log "   Miner account UUID: ${MINER_UUID}"
+# Reuse the hot_wallet account if a previous run (or the runner itself) already
+# created it, so re-running this script cannot split coinbase across two accounts.
+log "==> Resolving the Zallet 'hot_wallet' account..."
+MINER_UUID="$(rpc z_listaccounts '[]' | jq -r '.result[]? | select(.name == "hot_wallet") | .account_uuid' | head -n1)"
+if [ -n "$MINER_UUID" ]; then
+    log "   Reusing existing hot_wallet account: ${MINER_UUID}"
+else
+    MINER_UUID="$(rpc z_getnewaccount '["hot_wallet"]' | jq -r '.result.account_uuid // .result.account')"
+    log "   Created hot_wallet account: ${MINER_UUID}"
+fi
+[ -n "$MINER_UUID" ] && [ "$MINER_UUID" != "null" ] || { $COMPOSE down; die "failed to resolve or create the hot_wallet account"; }
 
-MINER_UA="$(rpc z_getaddressforaccount "[\"${MINER_UUID}\"]" | jq -r '.result.address')"
-MINER_TADDR="$(rpc z_listunifiedreceivers "[\"${MINER_UA}\"]" | jq -r '.result.p2pkh')"
-[ -n "$MINER_TADDR" ] && [ "$MINER_TADDR" != "null" ] || { $COMPOSE down; die "failed to derive transparent receiver for ${MINER_UUID}"; }
-log "   Miner T-address: ${MINER_TADDR}"
+# Read the account's EXISTING diversifier-0 address from z_listaccounts instead of
+# deriving one: every z_getaddressforaccount call derives a NEW address at the next
+# Sapling-valid diversifier index, and on an unfunded account the transparent gap
+# window is indices 0..9 — a few derivations exhaust it (ReachedGapLimit at index
+# 10). Account creation already generated the address we need.
+MINER_UA="$(rpc z_listaccounts '[]' | jq -r ".result[] | select(.account_uuid == \"${MINER_UUID}\") | .addresses | sort_by(.diversifier_index) | .[0].ua")"
+MINER_POOL="${Z3_MINER_POOL:-orchard}"
+MINER_TADDR="$(rpc z_listunifiedreceivers "[\"${MINER_UA}\"]" | jq -r ".result.${MINER_POOL}")"
+[ -n "$MINER_TADDR" ] && [ "$MINER_TADDR" != "null" ] || { $COMPOSE down; die "failed to derive ${MINER_POOL} receiver for ${MINER_UUID}"; }
+log "   hot_wallet ${MINER_POOL} receiver: ${MINER_TADDR}"
 
 # Persist so every future `docker compose up -d` uses the funded miner address.
 tmp="$(mktemp "${TMPDIR:-/tmp}/env.regtest.XXXXXX")"

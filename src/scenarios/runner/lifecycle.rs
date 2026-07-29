@@ -16,6 +16,12 @@ use crate::scenarios::runner::RunOptions;
 use crate::scenarios::runner::RunnerError;
 use crate::z3::{Z3Config, Z3Stack};
 
+/// Confirmations a coinbase output needs before it may be spent. Consensus, and
+/// identical on regtest — regtest waives the rule that transparent coinbase must
+/// be spent to shielded outputs, but not the maturity window. Mirrors
+/// `zcash_protocol`'s `COINBASE_MATURITY_BLOCKS`.
+const COINBASE_MATURITY_BLOCKS: u64 = 100;
+
 // ── SetupState ────────────────────────────────────────────────────────────────
 
 /// Everything needed to run the load phase, produced by [`setup`].
@@ -79,7 +85,10 @@ pub async fn setup(
                 .z_list_accounts()
                 .await
                 .map_err(|e| RunnerError::Setup(format!("z_list_accounts failed: {e}")))?;
-            if let Some(hw) = existing.into_iter().find(|a| a.name.as_deref() == Some("hot_wallet")) {
+            if let Some(hw) = existing
+                .into_iter()
+                .find(|a| a.name.as_deref() == Some("hot_wallet"))
+            {
                 hw.account
             } else {
                 // Fresh volumes with no named account: create one now.
@@ -117,15 +126,23 @@ pub async fn setup(
         }
     };
 
-    // 7. Retrieve the hot wallet UA at diversifier_index=0. That address was
-    //    created by init-regtest-fresh.sh with receivers [orchard, p2pkh], and
-    //    its transparent receiver is ZEBRA_MINING__MINER_ADDRESS. Passing it as
-    //    the `from` parameter in z_sendmany lets Zallet spend the transparent
-    //    coinbase inputs without triggering the "legacy account" restriction.
-    //    diversifier_index=0 is explicit so we always get the funded address,
-    //    not a newly-created one at the next available index.
+    // 7. Retrieve a hot wallet UA to use as the `from` parameter in z_sendmany.
+    //    A UA source avoids the "legacy account is currently unsupported for
+    //    spending from" error that a bare t-addr or ANY_TADDR produces.
+    //
+    //    Both the receiver set and the diversifier index are left to Zallet,
+    //    which is not merely a preference: creating an account already generates
+    //    its diversifier-0 address with *every* receiver type, so asking for a
+    //    narrower set at index 0 fails outright with "address at diversifier
+    //    index 0 was already generated with different receiver types". Pinning
+    //    index 0 also cannot yield a Sapling receiver, because only about half
+    //    of all indices have a valid Sapling diversifier.
+    //
+    //    Which diversifier we get does not affect funding: z_sendmany selects
+    //    inputs per *account*, not per address, so any UA of the account can
+    //    spend coinbase paid to any of its addresses.
     let hot_wallet_address = match rpc
-        .z_get_address_for_account(&hot_wallet_uuid, &["orchard", "p2pkh"], Some(0))
+        .z_get_address_for_account(&hot_wallet_uuid, &["orchard", "p2pkh"], None)
         .await
     {
         Ok(ua) => ua.address,
@@ -186,9 +203,9 @@ pub async fn warmup(
     // from Zaino's block cache in a background loop. Poll for up to 60 seconds
     // so the check isn't racy against Zallet's sync lag.
     //
-    // Persistent 0 balance means either Zebra's miner_address is not pointing
-    // at a Zallet account (check Z3's regtest-init.sh), or warmup_blocks is
-    // below the regtest coinbase maturity window.
+    // Persistent 0 balance means either Zebra's miner_address is not pointing at
+    // the hot_wallet account (run scripts/dev/regtest-miner-setup.sh), or
+    // warmup_blocks is below the regtest coinbase maturity window.
     let mut funded = false;
     for _ in 0..30 {
         let balance = rpc
@@ -204,12 +221,41 @@ pub async fn warmup(
     }
     if !funded {
         return Err(RunnerError::Warmup(
-            "hot wallet has 0 balance after warmup mining — verify that Z3's \
-             regtest-init.sh configured Zebra's miner_address to a Zallet-managed \
-             account, and that warmup_blocks exceeds the regtest coinbase maturity \
-             window"
+            "hot wallet has 0 balance after warmup mining — verify that Zebra's \
+             miner_address is the hot_wallet account's transparent receiver (run \
+             scripts/dev/regtest-miner-setup.sh), and that warmup_blocks exceeds \
+             the regtest coinbase maturity window"
                 .into(),
         ));
+    }
+
+    // A non-zero balance is necessary but NOT sufficient: it counts outputs the
+    // wallet has merely *received*. A measured run on Zallet v0.1.0-alpha.3 held
+    // 662.50 ZEC in 105-confirmation coinbase UTXOs, visible to z_listunspent and
+    // owned by the sending account, while every z_sendmany still answered
+    // "Insufficient balance (have 0)". Treating receipt as spendability is how a
+    // 0%-confirmation run came to look healthy, so require maturity too.
+    //
+    // This still cannot prove spendability — only a successful proposal does, and
+    // Zallet exposes no dry-run — so the load phase remains the real check. What
+    // this rules out is the specific false positive of counting immature coinbase.
+    // See docs/regtest-funding-plan.md.
+    let utxos = rpc
+        .z_list_unspent(1, None)
+        .await
+        .map_err(|e| RunnerError::Warmup(format!("z_listunspent failed: {e}")))?;
+    let mature = utxos
+        .iter()
+        .filter(|u| u.confirmations >= COINBASE_MATURITY_BLOCKS)
+        .count();
+    if mature == 0 {
+        return Err(RunnerError::Warmup(format!(
+            "hot wallet holds a balance but no output has reached the {COINBASE_MATURITY_BLOCKS}-block \
+             regtest coinbase maturity window ({} unspent output(s), highest confirmations {}) — \
+             raise warmup_blocks",
+            utxos.len(),
+            utxos.iter().map(|u| u.confirmations).max().unwrap_or(0),
+        )));
     }
 
     // Record warmup metric.
