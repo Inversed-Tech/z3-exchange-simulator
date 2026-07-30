@@ -274,10 +274,17 @@ pub struct OperationResult {
     pub error: Option<OperationError>,
 }
 
-/// One entry from `z_listunspent`. Verified against Zallet `v0.1.0-alpha.3`.
+/// One entry from `z_listunspent`. Verified against Zallet `v0.1.0-alpha.3`
+/// and `v0.1.0-beta.1`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct UnspentNote {
     pub txid: String,
+    /// Which pool holds the output: `"transparent"`, `"sapling"`, or
+    /// `"orchard"`. Optional defensively — coinbase maturity applies only to
+    /// transparent outputs, so a missing pool is treated as transparent (the
+    /// stricter reading) by consumers.
+    #[serde(default)]
+    pub pool: Option<String>,
     pub confirmations: u64,
     pub address: Option<String>,
     #[serde(rename = "account_uuid")]
@@ -734,6 +741,11 @@ impl RpcClient {
         txid: &str,
         verbose: bool,
     ) -> Result<RawTransaction, RpcError> {
+        // `verbose` is serialized as a NUMBER (0/1): Zebra ≥ 6.0.0 declares the
+        // parameter as a number and rejects a JSON boolean with -32602 "Invalid
+        // params" (v5.x tolerated the boolean). zcashd's own signature is also
+        // numeric.
+        let verbose = u8::from(verbose);
         self.call("getrawtransaction", serde_json::json!([txid, verbose]))
             .await
     }

@@ -46,6 +46,22 @@ use crate::rpc::{Recipient, RpcClient, RpcError};
 /// a 10-confirmation anchor policy).
 pub const ANCHOR_CONFIRMATIONS: u32 = 10;
 
+/// Zatoshis per ZEC, for converting scenario amounts (zatoshis) to the ZEC
+/// floats the JSON-RPC surface expects.
+pub const ZAT_PER_ZEC: f64 = 100_000_000.0;
+
+/// Convert zatoshis to a ZEC f64 with exactly 8 decimal places, via integer
+/// arithmetic. Never compute ZEC amounts with float multiplication: e.g.
+/// `0.1_f64 * 1.5` is `0.15000000000000002`, which Zallet rejects with
+/// `-3 Invalid amount` (amounts may not exceed 8 decimals).
+pub fn zat_to_zec(zatoshis: u64) -> f64 {
+    let whole = zatoshis / 100_000_000;
+    let frac = zatoshis % 100_000_000;
+    format!("{whole}.{frac:08}")
+        .parse()
+        .expect("generated ZEC decimal string is always a valid f64")
+}
+
 /// How long to keep polling an async wallet operation before giving up.
 const OPERATION_TIMEOUT: Duration = Duration::from_secs(240);
 
@@ -134,11 +150,42 @@ pub async fn resolve_account(rpc: &RpcClient, name: &str) -> Result<FundedAccoun
         }
     };
 
+    resolve_receivers(rpc, info).await
+}
+
+/// Resolve an account that is known to exist by UUID (e.g. from
+/// `RunOptions::hot_wallet_uuid`). Unlike [`resolve_account`], never creates.
+pub async fn resolve_account_by_uuid(
+    rpc: &RpcClient,
+    uuid: &str,
+) -> Result<FundedAccount, FundingError> {
+    let info = rpc
+        .z_list_accounts()
+        .await
+        .map_err(|e| FundingError::Rpc {
+            step: "z_listaccounts",
+            source: e,
+        })?
+        .into_iter()
+        .find(|a| a.account == uuid)
+        .ok_or_else(|| FundingError::Failed {
+            step: "resolve_account_by_uuid",
+            detail: format!("no account with UUID {uuid}"),
+        })?;
+    resolve_receivers(rpc, info).await
+}
+
+/// Shared tail of the resolve functions: take the account's pre-existing
+/// primary address and split out its receivers.
+pub async fn resolve_receivers(
+    rpc: &RpcClient,
+    info: crate::rpc::AccountInfo,
+) -> Result<FundedAccount, FundingError> {
     let address = info
         .primary_address()
         .ok_or_else(|| FundingError::Failed {
-            step: "resolve_account",
-            detail: format!("account {} ({name}) has no addresses", info.account),
+            step: "resolve_receivers",
+            detail: format!("account {} has no addresses", info.account),
         })?
         .to_string();
 
@@ -245,8 +292,34 @@ async fn send_with_anchor_retries(
     })
 }
 
-/// Fund `sinks` from `source` with `amount_zec` each, in one fan-out
-/// transaction paid to each sink's transparent receiver.
+/// How each sink account is funded by [`fund_accounts`].
+#[derive(Debug, Clone, Copy)]
+pub struct FundingPlan {
+    /// Number of separate transparent UTXOs to give each sink. One per
+    /// expected transparent spend: a transparent spend consumes its whole
+    /// UTXO and the change returns to the account's SHIELDED pool (the
+    /// wallet's change strategy), so an account holding a single t-UTXO can
+    /// source exactly one TToT/TToZ intent no matter how large the UTXO was.
+    pub transparent_outputs: u32,
+    /// ZEC per transparent UTXO. Must cover one intent's amount plus fee.
+    pub transparent_zec_each: f64,
+    /// ZEC paid to the sink's UA. One output suffices for any number of
+    /// shielded spends: shielded change stays in the account's own pool.
+    pub shielded_zec: f64,
+}
+
+impl FundingPlan {
+    fn per_sink_total(&self) -> f64 {
+        self.transparent_outputs as f64 * self.transparent_zec_each + self.shielded_zec
+    }
+}
+
+/// Fund `sinks` from `source` in one fan-out transaction, per `plan`.
+///
+/// Both pools matter for flow fidelity: TToT/TToZ intents spend the account's
+/// *transparent* funds (via its t-addr as `from`), while ZToT sweeps and ZToZ
+/// sends spend its *shielded* funds (via its UA as `from`). An account funded
+/// in only one pool can only source half the flow types.
 ///
 /// Precondition: coinbase has been mined to one of `source`'s receivers (the
 /// Orchard receiver, ideally — see module docs) and the wallet has had time to
@@ -261,7 +334,7 @@ pub async fn fund_accounts(
     rpc: &Arc<RpcClient>,
     source: &FundedAccount,
     sinks: &[FundedAccount],
-    amount_zec: f64,
+    plan: FundingPlan,
 ) -> Result<String, FundingError> {
     // 1. If the shielded pool is empty but transparent coinbase is present,
     //    shield it. With Orchard-coinbase mining this is a no-op.
@@ -274,7 +347,7 @@ pub async fn fund_accounts(
         })?;
     let private: f64 = balance.private.parse().unwrap_or(0.0);
     let transparent: f64 = balance.transparent.parse().unwrap_or(0.0);
-    let needed = amount_zec * sinks.len() as f64;
+    let needed = plan.per_sink_total() * sinks.len() as f64;
 
     if private < needed && transparent > 0.0 {
         let shield = rpc
@@ -286,40 +359,74 @@ pub async fn fund_accounts(
             })?;
         wait_operation(rpc, &shield.opid).await?;
         // The shielding tx itself needs anchor confirmations before the notes
-        // it created are spendable.
-        rpc.generate(ANCHOR_CONFIRMATIONS)
-            .await
-            .map_err(|e| FundingError::Rpc {
-                step: "generate",
-                source: e,
-            })?;
+        // it created are spendable. Mined in two chunks: with a shielded miner
+        // address each block carries a ~2s coinbase proof (emulated host), and
+        // one call for all 10 blocks would flirt with the 30s HTTP timeout.
+        for _ in 0..2 {
+            rpc.generate(ANCHOR_CONFIRMATIONS / 2)
+                .await
+                .map_err(|e| FundingError::Rpc {
+                    step: "generate",
+                    source: e,
+                })?;
+        }
     }
 
-    // 2. One transaction, N transparent outputs. Recipients are the extracted
-    //    p2pkh receivers so the sinks end up with genuinely transparent funds
-    //    (paying their UAs would settle shielded and TToT flows would have no
-    //    transparent inputs to spend).
-    let recipients: Vec<Recipient> = sinks
-        .iter()
-        .map(|s| {
-            s.transparent_receiver
-                .clone()
-                .ok_or_else(|| FundingError::Failed {
-                    step: "fund_accounts",
-                    detail: format!("sink account {} has no transparent receiver", s.uuid),
-                })
-                .map(|address| Recipient {
+    // 2. Fan out in rounds. Each sink needs `plan.transparent_outputs`
+    //    separate UTXOs at ONE address, but z_sendmany rejects duplicate
+    //    recipient addresses within a transaction (-8 "duplicated recipient
+    //    address", zcashd-compatible) — so each round is one transaction that
+    //    pays every sink's t-addr once, and the rounds repeat until every sink
+    //    holds the planned UTXO count. Shielded outputs ride along in the
+    //    first round (each UA appears once). Rounds run sequentially: the hot
+    //    wallet's note selection must not race itself.
+    //
+    //    Transparent value goes to the extracted p2pkh receivers so the sinks
+    //    end up with genuinely transparent funds (paying their UAs would
+    //    settle shielded and TToT/TToZ flows would have no transparent inputs
+    //    to spend); shielded value goes to the UAs.
+    let rounds = plan
+        .transparent_outputs
+        .max(u32::from(plan.shielded_zec > 0.0));
+    let mut last_txid: Option<String> = None;
+    for round in 0..rounds {
+        let mut recipients: Vec<Recipient> = Vec::with_capacity(sinks.len() * 2);
+        for s in sinks {
+            if round < plan.transparent_outputs && plan.transparent_zec_each > 0.0 {
+                let address =
+                    s.transparent_receiver
+                        .clone()
+                        .ok_or_else(|| FundingError::Failed {
+                            step: "fund_accounts",
+                            detail: format!("sink account {} has no transparent receiver", s.uuid),
+                        })?;
+                recipients.push(Recipient {
                     address,
-                    amount: amount_zec,
+                    amount: plan.transparent_zec_each,
                     memo: None,
-                })
-        })
-        .collect::<Result<_, _>>()?;
+                });
+            }
+            if round == 0 && plan.shielded_zec > 0.0 {
+                recipients.push(Recipient {
+                    address: s.address.clone(),
+                    amount: plan.shielded_zec,
+                    memo: None,
+                });
+            }
+        }
+        if recipients.is_empty() {
+            continue;
+        }
+        let opid =
+            send_with_anchor_retries(rpc, &source.address, &recipients, "AllowRevealedRecipients")
+                .await?;
+        last_txid = Some(wait_operation(rpc, &opid).await?);
+    }
 
-    let opid =
-        send_with_anchor_retries(rpc, &source.address, &recipients, "AllowRevealedRecipients")
-            .await?;
-    wait_operation(rpc, &opid).await
+    last_txid.ok_or_else(|| FundingError::Failed {
+        step: "fund_accounts",
+        detail: "nothing to fund: the plan produces no outputs (or no sinks)".into(),
+    })
 }
 
 #[cfg(test)]

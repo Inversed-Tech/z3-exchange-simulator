@@ -75,14 +75,25 @@ pub async fn build_intent_future(
     let _guard = ActiveGuard(active_count.clone());
     let _permit = sem.acquire_owned().await.unwrap();
 
+    // Per-flow `from` forms and privacy policies (measured on Zallet beta.1;
+    // docs/regtest-funding-plan.md): the intent generator already resolves
+    // `sender_address` per flow — the sender's t-addr for TToT/TToZ, the
+    // sender's UA for ZToT/ZToZ — and those are exactly the forms z_sendmany
+    // requires, because a UA `from` draws shielded funds only while a bare
+    // t-addr `from` draws that address's transparent UTXOs. The privacy policy
+    // then names what the pool combination reveals. Every flow's source is the
+    // synthetic account itself (funded at provisioning), not the hot wallet —
+    // except ZToT's second leg, where the hot wallet pays out after the sweep,
+    // mirroring a real exchange's shielded treasury.
     match intent.flow_type {
-        // ── Transparent → Transparent: withdrawal ──────────────────────
+        // ── Transparent → Transparent: withdrawal from the account's t-addr ──
         FlowType::TToT => {
             match run_withdrawal(
                 &rpc,
                 &intent.account_id,
-                &hot_wallet_address,
+                &intent.sender_address,
                 &intent.recipient_address,
+                "AllowFullyTransparent",
                 intent.amount_zatoshis,
                 Some(&intent.intent_id),
                 &run_id,
@@ -104,17 +115,14 @@ pub async fn build_intent_future(
             }
         }
 
-        // ── Transparent → Shielded: deposit ───────────────────────────
+        // ── Transparent → Shielded: deposit from the account's t-addr ──
         FlowType::TToZ => {
-            let zallet_uuid = match resolve_zallet_uuid(&zallet_uuids, &intent) {
-                Ok(u) => u,
-                Err(outcome) => return outcome,
-            };
             match run_deposit(
                 &rpc,
-                &intent.account_id,
-                &zallet_uuid,
-                &hot_wallet_address,
+                &intent.recipient_account_id,
+                &intent.recipient_address,
+                &intent.sender_address,
+                "AllowRevealedSenders",
                 intent.amount_zatoshis,
                 1,
                 &run_id,
@@ -142,7 +150,9 @@ pub async fn build_intent_future(
                 Ok(u) => u,
                 Err(outcome) => return outcome,
             };
-            // Step 1: sweep user's shielded notes into the hot wallet.
+            // Step 1: sweep the user's shielded notes into the hot wallet.
+            // z_listunspent filtering needs the account UUID; the sweep send
+            // itself goes from the account's UA (shielded source, z→z).
             let zallet_address = match zallet_addresses.get(&intent.account_id) {
                 Some(a) => a.clone(),
                 None => {
@@ -179,12 +189,14 @@ pub async fn build_intent_future(
                     }
                 }
             }
-            // Step 2: withdraw from hot wallet to recipient transparent address.
+            // Step 2: pay out from the hot wallet (shielded treasury) to the
+            // recipient's transparent address.
             match run_withdrawal(
                 &rpc,
                 &intent.account_id,
                 &hot_wallet_address,
                 &intent.recipient_address,
+                "AllowRevealedRecipients",
                 intent.amount_zatoshis,
                 Some(&intent.intent_id),
                 &run_id,
@@ -206,17 +218,14 @@ pub async fn build_intent_future(
             }
         }
 
-        // ── Shielded → Shielded: deposit ──────────────────────────────
+        // ── Shielded → Shielded: deposit from the account's UA ─────────
         FlowType::ZToZ => {
-            let zallet_uuid = match resolve_zallet_uuid(&zallet_uuids, &intent) {
-                Ok(u) => u,
-                Err(outcome) => return outcome,
-            };
             match run_deposit(
                 &rpc,
-                &intent.account_id,
-                &zallet_uuid,
-                &hot_wallet_address,
+                &intent.recipient_account_id,
+                &intent.recipient_address,
+                &intent.sender_address,
+                "FullPrivacy",
                 intent.amount_zatoshis,
                 1,
                 &run_id,

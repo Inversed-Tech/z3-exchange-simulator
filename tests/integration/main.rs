@@ -25,6 +25,33 @@ async fn test_smoke_scenario_via_runner() {
         "expected at least one intent"
     );
 
+    // Minimum confirmation rate. Before the measured funding pipeline landed,
+    // a run that confirmed 0 of 60 intents still passed this test, because it
+    // only asserted that the runner returned Ok — the 100%-failure regression
+    // was invisible (docs/regtest-funding-plan.md). `confirmed > 0` alone
+    // would catch that; the 50% floor also catches systemic partial failures
+    // (e.g. one flow type's `from` form or privacy policy broken) while
+    // tolerating individual timeouts under load.
+    let confirmed_rate = result.stats.confirmed as f64 / result.stats.total_attempted as f64;
+    assert!(
+        result.stats.confirmed > 0,
+        "no intent confirmed at all — the funding pipeline or spend path is broken \
+         (attempted {}, failed {}, timed out {})",
+        result.stats.total_attempted,
+        result.stats.failed,
+        result.stats.timed_out,
+    );
+    assert!(
+        confirmed_rate >= 0.5,
+        "confirmation rate {:.0}% below the 50% floor (confirmed {}, attempted {}, \
+         failed {}, timed out {})",
+        confirmed_rate * 100.0,
+        result.stats.confirmed,
+        result.stats.total_attempted,
+        result.stats.failed,
+        result.stats.timed_out,
+    );
+
     // Regression guard: no outcomes should contain "unprovisioned" addresses.
     for outcome in &result.outcomes {
         if let IntentOutcome::Failed { error, .. } = outcome {

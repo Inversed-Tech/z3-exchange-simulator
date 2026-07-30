@@ -23,8 +23,15 @@ pub struct ProvisionedPopulation {
     pub population: SyntheticPopulation,
     /// Maps simulator `account_id` → Zallet account UUID.
     pub zallet_uuids: Arc<HashMap<String, String>>,
-    /// Maps simulator `account_id` → Unified Address (the `from` address for z_sendmany).
+    /// Maps simulator `account_id` → the account's creation-time Unified
+    /// Address. The `from` for shielded (ZToT/ZToZ) sends and the recipient
+    /// for shielded deposits.
     pub zallet_addresses: Arc<HashMap<String, String>>,
+    /// Maps simulator `account_id` → the p2pkh receiver extracted from that
+    /// UA. The `from` for transparent (TToT/TToZ) sends — a UA `from` draws
+    /// shielded funds only — and the recipient that must be paid when the
+    /// account is to hold genuinely transparent value.
+    pub zallet_transparent_receivers: Arc<HashMap<String, String>>,
     pub hot_wallet_uuid: String,
 }
 
@@ -105,10 +112,16 @@ pub async fn provision(
         }
     };
 
-    // Step 3: for each account, spawn a semaphore-bounded task that creates
-    // a Zallet account and derives a Unified Address.
+    // Step 3: create a Zallet account per synthetic account (semaphore-bounded).
+    //
+    // Only the CREATE happens per task. No address is ever derived: account
+    // creation already generates the diversifier-0 UA with every receiver type,
+    // and z_getaddressforaccount always derives a NEW address at the next
+    // Sapling-valid diversifier index — on an unfunded account the transparent
+    // gap window is indices 0..9, so a few such calls fail with ReachedGapLimit
+    // "index 10" (the June smoke failure; docs/zallet-transparent-gap-limit.md).
     let sem = Arc::new(Semaphore::new(PROVISION_CONCURRENCY));
-    let mut tasks: JoinSet<Result<(String, String, String), RpcError>> = JoinSet::new();
+    let mut tasks: JoinSet<Result<(String, String), RpcError>> = JoinSet::new();
 
     for account in &population.accounts {
         let permit = sem.clone().acquire_owned().await.unwrap();
@@ -118,82 +131,88 @@ pub async fn provision(
         tasks.spawn(async move {
             let _permit = permit;
             let account_info = rpc_clone.z_get_new_account(&account_id).await?;
-            let zallet_uuid = account_info.account.clone();
-            // Orchard-only, deliberately, for two measured reasons (both in
-            // docs/regtest-funding-plan.md; gap-limit analysis in
-            // docs/zallet-transparent-gap-limit.md):
-            //
-            // 1. This derive call should not exist at all in its current form —
-            //    account creation above already generated the diversifier-0 UA
-            //    with every receiver type, and each z_getaddressforaccount call
-            //    DERIVES a new address at the next Sapling-valid diversifier
-            //    index. On an unfunded account the transparent gap window is
-            //    indices 0..9, so repeated derives that include p2pkh exhaust it
-            //    within a few calls (ReachedGapLimit "index 10" — the June smoke
-            //    failure). Orchard-only derivation sidesteps the window; reading
-            //    the existing address (funding::resolve_account) removes the
-            //    problem entirely and is the planned replacement.
-            //
-            // 2. On the pinned Zallet (v0.1.0-alpha.3) a transparent recipient
-            //    could not be funded anyway: its z_sendmany passes a
-            //    shielded-only spend policy, so no input is ever selected. The
-            //    beta.1 override stack fixes the spend; the fan-out that funds
-            //    per-account transparent receivers (funding::fund_accounts) is
-            //    wired in the next PR. See the KNOWN LIMITATION on the
-            //    AddressType::Transparent entry below.
-            let ua = rpc_clone
-                .z_get_address_for_account(&zallet_uuid, &["orchard"], None)
-                .await?;
-            Ok((account_id, zallet_uuid, ua.address))
+            Ok((account_id, account_info.account))
         });
     }
 
-    // Step 4: collect task results.
-    let mut provisioned: Vec<(String, String, String)> = Vec::new();
+    let mut created: Vec<(String, String)> = Vec::new();
     while let Some(result) = tasks.join_next().await {
+        let inner = result.map_err(ProvisionerError::Join)?;
+        let tuple = inner.map_err(ProvisionerError::Rpc)?;
+        created.push(tuple);
+    }
+
+    // Step 4: read every account's creation-time address back in ONE
+    // z_listaccounts call, then extract each UA's transparent receiver
+    // (semaphore-bounded — z_listunifiedreceivers is per-address).
+    let listed = rpc.z_list_accounts().await.map_err(ProvisionerError::Rpc)?;
+    let primary_by_uuid: HashMap<String, String> = listed
+        .into_iter()
+        .filter_map(|a| {
+            let addr = a.primary_address()?.to_string();
+            Some((a.account, addr))
+        })
+        .collect();
+
+    let mut receiver_tasks: JoinSet<Result<(String, String, String, String), RpcError>> =
+        JoinSet::new();
+    for (account_id, zallet_uuid) in created {
+        let ua = match primary_by_uuid.get(&zallet_uuid) {
+            Some(ua) => ua.clone(),
+            None => {
+                return Err(ProvisionerError::Rpc(RpcError::Parse(format!(
+                    "account {zallet_uuid} ({account_id}) has no addresses in z_listaccounts"
+                ))))
+            }
+        };
+        let permit = sem.clone().acquire_owned().await.unwrap();
+        let rpc_clone = rpc.clone();
+        receiver_tasks.spawn(async move {
+            let _permit = permit;
+            let receivers = rpc_clone.z_list_unified_receivers(&ua).await?;
+            let taddr = receivers.p2pkh.ok_or_else(|| {
+                RpcError::Parse(format!("UA of account {zallet_uuid} has no p2pkh receiver"))
+            })?;
+            Ok((account_id, zallet_uuid, ua, taddr))
+        });
+    }
+
+    let mut provisioned: Vec<(String, String, String, String)> = Vec::new();
+    while let Some(result) = receiver_tasks.join_next().await {
         let inner = result.map_err(ProvisionerError::Join)?;
         let tuple = inner.map_err(ProvisionerError::Rpc)?;
         provisioned.push(tuple);
     }
 
     // Step 5: for each provisioned account, add transparent and Orchard
-    // address entries to the population's wallet.
+    // address entries to the population's wallet. The intent generator resolves
+    // per-flow sender/recipient addresses from these pools, so the entries
+    // carry REAL per-pool addresses: the transparent entry is the account's
+    // p2pkh receiver (a payment to it settles transparent; spending from it is
+    // the `from` form transparent flows need), and the Orchard entry is the
+    // account's UA (payments settle shielded; a UA `from` draws shielded funds).
     let mut zallet_uuids: HashMap<String, String> = HashMap::new();
     let mut zallet_addresses: HashMap<String, String> = HashMap::new();
+    let mut zallet_transparent_receivers: HashMap<String, String> = HashMap::new();
 
-    for (account_id, zallet_uuid, ua_address) in &provisioned {
+    for (account_id, zallet_uuid, ua_address, taddr) in &provisioned {
         zallet_uuids.insert(account_id.clone(), zallet_uuid.clone());
         zallet_addresses.insert(account_id.clone(), ua_address.clone());
+        zallet_transparent_receivers.insert(account_id.clone(), taddr.clone());
 
         let wallet_id = population
             .wallet_for_account(account_id)
             .map(|w| w.wallet_id.clone())
             .unwrap_or_default();
 
-        // Transparent entry.
-        //
-        // KNOWN LIMITATION: `ua_address` is an orchard-only Unified Address (see
-        // the derivation above), so it embeds no transparent (p2pkh) receiver.
-        // It is stored under AddressType::Transparent only so that TToT/ZToT
-        // flows have a recipient to resolve; a z_sendmany to this UA settles in
-        // the *shielded* pool, not transparent. Consequently the "transparent
-        // recipient" leg of TToT/ZToT flows does not currently exercise a true
-        // transparent output, and pool attribution for those flows is optimistic.
-        //
-        // Root cause is the pinned Zallet version, not the gap limit: transparent
-        // coinbase can only be spent to a fully-shielded transaction (consensus,
-        // ZIP-213), alpha.3 exposes no z_shieldcoinbase to escape that, and its
-        // z_sendmany cannot select transparent inputs. A faithful transparent
-        // recipient needs Zallet v0.1.0-beta.1 plus a z_shieldcoinbase step after
-        // warmup — tracked as follow-up, not fixed here. Full analysis in
-        // docs/zallet-transparent-gap-limit.md.
+        // Transparent entry: the genuine p2pkh receiver.
         population
             .add_address(
                 account_id,
                 Address {
                     address_id: format!("addr-{account_id}-t"),
                     wallet_id: wallet_id.clone(),
-                    address: ua_address.clone(),
+                    address: taddr.clone(),
                     address_type: AddressType::Transparent,
                     purpose: AddressPurpose::Deposit,
                     created_at: Utc::now(),
@@ -202,7 +221,7 @@ pub async fn provision(
             )
             .map_err(ProvisionerError::Population)?;
 
-        // Orchard entry
+        // Orchard entry: the full UA.
         population
             .add_address(
                 account_id,
@@ -232,6 +251,7 @@ pub async fn provision(
         population,
         zallet_uuids: Arc::new(zallet_uuids),
         zallet_addresses: Arc::new(zallet_addresses),
+        zallet_transparent_receivers: Arc::new(zallet_transparent_receivers),
         hot_wallet_uuid,
     })
 }
@@ -327,15 +347,34 @@ mod tests {
             .mount(server)
             .await;
 
+        // The provisioner never derives: it reads each account's creation-time
+        // address back through z_listaccounts and splits its receivers.
         Mock::given(matchers::method("POST"))
             .and(matchers::body_partial_json(
-                serde_json::json!({"method": "z_getaddressforaccount"}),
+                serde_json::json!({"method": "z_listaccounts"}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [{
+                    "account_uuid": "uuid-1234",
+                    "name": "acct",
+                    "addresses": [
+                        {"diversifier_index": 0, "ua": "u1testaddress"}
+                    ]
+                }],
+                "error": null, "id": 1
+            })))
+            .mount(server)
+            .await;
+
+        Mock::given(matchers::method("POST"))
+            .and(matchers::body_partial_json(
+                serde_json::json!({"method": "z_listunifiedreceivers"}),
             ))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "result": {
-                    "account_uuid": "uuid-1234",
-                    "address": "u1testaddress",
-                    "receiver_types": ["orchard", "sapling", "p2pkh"]
+                    "orchard": "u1orchardonly",
+                    "sapling": "zregtestsaplingaddr",
+                    "p2pkh": "tmTestTransparentAddr"
                 },
                 "error": null, "id": 1
             })))
