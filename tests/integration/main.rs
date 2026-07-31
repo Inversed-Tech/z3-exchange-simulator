@@ -63,6 +63,60 @@ async fn test_smoke_scenario_via_runner() {
     }
 }
 
+/// Assert a scenario made and confirmed at least one intent — shared by the
+/// per-flow-type checks below, each of which runs a scenario at 100% weight
+/// on a single `FlowType` so a failure is unambiguous about which flow broke.
+fn assert_confirmed_at_least_one(result: &z3_exchange_simulator::scenarios::runner::RunResult) {
+    assert!(
+        result.stats.total_attempted > 0,
+        "expected at least one intent"
+    );
+    assert!(
+        result.stats.confirmed > 0,
+        "no intent confirmed at all (attempted {}, failed {}, timed out {})",
+        result.stats.total_attempted,
+        result.stats.failed,
+        result.stats.timed_out,
+    );
+}
+
+/// Transparent→shielded (T→Z) deposits only — requires a live Z3 regtest stack.
+///
+/// Run with: `cargo test -- --ignored test_flow_check_ttoz`
+#[tokio::test]
+#[ignore = "requires live Z3 regtest stack; run with: cargo test -- --ignored test_flow_check_ttoz"]
+async fn test_flow_check_ttoz() {
+    let scenario = load_scenario(Path::new("configs/scenarios/flow_check_ttoz.yaml")).unwrap();
+    validate_scenario(&scenario).unwrap();
+    let result = run(scenario, RunOptions::default()).await.unwrap();
+    assert_confirmed_at_least_one(&result);
+}
+
+/// Shielded→transparent (Z→T) sweep-then-withdrawal only — requires a live Z3
+/// regtest stack.
+///
+/// Run with: `cargo test -- --ignored test_flow_check_ztot`
+#[tokio::test]
+#[ignore = "requires live Z3 regtest stack; run with: cargo test -- --ignored test_flow_check_ztot"]
+async fn test_flow_check_ztot() {
+    let scenario = load_scenario(Path::new("configs/scenarios/flow_check_ztot.yaml")).unwrap();
+    validate_scenario(&scenario).unwrap();
+    let result = run(scenario, RunOptions::default()).await.unwrap();
+    assert_confirmed_at_least_one(&result);
+}
+
+/// Shielded→shielded (Z→Z) deposits only — requires a live Z3 regtest stack.
+///
+/// Run with: `cargo test -- --ignored test_flow_check_ztoz`
+#[tokio::test]
+#[ignore = "requires live Z3 regtest stack; run with: cargo test -- --ignored test_flow_check_ztoz"]
+async fn test_flow_check_ztoz() {
+    let scenario = load_scenario(Path::new("configs/scenarios/flow_check_ztoz.yaml")).unwrap();
+    validate_scenario(&scenario).unwrap();
+    let result = run(scenario, RunOptions::default()).await.unwrap();
+    assert_confirmed_at_least_one(&result);
+}
+
 /// Dry-run test — does NOT start the Z3 stack and must always pass.
 #[tokio::test]
 async fn test_dry_run_does_not_start_z3() {

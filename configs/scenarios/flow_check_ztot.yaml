@@ -1,0 +1,34 @@
+name: flow_check_ztot
+description: "Small-scale, single-flow-type check: shielded-to-transparent (Z→T) sweep-then-withdrawal only. Isolates this flow from the other three so a failure is unambiguous."
+seed: 44
+
+accounts_count: 10
+accounts_active_fraction: 0.5
+
+load_duration_seconds: 60
+load_target_tps: 1.0
+
+flows:
+  transparent_to_transparent: 0.0
+  transparent_to_shielded: 0.0
+  shielded_to_transparent: 1.0
+  shielded_to_shielded: 0.0
+
+warmup_blocks: 20 # orchard-coinbase warmup: a few blocks to fund + 10 anchor confirmations
+
+confirmations_deposit_required: 3
+
+observability:
+  record_rpc_calls: true
+  record_component_logs: true
+  metric_sampling_interval_secs: 5
+  mempool_saturation_threshold: 500
+
+activity_profiles:
+  low_fraction: 0.50
+  medium_fraction: 0.35
+  high_fraction: 0.15
+
+amounts:
+  min_zatoshis: 10000 # 0.0001 ZEC
+  max_zatoshis: 10000000 # 0.1 ZEC
