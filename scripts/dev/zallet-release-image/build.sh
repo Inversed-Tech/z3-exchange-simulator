@@ -3,19 +3,19 @@
 #
 # Upstream publishes container images only through v0.1.0-alpha.3. Later releases
 # ship source and prebuilt binaries but no image, and the simulator needs
-# v0.1.0-beta.1 (the first release whose z_sendmany can select transparent
-# inputs). This script fetches the release tarball for the host architecture,
-# verifies its digest against the value recorded here, and builds a thin image
-# around the binaries.
+# v0.1.0-beta.1 or later (the first release whose z_sendmany can select
+# transparent inputs). This script fetches the release tarball for the host
+# architecture, verifies its digest against the value recorded here, and
+# builds a thin image around the binaries.
 #
 # Usage:
 #   scripts/dev/zallet-release-image/build.sh [version] [image-tag]
 #
-# Defaults: version v0.1.0-beta.1, tag z3sim/zallet:<version>.
+# Defaults: version v0.1.0-beta.2, tag z3sim/zallet:<version>.
 #
 # Point the Z3 stack at the result by setting both of these in
 # external/z3/.env.regtest:
-#   Z3_ZALLET_IMAGE=z3sim/zallet:v0.1.0-beta.1
+#   Z3_ZALLET_IMAGE=z3sim/zallet:v0.1.0-beta.2
 #   DOCKER_PLATFORM=linux/arm64      # or linux/amd64; the compose default is amd64
 #
 # Requires: docker, curl, tar, sha256sum. Uses gh for the download when present
@@ -23,7 +23,7 @@
 
 set -euo pipefail
 
-VERSION="${1:-v0.1.0-beta.1}"
+VERSION="${1:-v0.1.0-beta.2}"
 IMAGE_TAG="${2:-z3sim/zallet:${VERSION}}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -54,6 +54,11 @@ declare -A SHA256=(
     # detached signature (`.asc`) or SLSA provenance on first adoption.
     [v0.1.0-beta.1-amd64]="d31c4d38ca27b620db5a7c7a40950786a877013ce68d5b5ed417691ac2db0922"
     [v0.1.0-beta.1-arm64]="230de200a4a4e6064945cf1609127e8d1a82f4434a049ddb1faf75ca3823b0be"
+    # Observed from the published assets on 2026-07-31 (release published
+    # 2026-07-28). beta.2 fixes the Zallet restart crash-loop documented in
+    # docs/zallet-restart-sync-failure.md (upstream zcash/zallet#598/#599).
+    [v0.1.0-beta.2-amd64]="c82d160f9e57905f481a8cba5ea26375856fa54de7c8571017c7c0e6767dbe2a"
+    [v0.1.0-beta.2-arm64]="cee04b878f7d0dbaf3964164974975eac9c73d68b498cee07ea576282b08fa5e"
 )
 
 ASSET="zallet-${VERSION}-linux-${ARCH}.tar.gz"

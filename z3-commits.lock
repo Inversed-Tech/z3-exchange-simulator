@@ -50,9 +50,10 @@ zallet:
 # proposal builder, so it cannot spend from ANY pool (measured;
 # scripts/experiments/funding-probe.sh). The combination below is the
 # upstream-coherent set the simulator runs against instead — each component's
-# lockfile pins the others' crate versions (Zallet beta.1 embeds zaino@8048bf8
-# and zebra-state 10.1 = Zebra v6.0.0; standalone Zaino 0.6.0 locks the same
-# zebra-state). Applied via Z3_{ZEBRA,ZAINO,ZALLET}_IMAGE in
+# lockfile pins the others' crate versions (Zallet beta.1 embedded
+# zaino@8048bf8 and zebra-state 10.1 = Zebra v6.0.0; standalone Zaino 0.6.0
+# locks the same zebra-state; beta.2 moved to zaino@d2d06bd/zebra-state 12.0.1
+# — see the `zallet:` note below). Applied via Z3_{ZEBRA,ZAINO,ZALLET}_IMAGE in
 # external/z3/.env.regtest; the Z3 compose commit stays as pinned above.
 # Validation: scripts/experiments/fanout-probe.sh — 12/12 steps on a fresh
 # datadir (mine → shield → fan out to 5 accounts → sink spends back).
@@ -67,11 +68,29 @@ overrides:
     image: zingodevops/zainod:0.6.0-no-tls
     commit: 17963672d0c2cad97dd12bd38bbf1b6fd232c8c5   # 0.6.0 tag, external/zaino checkout
   zallet:
-    version: v0.1.0-beta.1
-    image: z3sim/zallet:v0.1.0-beta.1
-    commit: 5be0f4861feedc47978102c627c6293dea2d7838
+    version: v0.1.0-beta.2
+    image: z3sim/zallet:v0.1.0-beta.2
+    commit: bd7f020eb9e1de6f79da947e8102281832b05f83
     note: >
-      No upstream image exists past v0.1.0-alpha.3. Built locally from the
-      official release tarball by scripts/dev/zallet-release-image/build.sh
-      (SHA-256 pinned there). Requires Zebra >= 6.0.0: its embedded Zaino
-      queries the "ironwood" subtree pool, which Zebra v5.0.0 rejects.
+      Bumped from beta.1 (2026-07-31) to fix the Zallet restart crash-loop
+      documented in docs/zallet-restart-sync-failure.md: beta.1's
+      data-requests sync task treated any chain-backend error on a persisted
+      transaction data request as fatal, which killed the whole process and
+      caused a permanent restart loop once the wallet DB held one stale
+      request (e.g. a transaction that only ever existed in Zebra's mempool
+      and did not survive a container restart). Fixed upstream by
+      zcash/zallet PR #598 (closes zcash/zallet#599), which is included in
+      beta.2 per its CHANGELOG "Fixed" section and confirmed via `git
+      merge-base --is-ancestor`. No upstream image exists past
+      v0.1.0-alpha.3. Built locally from the official release tarball by
+      scripts/dev/zallet-release-image/build.sh (SHA-256 pinned there).
+      Requires Zebra >= 6.0.0: its embedded Zaino queries the "ironwood"
+      subtree pool, which Zebra v5.0.0 rejects. Note: beta.2 moved its
+      embedded zaino-state dependency from zingolabs/zaino@8048bf8 (0.3.1) to
+      zodl-inc/zaino@d2d06bd (0.5.0), whose Cargo.lock pins zebra-state
+      12.0.1 (shipped by Zebra v6.2.3) rather than beta.1's zebra-state
+      10.1.0 (Zebra v6.0.0). Zallet reaches Zebra only over JSON-RPC
+      (`[indexer] validator_address`), not via direct RocksDB access, so
+      this is expected to remain wire-compatible with the pinned Zebra
+      v6.0.0; not yet independently re-verified beyond the funding-pipeline
+      probes re-run after this bump.

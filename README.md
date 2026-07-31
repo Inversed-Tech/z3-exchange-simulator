@@ -140,7 +140,7 @@ see [`docs/integration/pinned-commits.md`](docs/integration/pinned-commits.md).
 `z_sendmany` passes a shielded-only spend policy to the proposal builder), so no scenario
 can confirm a transaction on the pins above. Live runs use the upstream-coherent override
 set recorded in the `overrides:` section of [`z3-commits.lock`](z3-commits.lock) — Zebra
-`v6.0.0` + Zaino `0.6.0` + Zallet `v0.1.0-beta.1` (built locally by
+`v6.0.0` + Zaino `0.6.0` + Zallet `v0.1.0-beta.2` (built locally by
 [`scripts/dev/zallet-release-image/build.sh`](scripts/dev/zallet-release-image/build.sh);
 upstream publishes no image past alpha.3) — applied via `Z3_*_IMAGE` variables in
 `external/z3/.env.regtest`. The full evidence trail is in
