@@ -232,6 +232,43 @@ pub struct TotalBalance {
     pub total: String,
 }
 
+/// Returned by `z_getbalances`, kept as raw JSON rather than a strictly typed
+/// struct: the exact per-account entry shape has been observed live to vary
+/// in ways a single manual probe did not surface (extra/missing fields
+/// depending on account provenance or funding history), and this method's
+/// whole purpose is to avoid a hard failure mode (see below) — a brittle
+/// strict-typed parse would defeat that. Callers should navigate defensively,
+/// e.g. via [`spendable_zat_for_account`].
+///
+/// Unlike `z_listunspent`, this never decodes note memos, so it is unaffected
+/// by the Zallet v0.1.0-beta.1 defect where `z_listunspent` fails with
+/// `-20 WalletDb::get_memo failed` once any shielded coinbase note exists
+/// anywhere in the wallet (coinbase memo fields are not valid UTF-8, which the
+/// memo decoder assumes).
+pub type Balances = serde_json::Value;
+
+/// Extract one account's total spendable balance (zatoshis) from a
+/// `z_getbalances` response, tolerating any shape variation in fields other
+/// than `accounts[].account_uuid` and `accounts[].total.spendable.valueZat`.
+/// Returns `0` if the account is absent or any expected field is missing —
+/// callers that need to distinguish "no balance" from "malformed response"
+/// should not use this helper.
+pub fn spendable_zat_for_account(balances: &Balances, account_uuid: &str) -> u64 {
+    balances
+        .get("accounts")
+        .and_then(|a| a.as_array())
+        .and_then(|accounts| {
+            accounts
+                .iter()
+                .find(|acc| acc.get("account_uuid").and_then(|u| u.as_str()) == Some(account_uuid))
+        })
+        .and_then(|acc| acc.get("total"))
+        .and_then(|t| t.get("spendable"))
+        .and_then(|s| s.get("valueZat"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0)
+}
+
 /// The outcome detail inside a completed `OperationStatus` or `OperationResult`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct OperationResultDetail {
@@ -449,6 +486,7 @@ fn routing_table() -> HashMap<&'static str, Backend> {
         ("z_getaccount", Backend::Zallet),
         ("listaddresses", Backend::Zallet),
         ("z_gettotalbalance", Backend::Zallet),
+        ("z_getbalances", Backend::Zallet),
         ("z_sendmany", Backend::Zallet),
         ("z_getoperationstatus", Backend::Zallet),
         ("z_getoperationresult", Backend::Zallet),
@@ -927,6 +965,13 @@ impl RpcClient {
     pub async fn z_get_total_balance(&self) -> Result<TotalBalance, RpcError> {
         self.call("z_gettotalbalance", serde_json::json!([null, true]))
             .await
+    }
+
+    /// Per-account, per-pool spendable balances. See [`Balances`] for why this
+    /// is used instead of `z_listunspent` where only a total per account is
+    /// needed.
+    pub async fn z_get_balances(&self) -> Result<Balances, RpcError> {
+        self.call("z_getbalances", serde_json::json!([])).await
     }
 
     /// Send funds to one or more recipients. Fee is always `null` (auto-computed
@@ -1669,6 +1714,81 @@ mod tests {
             .await;
         // Would fail if params were wrong (no matching mock → error).
         client(&server.uri()).z_get_total_balance().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn z_get_balances_parses_per_account_per_pool_response() {
+        use wiremock::{matchers, Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(matchers::method("POST"))
+            .and(matchers::body_partial_json(
+                serde_json::json!({ "method": "z_getbalances" }),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": {
+                    "accounts": [
+                        {
+                            "account_uuid": "acct-empty",
+                            "total": { "spendable": { "valueZat": 0 } }
+                        },
+                        {
+                            "account_uuid": "acct-funded",
+                            "orchard": { "spendable": { "valueZat": 12_500_000_000_u64 } },
+                            "total": { "spendable": { "valueZat": 12_500_000_000_u64 } }
+                        }
+                    ]
+                },
+                "error": null, "id": 1
+            })))
+            .mount(&server)
+            .await;
+
+        let balances = client(&server.uri()).z_get_balances().await.unwrap();
+        assert_eq!(spendable_zat_for_account(&balances, "acct-empty"), 0);
+        assert_eq!(
+            spendable_zat_for_account(&balances, "acct-funded"),
+            12_500_000_000
+        );
+    }
+
+    #[test]
+    fn spendable_zat_for_account_returns_zero_for_unknown_account() {
+        let balances = serde_json::json!({
+            "accounts": [
+                { "account_uuid": "other", "total": { "spendable": { "valueZat": 5 } } }
+            ]
+        });
+        assert_eq!(spendable_zat_for_account(&balances, "missing"), 0);
+    }
+
+    #[test]
+    fn spendable_zat_for_account_tolerates_unexpected_shapes() {
+        // Missing `accounts` key entirely.
+        assert_eq!(spendable_zat_for_account(&serde_json::json!({}), "acct"), 0);
+        // `accounts` present but not an array.
+        assert_eq!(
+            spendable_zat_for_account(&serde_json::json!({"accounts": "oops"}), "acct"),
+            0
+        );
+        // Matching account present but missing `total`.
+        assert_eq!(
+            spendable_zat_for_account(
+                &serde_json::json!({"accounts": [{"account_uuid": "acct"}]}),
+                "acct"
+            ),
+            0
+        );
+        // `valueZat` present but not numeric.
+        assert_eq!(
+            spendable_zat_for_account(
+                &serde_json::json!({"accounts": [{
+                    "account_uuid": "acct",
+                    "total": {"spendable": {"valueZat": "not-a-number"}}
+                }]}),
+                "acct"
+            ),
+            0
+        );
     }
 
     #[tokio::test]

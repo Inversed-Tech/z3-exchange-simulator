@@ -5,7 +5,6 @@
 //! RPC client. All four are fully unit-testable with a mock RPC server and
 //! require no live Z3 stack.
 
-use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -18,6 +17,14 @@ use crate::data_model::{
 };
 use crate::metrics::MetricsRecorder;
 use crate::rpc::{OperationResult, OperationStatus, Recipient, RpcClient, RpcError};
+
+/// Conservative note-count assumption for [`run_sweep`]'s ZIP-317 fee estimate.
+/// `run_sweep` cannot enumerate an account's actual notes (see its doc comment),
+/// so it estimates the fee as if the account held this many notes. Most
+/// synthetic accounts hold exactly one shielded note from the initial funding
+/// fan-out; this overestimates the common case rather than risk underpaying
+/// and having the sweep rejected.
+const ASSUMED_SWEEP_NOTE_COUNT: usize = 4;
 
 // ── Error type ────────────────────────────────────────────────────────────────
 
@@ -422,12 +429,26 @@ pub async fn run_withdrawal(
 
 // ── Workflow: sweep ───────────────────────────────────────────────────────────
 
-/// Sweep all confirmed unspent notes belonging to `from_account` into
+/// Sweep the confirmed shielded balance belonging to `from_account` into
 /// `hot_wallet_address` via a single `z_send_many` call.
 ///
-/// The sent amount is the sum of all discovered notes minus `SWEEP_FEE_BUFFER_ZAT`
-/// to leave headroom for the ZIP-317 fee. Returns an error if no confirmed notes
-/// are found for the account. Emits `sweep_time_ms` to the metrics recorder.
+/// The sent amount is the account's total spendable balance (from
+/// `z_get_balances`) minus an estimated ZIP-317 fee. Returns an error if the
+/// account has no spendable balance. Emits `sweep_time_ms` to the metrics
+/// recorder.
+///
+/// Uses `z_get_balances` rather than `z_list_unspent` to determine the
+/// sweepable amount: `z_list_unspent` unconditionally fails with
+/// `-20 WalletDb::get_memo failed` once any shielded coinbase note exists
+/// anywhere in the wallet — measured to affect 100% of calls once the
+/// recommended Orchard-coinbase warmup path is used (coinbase memo fields are
+/// not valid UTF-8, which the memo decoder assumes; see
+/// `docs/regtest-funding-plan.md`). `z_get_balances` returns aggregate values
+/// only, without decoding any memo, and is unaffected. The trade-off is that
+/// the ZIP-317 fee can only be estimated (see `ASSUMED_SWEEP_NOTE_COUNT`)
+/// rather than computed from the account's actual note count, and the swept
+/// source address is reported as `from_address` rather than the individual
+/// note addresses.
 pub async fn run_sweep(
     rpc: &RpcClient,
     from_account: &str,
@@ -439,44 +460,28 @@ pub async fn run_sweep(
 ) -> Result<Sweep, ExchangeError> {
     let start = Instant::now();
 
-    // Collect all confirmed unspent notes, filter to this account.
-    let all_notes = rpc
-        .z_list_unspent(1, None)
-        .await
-        .map_err(ExchangeError::Rpc)?;
+    let balances = rpc.z_get_balances().await.map_err(ExchangeError::Rpc)?;
+    let total_zat = crate::rpc::spendable_zat_for_account(&balances, from_account);
 
-    let account_notes: Vec<_> = all_notes
-        .into_iter()
-        .filter(|n| n.account == from_account)
-        .collect();
-
-    if account_notes.is_empty() {
+    if total_zat == 0 {
         return Err(ExchangeError::EmptyResult {
-            context: format!("no confirmed unspent notes found for account {from_account}"),
+            context: format!("no spendable shielded balance for account {from_account}"),
         });
     }
 
-    let total_zat: u64 = account_notes.iter().map(|n| n.value_zat).sum();
-    let sweep_fee_zat = zip317_sweep_fee(account_notes.len());
+    let sweep_fee_zat = zip317_sweep_fee(ASSUMED_SWEEP_NOTE_COUNT);
     if total_zat <= sweep_fee_zat {
         return Err(ExchangeError::EmptyResult {
             context: format!(
-                "account {from_account} balance {total_zat} zat does not cover sweep fee {sweep_fee_zat} zat"
+                "account {from_account} balance {total_zat} zat does not cover the estimated sweep fee {sweep_fee_zat} zat"
             ),
         });
     }
     let sweep_amount_zat = total_zat - sweep_fee_zat;
 
-    let source_addresses: Vec<String> = account_notes
-        .iter()
-        .filter_map(|n| n.address.clone())
-        .collect::<HashSet<_>>()
-        .into_iter()
-        .collect();
-
     let mut sweep = Sweep {
         sweep_id: Uuid::new_v4().to_string(),
-        source_addresses,
+        source_addresses: vec![from_address.to_string()],
         destination_address: hot_wallet_address.to_string(),
         total_amount_zatoshis: total_zat,
         fee_zatoshis: sweep_fee_zat,
@@ -1321,21 +1326,16 @@ mod tests {
 
         Mock::given(matchers::method("POST"))
             .and(matchers::body_partial_json(
-                serde_json::json!({ "method": "z_listunspent" }),
+                serde_json::json!({ "method": "z_getbalances" }),
             ))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "result": [
-                    {
-                        "txid": "note1", "confirmations": 5,
+                "result": {
+                    "accounts": [{
                         "account_uuid": "sweep-account",
-                        "address": "u1addr1", "value": 0.5, "valueZat": 50_000_000u64
-                    },
-                    {
-                        "txid": "note2", "confirmations": 3,
-                        "account_uuid": "sweep-account",
-                        "address": "u1addr2", "value": 0.3, "valueZat": 30_000_000u64
-                    }
-                ],
+                        "orchard": { "spendable": { "valueZat": 80_000_000u64 } },
+                        "total": { "spendable": { "valueZat": 80_000_000u64 } }
+                    }]
+                },
                 "error": null, "id": 1
             })))
             .mount(&server)
@@ -1401,25 +1401,25 @@ mod tests {
 
         assert_eq!(sweep.status, SweepStatus::Confirmed);
         assert_eq!(sweep.total_amount_zatoshis, 80_000_000);
-        assert_eq!(sweep.fee_zatoshis, 15_000); // ZIP 317: 5_000 × max(2+1, 2) = 15_000
+        assert_eq!(sweep.fee_zatoshis, 25_000); // ZIP 317: 5_000 × max(4+1, 2) = 25_000
         assert_eq!(sweep.txid.as_deref(), Some("sweeptxid"));
         assert_eq!(sweep.destination_address, "u1hotwallet");
-        assert_eq!(sweep.source_addresses.len(), 2);
+        assert_eq!(sweep.source_addresses, vec!["u1sweepfrom".to_string()]);
 
         let samples = rec.samples();
         assert!(samples.iter().any(|s| s.metric_name == "sweep_time_ms"));
     }
 
     #[tokio::test]
-    async fn run_sweep_returns_err_when_no_notes_found() {
+    async fn run_sweep_returns_err_when_no_balance_found() {
         use wiremock::{matchers, Mock, MockServer, ResponseTemplate};
         let server = MockServer::start().await;
         Mock::given(matchers::method("POST"))
             .and(matchers::body_partial_json(
-                serde_json::json!({ "method": "z_listunspent" }),
+                serde_json::json!({ "method": "z_getbalances" }),
             ))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "result": [], "error": null, "id": 1
+                "result": { "accounts": [] }, "error": null, "id": 1
             })))
             .mount(&server)
             .await;
@@ -1440,19 +1440,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_sweep_ignores_notes_from_other_accounts() {
+    async fn run_sweep_ignores_balances_of_other_accounts() {
         use wiremock::{matchers, Mock, MockServer, ResponseTemplate};
         let server = MockServer::start().await;
         Mock::given(matchers::method("POST"))
             .and(matchers::body_partial_json(
-                serde_json::json!({ "method": "z_listunspent" }),
+                serde_json::json!({ "method": "z_getbalances" }),
             ))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "result": [{
-                    "txid": "note-other", "confirmations": 5,
-                    "account_uuid": "other-account",
-                    "address": "u1other", "value": 1.0, "valueZat": 100_000_000u64
-                }],
+                "result": {
+                    "accounts": [{
+                        "account_uuid": "other-account",
+                        "orchard": { "spendable": { "valueZat": 100_000_000u64 } },
+                        "total": { "spendable": { "valueZat": 100_000_000u64 } }
+                    }]
+                },
                 "error": null, "id": 1
             })))
             .mount(&server)
@@ -1471,91 +1473,6 @@ mod tests {
         .unwrap_err();
 
         assert!(matches!(err, ExchangeError::EmptyResult { .. }));
-    }
-
-    #[tokio::test]
-    async fn run_sweep_handles_notes_with_null_address() {
-        use wiremock::{matchers, Mock, MockServer, ResponseTemplate};
-        let server = MockServer::start().await;
-
-        Mock::given(matchers::method("POST"))
-            .and(matchers::body_partial_json(
-                serde_json::json!({ "method": "z_listunspent" }),
-            ))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "result": [
-                    {
-                        "txid": "note1", "confirmations": 2,
-                        "account_uuid": "my-account",
-                        "address": null, "value": 0.1, "valueZat": 10_000_000u64
-                    }
-                ],
-                "error": null, "id": 1
-            })))
-            .mount(&server)
-            .await;
-
-        Mock::given(matchers::method("POST"))
-            .and(matchers::body_partial_json(
-                serde_json::json!({ "method": "z_sendmany" }),
-            ))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "result": "opid-1", "error": null, "id": 1
-            })))
-            .mount(&server)
-            .await;
-
-        Mock::given(matchers::method("POST"))
-            .and(matchers::body_partial_json(
-                serde_json::json!({ "method": "z_getoperationstatus" }),
-            ))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "result": [{
-                    "id": "opid-1", "status": "success",
-                    "result": { "txid": "txid1" }, "error": null
-                }],
-                "error": null, "id": 1
-            })))
-            .mount(&server)
-            .await;
-
-        Mock::given(matchers::method("POST"))
-            .and(matchers::body_partial_json(
-                serde_json::json!({ "method": "generate" }),
-            ))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "result": ["h1"], "error": null, "id": 1
-            })))
-            .mount(&server)
-            .await;
-
-        Mock::given(matchers::method("POST"))
-            .and(matchers::body_partial_json(
-                serde_json::json!({ "method": "getrawtransaction" }),
-            ))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "result": { "txid": "txid1", "hex": "dead", "confirmations": 1 },
-                "error": null, "id": 1
-            })))
-            .mount(&server)
-            .await;
-
-        let sweep = run_sweep(
-            &rpc(&server.uri()),
-            "my-account",
-            "u1sweepfrom",
-            "u1hotwallet",
-            "run-1",
-            None,
-            &instant_polling(),
-        )
-        .await
-        .unwrap();
-
-        // Note with null address still contributes to total; source_addresses is empty.
-        assert_eq!(sweep.total_amount_zatoshis, 10_000_000);
-        assert!(sweep.source_addresses.is_empty());
-        assert_eq!(sweep.status, SweepStatus::Confirmed);
     }
 
     // ── zat_to_zec ────────────────────────────────────────────────────────────
@@ -1587,17 +1504,19 @@ mod tests {
         use wiremock::{matchers, Mock, MockServer, ResponseTemplate};
         let server = MockServer::start().await;
 
-        // 1 note of 9_000 zat; ZIP 317 fee = 10_000 → balance insufficient
+        // Balance 9_000 zat; estimated ZIP 317 fee = 25_000 → insufficient
         Mock::given(matchers::method("POST"))
             .and(matchers::body_partial_json(
-                serde_json::json!({ "method": "z_listunspent" }),
+                serde_json::json!({ "method": "z_getbalances" }),
             ))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "result": [{
-                    "txid": "note1", "confirmations": 3,
-                    "account_uuid": "my-account",
-                    "address": "u1addr", "value": 0.00009, "valueZat": 9_000u64
-                }],
+                "result": {
+                    "accounts": [{
+                        "account_uuid": "my-account",
+                        "orchard": { "spendable": { "valueZat": 9_000u64 } },
+                        "total": { "spendable": { "valueZat": 9_000u64 } }
+                    }]
+                },
                 "error": null, "id": 1
             })))
             .mount(&server)
@@ -1616,7 +1535,9 @@ mod tests {
         .unwrap_err();
 
         assert!(matches!(err, ExchangeError::EmptyResult { .. }));
-        assert!(err.to_string().contains("does not cover sweep fee"));
+        assert!(err
+            .to_string()
+            .contains("does not cover the estimated sweep fee"));
     }
 
     // ── run_mempool_watcher ───────────────────────────────────────────────────
