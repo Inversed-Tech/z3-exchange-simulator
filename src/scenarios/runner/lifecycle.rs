@@ -59,9 +59,22 @@ pub async fn setup(
         return Err(RunnerError::Setup(e.to_string()));
     }
 
-    // 3. Build the RPC client.
+    // 3. Build the RPC client. `z_sendmany` for a shielded output can spend a
+    //    long time in synchronous proposal-building (which includes ZK proof
+    //    generation) before it ever returns an operation ID — measured at ~2s
+    //    uncontended, but P99 latency observed climbing past 20s under
+    //    concurrent shielded load in this same client's own recorded metrics.
+    //    reqwest's `timeout()` covers the full request including body read, so
+    //    the client's default (30s, tuned for cheap calls) leaves too little
+    //    headroom here: a call that runs long gets its connection cut mid-body,
+    //    which surfaces as a misleading `RpcError::Parse` ("error decoding
+    //    response body") rather than a clean timeout. 120s leaves ~5x headroom
+    //    over the observed P99; existing mining-chunk sizing already stays
+    //    far under even the previous 30s budget, so this is not a regression
+    //    for warmup/funding.
+    const RPC_TIMEOUT: Duration = Duration::from_secs(120);
     let rpc = {
-        let client = RpcClient::new(&rpc_url, run_id, Some(metrics.clone()), None);
+        let client = RpcClient::new(&rpc_url, run_id, Some(metrics.clone()), Some(RPC_TIMEOUT));
         if let Some((user, pass)) = basic_auth {
             client.with_basic_auth(user, pass)
         } else {
@@ -188,7 +201,7 @@ const MINE_CHUNK_BLOCKS: u32 = 5;
 /// Transport errors are retried a few times per chunk: right after stack
 /// startup the rpc-router can still be restarting, and an emulated prover can
 /// occasionally push a chunk past the deadline.
-async fn mine_blocks(rpc: &RpcClient, total: u32) -> Result<(), RunnerError> {
+pub(crate) async fn mine_blocks(rpc: &RpcClient, total: u32) -> Result<(), RunnerError> {
     let mut remaining = total;
     while remaining > 0 {
         let chunk = remaining.min(MINE_CHUNK_BLOCKS);

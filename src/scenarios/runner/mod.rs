@@ -36,7 +36,7 @@ pub use scheduler::LoadShape;
 
 use config::print_dry_run_summary;
 use dispatch::{background_miner, build_intent_future, periodic_balance_check};
-use lifecycle::{finalize_run_artifacts, setup, teardown, SetupState};
+use lifecycle::{finalize_run_artifacts, mine_blocks, setup, teardown, SetupState};
 use provisioner::{ProvisionedPopulation, ProvisionerError};
 use scheduler::{mixed_flow_config, Scheduler};
 
@@ -384,12 +384,17 @@ async fn load_phase(
         }
     }
 
-    // Signal background tasks to stop.
-    let _ = mempool_tx.send(());
-    let _ = balance_tx.send(());
-    let _ = miner_tx.send(());
-
-    // Drain all in-flight tasks.
+    // Drain all in-flight tasks. The background miner, balance check, and
+    // mempool watcher are deliberately left running through this loop (their
+    // stop signals are sent afterward, below): an intent dispatched near the
+    // end of the load window can still be waiting on confirmations, and
+    // stopping the miner here would strand it forever, since no more blocks
+    // would ever arrive — a test-harness artifact that has nothing to do with
+    // how well the Z3 stack actually performs, but that previously inflated
+    // the failure rate on every scenario. Confirmed live: block height was
+    // still climbing right up to the last background-sampler tick, yet the
+    // run didn't finish draining until ~90s later — 90s of pure dead air with
+    // no new blocks for anything still pending.
     let mut outcomes = Vec::with_capacity(tasks.len());
     while let Some(result) = tasks.join_next().await {
         match result {
@@ -403,6 +408,26 @@ async fn load_phase(
             }
         }
     }
+
+    // Flush the mempool: any intent this run gave up on via its own internal
+    // timeout (rather than a clean RPC error) may still have a transaction
+    // sitting broadcast-but-unmined. Mempool contents do not survive a
+    // container restart, only mined chain state does — so a transaction left
+    // stranded here becomes a dangling reference the wallet crashes on the
+    // next time it restarts and tries to re-verify its own history (measured;
+    // see docs/regtest-funding-plan.md and the Zallet WalletDb sync failure
+    // mode). A handful of extra blocks costs little and meaningfully reduces
+    // how often a run leaves the wallet in a state that requires a full wipe.
+    const MEMPOOL_FLUSH_BLOCKS: u32 = 5;
+    if let Err(e) = mine_blocks(&rpc, MEMPOOL_FLUSH_BLOCKS).await {
+        tracing::warn!("post-load mempool flush failed: {e}");
+    }
+
+    // Signal background tasks to stop, now that mining and observability have
+    // covered the full drain (and flush) window.
+    let _ = mempool_tx.send(());
+    let _ = balance_tx.send(());
+    let _ = miner_tx.send(());
 
     // Emit end-of-load summary metrics consumed by generate_summary.
     let confirmed = outcomes
