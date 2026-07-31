@@ -85,11 +85,11 @@ the method's routing table.
 | `confirmed_txs_total` | `flow_type` | Cumulative confirmed transactions |
 | `failed_txs_total` | `flow_type`, `reason` | Cumulative failed transactions |
 | `deposit_confirmation_time_ms` | — | Time from deposit detection to credit |
-| `proving_time_ms` | — | ZK proof generation time for shielded txs |
+| `withdrawal_proving_time_ms` | — | ZK proof generation time for a withdrawal's shielded send |
 | `active_accounts` | — | Accounts actively transacting at sample time |
 | `block_height` | — | Current chain height |
 | `tps_achieved` | — | Observed transactions per second vs. target |
-| `mempool_saturation_event` | `threshold` | Recorded once when mempool depth crosses the saturation threshold; value is the observed depth at crossing |
+| `mempool_saturated` | — | Recorded (value `1.0`) on every sample where mempool depth is at or above the saturation threshold; the depth itself is the co-emitted `mempool_tx_count` sample at the same timestamp |
 | `process_cpu_percent` | `process` | CPU usage of each Docker container (Zebra, Zaino, Zallet) |
 | `process_memory_mb` | `process` | Memory usage of each Docker container |
 
@@ -111,11 +111,11 @@ component_logs/
   zallet.log
 ```
 
-**Capture mechanism: pipe.** The simulator starts each Z3 process with stdout and stderr
-piped into the simulator, reads them in background tasks, and writes the bytes to the
-log files above. This gives the simulator full ownership of the output stream, which
-enables health-check detection (e.g. watching for "RPC server ready" before marking a
-component healthy) without relying on platform-specific tools like `tee`.
+**Capture mechanism: `docker compose logs --follow`.** Z3 components run as Docker
+containers, not simulator child processes, so the simulator spawns
+`docker compose logs --follow --no-log-prefix <service>` per component as a subprocess,
+reads its piped stdout line by line in a background task, and writes each line to the
+log files above (`src/z3/mod.rs::capture_logs`).
 
 Log verbosity should be tuned per run: higher for debugging, lower for large-scale
 runs where log volume becomes a bottleneck.

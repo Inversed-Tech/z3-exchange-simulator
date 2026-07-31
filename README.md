@@ -217,7 +217,6 @@ Run directories are gitignored and are not tracked by version control.
 | [`docs/integration/pinned-commits.md`](docs/integration/pinned-commits.md) | Commit pinning rationale |
 | [`docs/rpc/rpc-coverage-matrix.md`](docs/rpc/rpc-coverage-matrix.md) | RPC coverage and zcashd parity matrix |
 | [`docs/rpc/method-scope.md`](docs/rpc/method-scope.md) | Confirmed method list: stress vs smoke split |
-| [`docs/rpc/proposed-method-scope.md`](docs/rpc/proposed-method-scope.md) | Proposed method list for Foundation confirmation |
 | [`docs/scenarios/scenario-design.md`](docs/scenarios/scenario-design.md) | Scenario library design |
 | [`docs/zallet-transparent-spending-bug.md`](docs/zallet-transparent-spending-bug.md) | Zallet alpha: transparent coinbase not spendable via `z_sendmany` |
 | [`docs/zallet-transparent-gap-limit.md`](docs/zallet-transparent-gap-limit.md) | Transparent address gap limit at exchange scale: what it really constrains, and the upstream recommendation |
