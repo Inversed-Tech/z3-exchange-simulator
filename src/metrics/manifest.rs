@@ -29,22 +29,41 @@ pub fn read_manifest(path: &Path) -> Result<RunManifest, MetricsError> {
     serde_json::from_str(&content).map_err(MetricsError::Serialization)
 }
 
+/// Find the first `commit:` line within `section:` inside `text`, stopping at
+/// the section's end (a following unindented, non-blank line).
+fn extract_commit(text: &str, section: &str) -> Option<String> {
+    let mut in_section = false;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with(&format!("{section}:")) {
+            in_section = true;
+        } else if in_section && trimmed.starts_with("commit:") {
+            let value = trimmed["commit:".len()..].trim();
+            // Strip a trailing inline YAML comment, e.g. `commit: abc123   # v6.0.0 tag`.
+            let value = value.split('#').next().unwrap_or(value).trim();
+            return Some(value.to_string());
+        } else if in_section && !trimmed.is_empty() && !line.starts_with(' ') {
+            // Must check `line` (not `trimmed`) — trimmed never starts with a space.
+            in_section = false;
+        }
+    }
+    None
+}
+
 pub fn read_z3_commits(lock_path: &Path) -> (String, String, String) {
     let content = std::fs::read_to_string(lock_path).unwrap_or_default();
+    // Everything after the top-level `overrides:` key, if present: the stack
+    // actually run when the frozen pins above it are confirmed non-functional
+    // (see z3-commits.lock's "Regtest override set" note). An override commit
+    // for a component takes precedence over that component's frozen pin.
+    let overrides = content
+        .split_once("\noverrides:")
+        .map(|(_, rest)| rest)
+        .unwrap_or("");
     let extract = |section: &str| -> String {
-        let mut in_section = false;
-        for line in content.lines() {
-            let trimmed = line.trim();
-            if trimmed.starts_with(&format!("{section}:")) {
-                in_section = true;
-            } else if in_section && trimmed.starts_with("commit:") {
-                return trimmed["commit:".len()..].trim().to_string();
-            } else if in_section && !trimmed.is_empty() && !line.starts_with(' ') {
-                // Must check `line` (not `trimmed`) — trimmed never starts with a space.
-                in_section = false;
-            }
-        }
-        "unknown".to_string()
+        extract_commit(overrides, section)
+            .or_else(|| extract_commit(&content, section))
+            .unwrap_or_else(|| "unknown".to_string())
     };
     (extract("zebra"), extract("zaino"), extract("zallet"))
 }
@@ -259,6 +278,59 @@ zallet:
     }
 
     #[test]
+    fn read_z3_commits_prefers_override_commit_over_frozen_pin() {
+        // Mirrors z3-commits.lock's real shape: a frozen pin that is known
+        // non-functional, superseded by an `overrides:` block for the stack
+        // actually used to run.
+        let fixture = r#"zebra:
+  version: v5.0.0
+  commit: frozen-zebra-sha
+zaino:
+  version: 0.4.0-rc.2
+  commit: frozen-zaino-sha
+zallet:
+  version: v0.1.0-alpha.3
+  commit: frozen-zallet-sha
+
+overrides:
+  zebra:
+    version: v6.0.0
+    commit: override-zebra-sha
+  zaino:
+    version: 0.6.0
+    commit: override-zaino-sha
+  zallet:
+    version: v0.1.0-beta.1
+    commit: override-zallet-sha
+"#;
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join("override.lock");
+        std::fs::write(&lock, fixture).unwrap();
+        let (z, i, t) = read_z3_commits(&lock);
+        assert_eq!(z, "override-zebra-sha");
+        assert_eq!(i, "override-zaino-sha");
+        assert_eq!(t, "override-zallet-sha");
+    }
+
+    #[test]
+    fn read_z3_commits_falls_back_to_frozen_pin_when_no_overrides_section() {
+        let fixture = r#"zebra:
+  commit: frozen-zebra-sha
+zaino:
+  commit: frozen-zaino-sha
+zallet:
+  commit: frozen-zallet-sha
+"#;
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join("nooverride.lock");
+        std::fs::write(&lock, fixture).unwrap();
+        let (z, i, t) = read_z3_commits(&lock);
+        assert_eq!(z, "frozen-zebra-sha");
+        assert_eq!(i, "frozen-zaino-sha");
+        assert_eq!(t, "frozen-zallet-sha");
+    }
+
+    #[test]
     fn read_z3_commits_section_without_commit_line_returns_unknown() {
         let fixture = r#"zebra:
   repo: https://github.com/ZcashFoundation/zebra
@@ -279,5 +351,34 @@ zallet:
         );
         assert_eq!(i, "sha-i");
         assert_eq!(t, "sha-t");
+    }
+
+    #[test]
+    fn read_z3_commits_strips_trailing_inline_comment() {
+        // z3-commits.lock's real override entries look like this: a trailing
+        // `# ...` comment on the same line as the commit hash.
+        let fixture = r#"overrides:
+  zebra:
+    commit: override-zebra-sha   # v6.0.0 tag, external/zebra checkout
+"#;
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join("commented.lock");
+        std::fs::write(&lock, fixture).unwrap();
+        let (z, _, _) = read_z3_commits(&lock);
+        assert_eq!(z, "override-zebra-sha");
+    }
+
+    #[test]
+    fn read_z3_commits_matches_actual_lock_file() {
+        // Regression guard against the real z3-commits.lock: the frozen pins
+        // are documented as non-functional, so the manifest must record the
+        // override stack that runs are actually validated against.
+        let (z, i, t) = read_z3_commits(std::path::Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/z3-commits.lock"
+        )));
+        assert_eq!(z, "bb41d69013edbfa8594bb097fa751f47eeb31445");
+        assert_eq!(i, "17963672d0c2cad97dd12bd38bbf1b6fd232c8c5");
+        assert_eq!(t, "5be0f4861feedc47978102c627c6293dea2d7838");
     }
 }
