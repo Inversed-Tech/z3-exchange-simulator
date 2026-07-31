@@ -518,6 +518,11 @@ fn routing_table() -> HashMap<&'static str, Backend> {
 
 // ── RpcClient ─────────────────────────────────────────────────────────────────
 
+/// HTTP timeout used when a caller doesn't specify one. Named so the value
+/// actually used by every production `RpcClient::new(..., None)` call can be
+/// recorded in the run manifest instead of duplicated as a magic number.
+pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+
 pub struct RpcClient {
     http: reqwest::Client,
     base_url: String,
@@ -542,7 +547,7 @@ impl RpcClient {
         timeout: Option<Duration>,
     ) -> Self {
         let http = reqwest::Client::builder()
-            .timeout(timeout.unwrap_or(Duration::from_secs(30)))
+            .timeout(timeout.unwrap_or(DEFAULT_TIMEOUT))
             .build()
             .expect("failed to build HTTP client");
 

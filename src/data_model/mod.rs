@@ -299,6 +299,28 @@ pub struct MetricSample {
     pub labels: HashMap<String, String>,
 }
 
+/// One line of a run's `intents.jsonl`: the outcome of a single dispatched
+/// transaction intent. Previously this was tracked only as an in-memory
+/// `IntentOutcome` and discarded after being folded into the run's aggregate
+/// confirmed/failed/timed-out counts — the findings report needs per-intent,
+/// per-flow-type attribution that the aggregate counts alone can't provide.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IntentRecord {
+    pub run_id: String,
+    pub intent_id: String,
+    pub flow_type: FlowType,
+    /// One of "confirmed", "failed", "timed_out".
+    pub outcome: String,
+    pub error: Option<String>,
+    /// Set only when `outcome == "timed_out"`: which wait expired, e.g.
+    /// "operation <id> did not complete within the deadline" (async ZK
+    /// proving) vs. "tx <id> did not reach N confirmations" (confirmation
+    /// wait) — distinguishing an RPC/operation stall from a confirmation-depth
+    /// stall.
+    pub timeout_context: Option<String>,
+    pub recorded_at: DateTime<Utc>,
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

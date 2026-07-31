@@ -102,10 +102,15 @@ pub async fn build_intent_future(
             )
             .await
             {
-                Ok(w) => IntentOutcome::WithdrawalOk(w),
-                Err(ExchangeError::Timeout { .. }) => IntentOutcome::TimedOut {
+                Ok(withdrawal) => IntentOutcome::WithdrawalOk {
+                    withdrawal,
+                    intent_id: intent.intent_id.clone(),
+                    flow_type: FlowType::TToT,
+                },
+                Err(ExchangeError::Timeout { context }) => IntentOutcome::TimedOut {
                     intent_id: intent.intent_id,
                     flow_type: FlowType::TToT,
+                    context,
                 },
                 Err(e) => IntentOutcome::Failed {
                     intent_id: intent.intent_id,
@@ -131,10 +136,15 @@ pub async fn build_intent_future(
             )
             .await
             {
-                Ok(d) => IntentOutcome::DepositOk(d),
-                Err(ExchangeError::Timeout { .. }) => IntentOutcome::TimedOut {
+                Ok(deposit) => IntentOutcome::DepositOk {
+                    deposit,
+                    intent_id: intent.intent_id.clone(),
+                    flow_type: FlowType::TToZ,
+                },
+                Err(ExchangeError::Timeout { context }) => IntentOutcome::TimedOut {
                     intent_id: intent.intent_id,
                     flow_type: FlowType::TToZ,
+                    context,
                 },
                 Err(e) => IntentOutcome::Failed {
                     intent_id: intent.intent_id,
@@ -175,10 +185,11 @@ pub async fn build_intent_future(
             .await
             {
                 Ok(_) => {}
-                Err(ExchangeError::Timeout { .. }) => {
+                Err(ExchangeError::Timeout { context }) => {
                     return IntentOutcome::TimedOut {
                         intent_id: intent.intent_id,
                         flow_type: FlowType::ZToT,
+                        context,
                     }
                 }
                 Err(e) => {
@@ -205,10 +216,15 @@ pub async fn build_intent_future(
             )
             .await
             {
-                Ok(w) => IntentOutcome::WithdrawalOk(w),
-                Err(ExchangeError::Timeout { .. }) => IntentOutcome::TimedOut {
+                Ok(withdrawal) => IntentOutcome::WithdrawalOk {
+                    withdrawal,
+                    intent_id: intent.intent_id.clone(),
+                    flow_type: FlowType::ZToT,
+                },
+                Err(ExchangeError::Timeout { context }) => IntentOutcome::TimedOut {
                     intent_id: intent.intent_id,
                     flow_type: FlowType::ZToT,
+                    context,
                 },
                 Err(e) => IntentOutcome::Failed {
                     intent_id: intent.intent_id,
@@ -234,10 +250,15 @@ pub async fn build_intent_future(
             )
             .await
             {
-                Ok(d) => IntentOutcome::DepositOk(d),
-                Err(ExchangeError::Timeout { .. }) => IntentOutcome::TimedOut {
+                Ok(deposit) => IntentOutcome::DepositOk {
+                    deposit,
+                    intent_id: intent.intent_id.clone(),
+                    flow_type: FlowType::ZToZ,
+                },
+                Err(ExchangeError::Timeout { context }) => IntentOutcome::TimedOut {
                     intent_id: intent.intent_id,
                     flow_type: FlowType::ZToZ,
+                    context,
                 },
                 Err(e) => IntentOutcome::Failed {
                     intent_id: intent.intent_id,

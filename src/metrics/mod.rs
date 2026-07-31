@@ -12,7 +12,7 @@ use crate::data_model::{MetricSample, RpcCall};
 
 pub use error::MetricsError;
 pub use manifest::{
-    read_manifest, read_simulator_commit, read_z3_commits, write_manifest, RunManifest,
+    read_manifest, read_simulator_commit, read_z3_commits, write_manifest, RunManifest, RunTimeouts,
 };
 pub use recorder::{JsonlRecorder, NullRecorder};
 pub use run_dir::RunDir;

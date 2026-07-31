@@ -4,6 +4,20 @@ use std::path::Path;
 
 use super::error::MetricsError;
 
+/// The RPC transport timeout and confirmation/operation polling patience
+/// actually in effect for a run. These were previously hardcoded constants
+/// with no record of their value per run, which made it impossible to tell
+/// whether a low confirmation rate reflected the stack under test or an
+/// impatient client — see docs/scope.md's report data-sufficiency review.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct RunTimeouts {
+    pub rpc_timeout_ms: u64,
+    pub operation_poll_interval_ms: u64,
+    pub max_operation_wait_ms: u64,
+    pub confirmation_poll_interval_ms: u64,
+    pub max_confirmation_wait_ms: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunManifest {
     pub run_id: String,
@@ -16,6 +30,7 @@ pub struct RunManifest {
     pub scenario_name: String,
     pub scenario_config_hash: String,
     pub target_tps: f64,
+    pub timeouts: RunTimeouts,
 }
 
 pub fn write_manifest(path: &Path, manifest: &RunManifest) -> Result<(), MetricsError> {
@@ -29,41 +44,67 @@ pub fn read_manifest(path: &Path) -> Result<RunManifest, MetricsError> {
     serde_json::from_str(&content).map_err(MetricsError::Serialization)
 }
 
-pub fn read_z3_commits(lock_path: &Path) -> (String, String, String) {
-    let content = std::fs::read_to_string(lock_path).unwrap_or_default();
-    let extract = |section: &str| -> String {
-        let mut in_section = false;
-        for line in content.lines() {
-            let trimmed = line.trim();
-            if trimmed.starts_with(&format!("{section}:")) {
-                in_section = true;
-            } else if in_section && trimmed.starts_with("commit:") {
-                return trimmed["commit:".len()..].trim().to_string();
-            } else if in_section && !trimmed.is_empty() && !line.starts_with(' ') {
-                // Must check `line` (not `trimmed`) — trimmed never starts with a space.
-                in_section = false;
-            }
-        }
-        "unknown".to_string()
-    };
-    (extract("zebra"), extract("zaino"), extract("zallet"))
+#[derive(Debug, Default, Deserialize)]
+struct ComponentPin {
+    #[serde(default)]
+    commit: Option<String>,
 }
 
-pub fn read_simulator_commit() -> String {
-    std::process::Command::new("git")
-        .args(["rev-parse", "HEAD"])
-        .output()
-        .ok()
-        .and_then(|o| {
-            if o.status.success() {
-                String::from_utf8(o.stdout).ok()
-            } else {
-                None
-            }
-        })
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
+#[derive(Debug, Default, Deserialize)]
+struct Overrides {
+    #[serde(default)]
+    zebra: Option<ComponentPin>,
+    #[serde(default)]
+    zaino: Option<ComponentPin>,
+    #[serde(default)]
+    zallet: Option<ComponentPin>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct CommitsLock {
+    #[serde(default)]
+    zebra: Option<ComponentPin>,
+    #[serde(default)]
+    zaino: Option<ComponentPin>,
+    #[serde(default)]
+    zallet: Option<ComponentPin>,
+    #[serde(default)]
+    overrides: Overrides,
+}
+
+fn effective_commit(primary: Option<ComponentPin>, over: Option<ComponentPin>) -> String {
+    // The `overrides:` block, when present for a component, records the commit
+    // actually in effect at run time (applied via `Z3_*_IMAGE` env vars) — the
+    // frozen top-level pin exists for contractual attribution but may not be
+    // spendable at all (see docs/regtest-funding-plan.md). A run's manifest
+    // must record what actually ran, not merely the first pin encountered in
+    // the file.
+    over.and_then(|o| o.commit)
+        .or_else(|| primary.and_then(|p| p.commit))
         .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// Reads the commit actually in effect for each component: the `overrides:`
+/// entry when one exists for that component, otherwise the frozen top-level
+/// pin. Malformed or unreadable lock files degrade to `"unknown"` for every
+/// field rather than panicking.
+pub fn read_z3_commits(lock_path: &Path) -> (String, String, String) {
+    let content = std::fs::read_to_string(lock_path).unwrap_or_default();
+    let parsed: CommitsLock = serde_yaml::from_str(&content).unwrap_or_default();
+    (
+        effective_commit(parsed.zebra, parsed.overrides.zebra),
+        effective_commit(parsed.zaino, parsed.overrides.zaino),
+        effective_commit(parsed.zallet, parsed.overrides.zallet),
+    )
+}
+
+/// The commit this binary was built from, embedded at compile time by `build.rs`.
+///
+/// Deliberately not a runtime `git rev-parse HEAD` call: that reports the
+/// working tree's *current* commit, which silently diverges from the commit
+/// actually running whenever the binary isn't rebuilt after a later commit.
+pub fn read_simulator_commit() -> String {
+    env!("SIMULATOR_GIT_COMMIT").to_string()
 }
 
 #[cfg(test)]
@@ -85,6 +126,7 @@ mod tests {
             scenario_name: "smoke".into(),
             scenario_config_hash: "sha256:deadbeef".into(),
             target_tps: 10.0,
+            timeouts: RunTimeouts::default(),
         };
         write_manifest(&path, &m).unwrap();
         let back = read_manifest(&path).unwrap();
@@ -121,6 +163,52 @@ zallet:
     }
 
     #[test]
+    fn read_z3_commits_prefers_override_when_present() {
+        // Mirrors the real z3-commits.lock shape: a frozen top-level pin that
+        // cannot produce a non-zero confirmation rate, and an `overrides:`
+        // block recording what the simulator actually runs against. A run's
+        // manifest must reflect the latter, not the former — this is the bug
+        // a live run (20260731T133332Z-smoke) exposed: the manifest reported
+        // the frozen pin while the stack was demonstrably running overrides.
+        let fixture = r#"zebra:
+  commit: frozen-zebra
+zaino:
+  commit: frozen-zaino
+zallet:
+  commit: frozen-zallet
+
+overrides:
+  zebra:
+    commit: override-zebra
+  zallet:
+    commit: override-zallet
+"#;
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join("z3-commits.lock");
+        std::fs::write(&lock, fixture).unwrap();
+        let (z, i, t) = read_z3_commits(&lock);
+        assert_eq!(z, "override-zebra", "zebra has an override — must win");
+        assert_eq!(
+            i, "frozen-zaino",
+            "zaino has no override — frozen pin stands"
+        );
+        assert_eq!(t, "override-zallet", "zallet has an override — must win");
+    }
+
+    #[test]
+    fn read_z3_commits_against_real_lock_file_returns_the_active_overrides() {
+        // Regression test tied to the actual repo file, not a fixture — this
+        // is what a real run's manifest will now record. If the overrides
+        // block is ever bumped again (as it was beta.1 -> beta.2 today) this
+        // test's expected values must be updated alongside it.
+        let lock_path = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/z3-commits.lock"));
+        let (zebra, zaino, zallet) = read_z3_commits(lock_path);
+        assert_eq!(zebra, "bb41d69013edbfa8594bb097fa751f47eeb31445");
+        assert_eq!(zaino, "17963672d0c2cad97dd12bd38bbf1b6fd232c8c5");
+        assert_eq!(zallet, "bd7f020eb9e1de6f79da947e8102281832b05f83");
+    }
+
+    #[test]
     fn read_z3_commits_returns_unknown_when_file_absent() {
         let dir = tempfile::tempdir().unwrap();
         let lock = dir.path().join("missing.lock");
@@ -147,6 +235,7 @@ zallet:
                 scenario_name: "".into(),
                 scenario_config_hash: "".into(),
                 target_tps: 0.0,
+                timeouts: RunTimeouts::default(),
             },
         )
         .unwrap();
@@ -176,6 +265,7 @@ zallet:
             scenario_name: "phase".into(),
             scenario_config_hash: "hash".into(),
             target_tps: 5.0,
+            timeouts: RunTimeouts::default(),
         };
         write_manifest(&path, &m).unwrap();
         let partial = read_manifest(&path).unwrap();
@@ -208,6 +298,7 @@ zallet:
             scenario_name: "".into(),
             scenario_config_hash: "".into(),
             target_tps: 0.0,
+            timeouts: RunTimeouts::default(),
         };
         write_manifest(&path, &m).unwrap();
         let back = read_manifest(&path).unwrap();

@@ -36,8 +36,39 @@ attribution only. The simulator does not select backends directly.
 | Deviation | Behavior differs from zcashd — see Notes |
 | No-equiv | No zcashd equivalent exists |
 
-> **Tested?** is `No` for every method below: no scenario has yet been run against a
-> live Z3 stack. It flips to `Yes` per method once the integration suite runs.
+> **Tested? evidence.** As of 2026-07-31, 16 real runs exist under
+> `experiments/runs/` (`smoke` and single-flow `flow-check-{ttoz,ztot,ztoz}` probes;
+> `steady-state`/`ramp`/`burst`/`mixed` have not been run yet — see
+> `docs/scenarios/scenario-design.md`). Aggregated across all 16 runs' `rpc_calls.jsonl`,
+> the 16 methods below show at least one recorded call and are marked `Tested? = Yes`
+> below; every other method in this matrix has not been exercised by any run on disk
+> and stays `No`. Call counts (successes/total) as observed:
+>
+> `generate` 235/235 · `getblockchaininfo` 8/8 · `getblockcount` 78/78 ·
+> `getmempoolinfo` 111/111 · `getrawmempool` 111/111 · `getrawtransaction` 1800/1800 ·
+> `getwalletinfo` 8/8 · `z_getnewaccount` 80/80 · `z_getoperationresult` 106/106 ·
+> `z_getoperationstatus` 1699/1732 · `z_gettotalbalance` 94/121 · `z_listaccounts` 16/76 ·
+> `z_listunifiedreceivers` 88/88 · `z_listunspent` 0/68 · `z_sendmany` 341/550
+>
+> **One exception, flagged rather than silently included:** `z_getbalances` also
+> appears (44/120) in one older run (`20260731T100505Z-flow-check-ztot`), despite no
+> call site for that method existing anywhere in the RPC client source at the commit
+> its manifest claimed (`src/rpc/mod.rs` only implements `z_get_total_balance`).
+> **Explained and fixed, not just flagged:** the run's manifest recorded
+> `simulator_commit` via a runtime `git rev-parse HEAD` call, which reports the
+> working tree's *current* commit rather than the commit the running binary was
+> actually built from — so a stale, not-yet-rebuilt binary's run got mislabeled with
+> a newer commit than the one that produced it. `read_simulator_commit()` now embeds
+> the commit at compile time instead (`build.rs`), so this cannot recur; see
+> `docs/architecture/observability.md`. This specific historical run's data should
+> still not be mixed with current-commit runs in the findings report, since its true
+> originating commit is now unrecoverable — but the mechanism itself is resolved.
+> `z_getbalances` is **not** marked `Tested?` below.
+>
+> "Tested? = Yes" here means "observed at least once in real evidence," not "passes
+> reliably" — several of these methods have substantial failure rates in the same
+> data (e.g. `z_listunspent` 0/68, `z_sendmany` 341/550) documented elsewhere
+> (`docs/zallet-transparent-spending-bug.md`, `docs/regtest-funding-plan.md`).
 
 ---
 
@@ -47,8 +78,8 @@ attribution only. The simulator does not select backends directly.
 
 | Method | Backend | Test category | zcashd equiv? | T/Z | Implemented? | Tested? | Parity | Notes |
 |---|---|---|---|---|---|---|---|---|
-| `getblockchaininfo` | Zebra | Stress | Yes | N/A | Yes | No | TBD | Primary smoke signal; called at the start of every run. |
-| `getblockcount` | Zebra | Stress | Yes | N/A | Yes | No | TBD | |
+| `getblockchaininfo` | Zebra | Stress | Yes | N/A | Yes | Yes | TBD | Primary smoke signal; called at the start of every run. |
+| `getblockcount` | Zebra | Stress | Yes | N/A | Yes | Yes | TBD | |
 | `getbestblockhash` | Zebra | Stress | Yes | N/A | Yes | No | TBD | |
 | `getbestblockheightandhash` | Zebra | Stress | No | N/A | No | No | No-equiv | Zebra-specific combined tip height+hash. In the Foundation's confirmed stress list. |
 
@@ -64,7 +95,7 @@ attribution only. The simulator does not select backends directly.
 
 | Method | Backend | Test category | zcashd equiv? | T/Z | Implemented? | Tested? | Parity | Notes |
 |---|---|---|---|---|---|---|---|---|
-| `getrawtransaction` | Zebra + Zallet | Stress | Yes | Both | Yes | No | TBD | Listed under both backends; routed to Zebra. A Zallet wallet-aware variant is TBD. |
+| `getrawtransaction` | Zebra + Zallet | Stress | Yes | Both | Yes | Yes | TBD | Listed under both backends; routed to Zebra. A Zallet wallet-aware variant is TBD. |
 | `decoderawtransaction` | Zallet | — | Yes | Both | No | No | TBD | Not in Foundation's confirmed list. |
 | `gettxout` | Zebra | Stress | Yes | T | Yes | No | TBD | |
 
@@ -80,8 +111,8 @@ attribution only. The simulator does not select backends directly.
 
 | Method | Backend | Test category | zcashd equiv? | T/Z | Implemented? | Tested? | Parity | Notes |
 |---|---|---|---|---|---|---|---|---|
-| `getrawmempool` | Zebra | Stress | Yes | Both | Yes | No | TBD | Core mempool saturation signal. |
-| `getmempoolinfo` | Zebra | Stress | Yes | N/A | Yes | No | TBD | |
+| `getrawmempool` | Zebra | Stress | Yes | Both | Yes | Yes | TBD | Core mempool saturation signal. |
+| `getmempoolinfo` | Zebra | Stress | Yes | N/A | Yes | Yes | TBD | |
 
 ### Mempool notifications (gRPC)
 
@@ -122,7 +153,7 @@ the test rather than being part of the measured workload.
 
 | Method | Backend | Test category | zcashd equiv? | T/Z | Implemented? | Tested? | Parity | Notes |
 |---|---|---|---|---|---|---|---|---|
-| `generate` | Zebra | Regtest-control | Yes | N/A | Yes | No | TBD | Mine N blocks immediately; used in warmup and confirmation steps. |
+| `generate` | Zebra | Regtest-control | Yes | N/A | Yes | Yes | TBD | Mine N blocks immediately; used in warmup and confirmation steps. |
 | `invalidateblock` | Zebra | Regtest-control | Yes | N/A | No | No | TBD | Drives chain-reorganization scenarios. |
 | `reconsiderblock` | Zebra | Regtest-control | Yes | N/A | No | No | TBD | Restores a branch invalidated by `invalidateblock`. |
 
@@ -139,7 +170,7 @@ the test rather than being part of the measured workload.
 |---|---|---|---|---|---|---|---|---|
 | `validateaddress` | Zebra | Smoke | Yes | T | Yes | No | TBD | |
 | `z_validateaddress` | Zebra | Smoke | Yes | Z | No | No | TBD | Not present in Zallet at pinned commit. |
-| `z_listunifiedreceivers` | Zebra + Zallet | Smoke | No | Both | No | No | No-equiv | Lists individual receivers within a Unified Address. Listed under both backends. |
+| `z_listunifiedreceivers` | Zebra + Zallet | Smoke | No | Both | No | Yes | No-equiv | Lists individual receivers within a Unified Address. Listed under both backends. |
 
 ### Transaction broadcast
 
@@ -161,9 +192,9 @@ Zallet uses an account model that replaces zcashd's per-address generation.
 
 | Method | Backend | Test category | zcashd equiv? | T/Z | Implemented? | Tested? | Parity | Notes |
 |---|---|---|---|---|---|---|---|---|
-| `z_getnewaccount` | Zallet | Stress | No | Both | Yes | No | No-equiv | Replaces `getnewaddress` + `z_getnewaddress`. |
+| `z_getnewaccount` | Zallet | Stress | No | Both | Yes | Yes | No-equiv | Replaces `getnewaddress` + `z_getnewaddress`. |
 | `z_getaddressforaccount` | Zallet | Stress | No | Both | Yes | No | No-equiv | Derives a Unified Address from an account. |
-| `z_listaccounts` | Zallet | Stress | No | Both | Yes | No | No-equiv | |
+| `z_listaccounts` | Zallet | Stress | No | Both | Yes | Yes | No-equiv | |
 | `z_getaccount` | Zallet | Stress | No | Both | Yes | No | No-equiv | |
 | `listaddresses` | Zallet | Stress | No | Both | Yes | No | No-equiv | |
 
@@ -171,38 +202,38 @@ Zallet uses an account model that replaces zcashd's per-address generation.
 
 | Method | Backend | Test category | zcashd equiv? | T/Z | Implemented? | Tested? | Parity | Notes |
 |---|---|---|---|---|---|---|---|---|
-| `z_gettotalbalance` | Zallet | Stress | Yes | Both | Yes | No | TBD | Requires `include_watchonly=true` at the pinned Zallet commit. |
+| `z_gettotalbalance` | Zallet | Stress | Yes | Both | Yes | Yes | TBD | Requires `include_watchonly=true` at the pinned Zallet commit. |
 
 ### Transaction creation
 
 | Method | Backend | Test category | zcashd equiv? | T/Z | Implemented? | Tested? | Parity | Notes |
 |---|---|---|---|---|---|---|---|---|
-| `z_sendmany` | Zallet | Stress | Yes | Both | Yes | No | Deviation | `fee` must be `null`; auto-computed via ZIP 317. Returns operation ID immediately (async). |
+| `z_sendmany` | Zallet | Stress | Yes | Both | Yes | Yes | Deviation | `fee` must be `null`; auto-computed via ZIP 317. Returns operation ID immediately (async). |
 
 ### Async operations
 
 | Method | Backend | Test category | zcashd equiv? | T/Z | Implemented? | Tested? | Parity | Notes |
 |---|---|---|---|---|---|---|---|---|
-| `z_getoperationstatus` | Zallet | Stress | Yes | Z | Yes | No | TBD | |
-| `z_getoperationresult` | Zallet | Stress | Yes | Z | Yes | No | TBD | |
+| `z_getoperationstatus` | Zallet | Stress | Yes | Z | Yes | Yes | TBD | |
+| `z_getoperationresult` | Zallet | Stress | Yes | Z | Yes | Yes | TBD | |
 | `z_listoperationids` | Zallet | Stress | Yes | Z | Yes | No | TBD | |
 
 ### Wallet — transaction history and notes
 
 | Method | Backend | Test category | zcashd equiv? | T/Z | Implemented? | Tested? | Parity | Notes |
 |---|---|---|---|---|---|---|---|---|
-| `z_listunspent` | Zallet | Stress | Yes | Z | Yes | No | Deviation | `amount` renamed to `value`; new fields added vs zcashd. |
+| `z_listunspent` | Zallet | Stress | Yes | Z | Yes | Yes | Deviation | `amount` renamed to `value`; new fields added vs zcashd. |
 | `z_listtransactions` | Zallet | Stress | No | Both | No | No | No-equiv | Not in zcashd. |
 | `z_getnotescount` | Zallet | Stress | No | Z | No | No | No-equiv | Count of unspent notes — shielded state size signal. |
 | `z_viewtransaction` | Zallet | Stress | Yes | Both | No | No | TBD | Decode full wallet transaction details. |
 | `z_recoveraccounts` | Zallet | Stress | No | Both | No | No | No-equiv | Recover accounts from wallet seed. |
-| `getrawtransaction` | Zebra + Zallet | Stress | Yes | Both | Yes | No | TBD | See Transaction lookup section above. |
+| `getrawtransaction` | Zebra + Zallet | Stress | Yes | Both | Yes | Yes | TBD | See Transaction lookup section above. |
 
 ### Wallet — management
 
 | Method | Backend | Test category | zcashd equiv? | T/Z | Implemented? | Tested? | Parity | Notes |
 |---|---|---|---|---|---|---|---|---|
-| `getwalletinfo` | Zallet | Smoke | Yes | N/A | Yes | No | TBD | |
+| `getwalletinfo` | Zallet | Smoke | Yes | N/A | Yes | Yes | TBD | |
 | `walletlock` | Zallet | Smoke | Yes | N/A | No | No | TBD | |
 | `walletpassphrase` | Zallet | Smoke | Yes | N/A | No | No | TBD | |
 | `help` | Zallet | Smoke | Yes | N/A | No | No | TBD | |

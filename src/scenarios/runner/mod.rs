@@ -16,7 +16,7 @@ use tokio::time::MissedTickBehavior;
 use crate::data_model::{MetricSample, ScenarioConfig};
 use crate::metrics::{
     read_simulator_commit, read_z3_commits, write_manifest, JsonlRecorder, MetricsRecorder, RunDir,
-    RunManifest,
+    RunManifest, RunTimeouts,
 };
 use crate::scenarios::exchange::{run_mempool_watcher, PollingConfig};
 use crate::synthetic::generators::TransactionIntentGenerator;
@@ -160,7 +160,17 @@ pub async fn run(scenario: ScenarioConfig, opts: RunOptions) -> Result<RunResult
     let metrics: Arc<dyn MetricsRecorder> = recorder.clone();
 
     // 5. Write the initial run manifest (completed_at filled in by teardown).
-    let (zebra_commit, zaino_commit, zallet_commit) = read_z3_commits(Path::new("z3-commits.lock"));
+    // Anchored to the crate root at compile time, not resolved relative to the
+    // process's working directory at run time — a relative path here silently
+    // reads whatever file happens to occupy that path from the invoking shell's
+    // cwd, which is exactly the kind of build/run environment dependency this
+    // manifest exists to rule out.
+    let lock_path = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/z3-commits.lock"));
+    let (zebra_commit, zaino_commit, zallet_commit) = read_z3_commits(lock_path);
+    // Same resolution `load_phase` applies later — recorded here so the
+    // manifest reflects the polling patience actually in effect for this run,
+    // not just the crate's compiled-in default.
+    let effective_polling = opts.polling.unwrap_or_default();
     let mut manifest = RunManifest {
         run_id: run_id.clone(),
         run_started_at: Utc::now(),
@@ -172,6 +182,15 @@ pub async fn run(scenario: ScenarioConfig, opts: RunOptions) -> Result<RunResult
         scenario_name: scenario.name.clone(),
         scenario_config_hash: scenario.config_hash.clone(),
         target_tps: scenario.load_target_tps,
+        timeouts: RunTimeouts {
+            rpc_timeout_ms: crate::rpc::DEFAULT_TIMEOUT.as_millis() as u64,
+            operation_poll_interval_ms: effective_polling.operation_poll_interval.as_millis()
+                as u64,
+            max_operation_wait_ms: effective_polling.max_operation_wait.as_millis() as u64,
+            confirmation_poll_interval_ms: effective_polling.confirmation_poll_interval.as_millis()
+                as u64,
+            max_confirmation_wait_ms: effective_polling.max_confirmation_wait.as_millis() as u64,
+        },
     };
     write_manifest(&run_dir.manifest_path(), &manifest)
         .map_err(|e| RunnerError::Metrics(e.to_string()))?;
@@ -249,12 +268,13 @@ pub async fn run(scenario: ScenarioConfig, opts: RunOptions) -> Result<RunResult
             };
             for o in &outcomes {
                 match o {
-                    IntentOutcome::WithdrawalOk(_) | IntentOutcome::DepositOk(_) => {
+                    IntentOutcome::WithdrawalOk { .. } | IntentOutcome::DepositOk { .. } => {
                         stats.confirmed += 1;
                     }
                     IntentOutcome::Failed { .. } => stats.failed += 1,
                     IntentOutcome::TimedOut { .. } => stats.timed_out += 1,
                 }
+                recorder.record_intent(crate::data_model::IntentRecord::from_outcome(o, &run_id));
             }
             Ok(RunResult {
                 run_id,
@@ -410,7 +430,7 @@ async fn load_phase(
         .filter(|o| {
             matches!(
                 o,
-                IntentOutcome::WithdrawalOk(_) | IntentOutcome::DepositOk(_)
+                IntentOutcome::WithdrawalOk { .. } | IntentOutcome::DepositOk { .. }
             )
         })
         .count();

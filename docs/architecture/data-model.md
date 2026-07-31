@@ -240,3 +240,26 @@ designed to be compatible with Prometheus/OpenMetrics for future integration.
 | `metric_name` | `string` | e.g. `rpc_latency_ms`, `mempool_tx_count`, `confirmed_txs_total` | No |
 | `value` | `f64` | Numeric value of the sample | No |
 | `labels` | `Map<string, string>` | Dimensions, e.g. `{"component": "Zebra", "method": "getblockcount"}` | No |
+
+---
+
+## IntentRecord
+
+The persisted outcome of a single dispatched `TransactionIntent`, written to
+`intents.jsonl` once the load phase completes. One record per intent, regardless of
+outcome — confirmed, failed, or timed out.
+
+| Field | Type | Description | Zcash-specific? |
+|---|---|---|---|
+| `run_id` | `string` | Which simulator run | No |
+| `intent_id` | `string` | Links back to the originating `TransactionIntent` | No |
+| `flow_type` | `enum(t_to_t, t_to_z, z_to_t, z_to_z)` | Transparent/shielded classification | Yes — Zcash pool distinction |
+| `outcome` | `enum(confirmed, failed, timed_out)` | Final state of the intent | No |
+| `error` | `Option<string>` | Set when `outcome == failed`; the underlying error message | No |
+| `timeout_context` | `Option<string>` | Set when `outcome == timed_out`; distinguishes an async-operation (ZK proving) wait from a confirmation-depth wait — see the two `ExchangeError::Timeout` sites in `src/scenarios/exchange.rs` | Yes — proving vs. confirmation are Zcash-specific wait phases |
+| `recorded_at` | `timestamp` | Wall-clock time the outcome was recorded | No |
+
+This is the primary data source for per-flow-type failure/timeout attribution in the
+findings report — `RunStats`' aggregate confirmed/failed/timed-out counts alone cannot
+distinguish, for example, whether Z→T flows fail more often than T→Z flows, or whether
+a run's timeouts were dominated by ZK-proving stalls or by slow confirmation.

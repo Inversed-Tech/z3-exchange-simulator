@@ -2,14 +2,15 @@
 
 ## What is measured
 
-Every simulator run produces five categories of observation:
+Every simulator run produces six categories of observation:
 
 | Category | Purpose | Output file |
 |---|---|---|
 | **RPC call log** | Per-call latency, success/failure, method, component | `rpc_calls.jsonl` |
+| **Intent outcome log** | Per-intent confirmed/failed/timed-out result, by flow type | `intents.jsonl` |
 | **Metric samples** | Time-series: throughput, mempool size, confirmation times | `metrics.jsonl` |
 | **Component logs** | Stdout/stderr from Zebra, Zaino, and Zallet processes | `component_logs/` |
-| **Run manifest** | Exact commits, scenario, and timestamps for reproducibility | `manifest.json` |
+| **Run manifest** | Exact commits, scenario, timeouts, and timestamps for reproducibility | `manifest.json` |
 | **Run summary** | Human-readable narrative of results and key findings | `summary.md` |
 
 ---
@@ -24,17 +25,66 @@ scenario configuration used. Required for any finding to be reportable.
   "run_id": "20260602T140000Z-smoke",
   "run_started_at": "2026-06-02T14:00:00Z",
   "run_completed_at": "2026-06-02T14:01:03Z",
-  "simulator_commit": "<git SHA of this repository>",
+  "simulator_commit": "<git SHA the running binary was compiled from, embedded at build time>",
   "zebra_commit": "<SHA from z3-commits.lock>",
   "zaino_commit": "<SHA from z3-commits.lock>",
   "zallet_commit": "<SHA from z3-commits.lock>",
   "scenario_name": "smoke",
-  "scenario_config_hash": "sha256:<hash of scenario YAML content>"
+  "scenario_config_hash": "sha256:<hash of scenario YAML content>",
+  "timeouts": {
+    "rpc_timeout_ms": 30000,
+    "operation_poll_interval_ms": 2000,
+    "max_operation_wait_ms": 120000,
+    "confirmation_poll_interval_ms": 1000,
+    "max_confirmation_wait_ms": 60000
+  }
 }
 ```
 
 **Run ID format:** `<YYYYMMDDTHHMMSSZ>-<scenario-name>`. Sortable, human-readable, and
 unique per run (assuming no two runs of the same scenario start in the same second).
+
+**`simulator_commit` is embedded at compile time** (`build.rs` shells out to
+`git rev-parse HEAD` at build time and bakes the result into the binary via
+`SIMULATOR_GIT_COMMIT`), not read from the working tree at run time. A prior
+implementation called `git rev-parse HEAD` when the run started, which silently
+mislabeled every run with whatever commit the source tree happened to be on if the
+binary wasn't rebuilt after a later commit — the binary that actually executed and
+the commit recorded in the manifest could diverge with no indication. Likewise,
+`zebra_commit`/`zaino_commit`/`zallet_commit` are read from `z3-commits.lock` at a path
+anchored to the crate root at compile time (`CARGO_MANIFEST_DIR`), not resolved
+relative to the process's working directory at run time.
+
+**`timeouts`** records the RPC transport timeout and the confirmation/operation
+polling patience actually in effect for the run — previously hardcoded constants
+(`src/rpc/mod.rs`, `src/scenarios/exchange.rs::PollingConfig`) with no per-run record
+of their value, which made it impossible to tell whether a low confirmation rate
+reflected the stack under test or an impatient client.
+
+---
+
+## Intent outcome log (`intents.jsonl`)
+
+One JSON object per line, one line per dispatched transaction intent, written once
+the load phase completes. Previously an intent's outcome (`IntentOutcome`) existed
+only in memory during a run and was discarded after being folded into the run's
+aggregate confirmed/failed/timed-out counts — there was no way to attribute a failure
+to a specific flow type, or to tell an async-operation (ZK proving) timeout apart from
+a confirmation-depth timeout, from the persisted output alone.
+
+```json
+{"run_id":"20260602T140000Z-smoke","intent_id":"a1b2c3","flow_type":"t_to_z","outcome":"confirmed","error":null,"timeout_context":null,"recorded_at":"2026-06-02T14:00:45Z"}
+{"run_id":"20260602T140000Z-smoke","intent_id":"d4e5f6","flow_type":"z_to_t","outcome":"failed","error":"RPC error: ...","timeout_context":null,"recorded_at":"2026-06-02T14:00:47Z"}
+{"run_id":"20260602T140000Z-smoke","intent_id":"g7h8i9","flow_type":"t_to_z","outcome":"timed_out","error":null,"timeout_context":"operation op-1 did not complete within the deadline","recorded_at":"2026-06-02T14:00:52Z"}
+```
+
+`outcome` is one of `confirmed` / `failed` / `timed_out`. `timeout_context` is set only
+when `outcome == "timed_out"` and distinguishes an async-operation wait ("operation
+`<id>` did not complete within the deadline") from a confirmation-depth wait ("tx
+`<id>` did not reach N confirmations within the deadline") — the two `ExchangeError::Timeout`
+call sites in `src/scenarios/exchange.rs`. `generate_summary` reads this file (if
+present — older runs predating this feature simply produce no "Outcomes by flow type"
+section) to break down outcomes and timeout stages per flow type in `summary.md`.
 
 ---
 
@@ -155,6 +205,18 @@ the Foundation and component teams without requiring them to parse JSONL files.
 - Peak mempool size: <n> transactions
 - Mempool saturation events: <n>
 
+## Outcomes by flow type
+| Flow type | Confirmed | Failed | Timed out |
+|---|---|---|---|
+| ...       | ...       | ...    | ...       |
+
+### Timeouts by stage
+- async operation (ZK proving) wait: <n>
+- on-chain confirmation wait: <n>
+
+(Omitted entirely for runs with no `intents.jsonl`, e.g. runs recorded before this
+section existed.)
+
 ## Notable errors and findings
 - ...
 
@@ -169,9 +231,10 @@ the Foundation and component teams without requiring them to parse JSONL files.
 ```
 experiments/runs/
   <run-id>/
-    manifest.json          Run metadata and commit pins
+    manifest.json          Run metadata, commit pins, and effective timeouts
     scenario.yaml          Exact scenario config snapshot
     rpc_calls.jsonl        Per-call log (one JSON object per line)
+    intents.jsonl          Per-intent outcome log, by flow type
     metrics.jsonl          Time-series metric samples
     component_logs/
       zebra.log

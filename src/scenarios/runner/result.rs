@@ -1,12 +1,22 @@
 //! Outcome types and run statistics for the scenario runner.
 
-use crate::data_model::{Deposit, FlowType, Withdrawal};
+use chrono::Utc;
+
+use crate::data_model::{Deposit, FlowType, IntentRecord, Withdrawal};
 
 /// The outcome of a single dispatched transaction intent.
 #[derive(Debug)]
 pub enum IntentOutcome {
-    WithdrawalOk(Withdrawal),
-    DepositOk(Deposit),
+    WithdrawalOk {
+        withdrawal: Withdrawal,
+        intent_id: String,
+        flow_type: FlowType,
+    },
+    DepositOk {
+        deposit: Deposit,
+        intent_id: String,
+        flow_type: FlowType,
+    },
     Failed {
         intent_id: String,
         flow_type: FlowType,
@@ -15,7 +25,66 @@ pub enum IntentOutcome {
     TimedOut {
         intent_id: String,
         flow_type: FlowType,
+        /// Which wait timed out, e.g. "operation <id> did not complete within
+        /// the deadline" (async ZK proving) vs. "tx <id> did not reach N
+        /// confirmations" — propagated from `ExchangeError::Timeout`'s own
+        /// context string. Needed to tell an RPC-layer stall apart from a
+        /// confirmation-depth stall when reading the findings report.
+        context: String,
     },
+}
+
+impl IntentRecord {
+    pub fn from_outcome(outcome: &IntentOutcome, run_id: &str) -> Self {
+        let recorded_at = Utc::now();
+        let run_id = run_id.to_string();
+        match outcome {
+            IntentOutcome::WithdrawalOk {
+                intent_id,
+                flow_type,
+                ..
+            }
+            | IntentOutcome::DepositOk {
+                intent_id,
+                flow_type,
+                ..
+            } => Self {
+                run_id,
+                intent_id: intent_id.clone(),
+                flow_type: flow_type.clone(),
+                outcome: "confirmed".to_string(),
+                error: None,
+                timeout_context: None,
+                recorded_at,
+            },
+            IntentOutcome::Failed {
+                intent_id,
+                flow_type,
+                error,
+            } => Self {
+                run_id,
+                intent_id: intent_id.clone(),
+                flow_type: flow_type.clone(),
+                outcome: "failed".to_string(),
+                error: Some(error.clone()),
+                timeout_context: None,
+                recorded_at,
+            },
+            IntentOutcome::TimedOut {
+                intent_id,
+                flow_type,
+                context,
+            } => Self {
+                run_id,
+                intent_id: intent_id.clone(),
+                flow_type: flow_type.clone(),
+                outcome: "timed_out".to_string(),
+                error: None,
+                timeout_context: Some(context.clone()),
+                recorded_at,
+            },
+        }
+    }
 }
 
 /// Aggregate statistics collected during the load phase.

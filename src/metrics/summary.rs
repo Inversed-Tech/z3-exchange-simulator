@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
 
-use crate::data_model::{MetricSample, RpcCall};
+use crate::data_model::{IntentRecord, MetricSample, RpcCall};
 
 use super::error::MetricsError;
 use super::latency::percentile_value;
@@ -22,6 +22,29 @@ struct MetricAgg {
     saturation_events: u64,
     proving_ms: Vec<u64>,
     tps_achieved: Option<f64>,
+}
+
+#[derive(Default)]
+struct IntentAgg {
+    confirmed: u64,
+    failed: u64,
+    timed_out: u64,
+}
+
+/// Coarse timeout attribution derived from the free-text context recorded in
+/// `IntentRecord.timeout_context` (see `ExchangeError::Timeout`'s two call
+/// sites in `src/scenarios/exchange.rs`): an async-operation (ZK proving)
+/// stall reads "operation <id> did not complete ..."; a confirmation-depth
+/// stall reads "tx <id> did not reach ... confirmations". Bucketing avoids a
+/// summary table exploding into one row per distinct intent/tx id.
+fn timeout_stage(context: &str) -> &'static str {
+    if context.starts_with("operation ") {
+        "async operation (ZK proving) wait"
+    } else if context.starts_with("tx ") {
+        "on-chain confirmation wait"
+    } else {
+        "other"
+    }
 }
 
 pub fn generate_summary(run_dir: &RunDir, manifest: &RunManifest) -> Result<String, MetricsError> {
@@ -100,6 +123,43 @@ pub fn generate_summary(run_dir: &RunDir, manifest: &RunManifest) -> Result<Stri
                     _ => {}
                 },
                 Err(e) => eprintln!("[metrics] summary: malformed metrics line: {e}"),
+            }
+        }
+    }
+
+    // intents.jsonl is optional: runs recorded before this file existed (or
+    // any run whose intents writer failed to open) simply produce no
+    // "Outcomes by flow type" detail below, rather than an error.
+    let mut intent_aggs: HashMap<String, IntentAgg> = HashMap::new();
+    let mut timeout_stage_counts: HashMap<&'static str, u64> = HashMap::new();
+    let intents_path = run_dir.intents_path();
+    if intents_path.exists() {
+        let file = std::fs::File::open(&intents_path).map_err(MetricsError::Io)?;
+        for line in BufReader::new(file).lines() {
+            let line = line.map_err(MetricsError::Io)?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            match serde_json::from_str::<IntentRecord>(&line) {
+                Ok(record) => {
+                    let flow_key = serde_json::to_value(&record.flow_type)
+                        .ok()
+                        .and_then(|v| v.as_str().map(str::to_string))
+                        .unwrap_or_else(|| "unknown".to_string());
+                    let agg = intent_aggs.entry(flow_key).or_default();
+                    match record.outcome.as_str() {
+                        "confirmed" => agg.confirmed += 1,
+                        "failed" => agg.failed += 1,
+                        "timed_out" => {
+                            agg.timed_out += 1;
+                            if let Some(ctx) = &record.timeout_context {
+                                *timeout_stage_counts.entry(timeout_stage(ctx)).or_default() += 1;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                Err(e) => eprintln!("[metrics] summary: malformed intents line: {e}"),
             }
         }
     }
@@ -214,6 +274,31 @@ pub fn generate_summary(run_dir: &RunDir, manifest: &RunManifest) -> Result<Stri
         ));
     }
 
+    if !intent_aggs.is_empty() {
+        md.push_str("## Outcomes by flow type\n");
+        md.push_str("| Flow type | Confirmed | Failed | Timed out |\n");
+        md.push_str("|---|---|---|---|\n");
+        let mut flow_entries: Vec<_> = intent_aggs.iter().collect();
+        flow_entries.sort_by(|a, b| a.0.cmp(b.0));
+        for (flow_type, agg) in flow_entries {
+            md.push_str(&format!(
+                "| {flow_type} | {} | {} | {} |\n",
+                agg.confirmed, agg.failed, agg.timed_out
+            ));
+        }
+        md.push('\n');
+
+        if !timeout_stage_counts.is_empty() {
+            md.push_str("### Timeouts by stage\n");
+            let mut stages: Vec<_> = timeout_stage_counts.iter().collect();
+            stages.sort_by(|a, b| b.1.cmp(a.1));
+            for (stage, count) in stages {
+                md.push_str(&format!("- {stage}: {count}\n"));
+            }
+            md.push('\n');
+        }
+    }
+
     md.push_str("## Notable errors and findings\n");
     let has_errors = agg_entries
         .iter()
@@ -237,7 +322,7 @@ pub fn generate_summary(run_dir: &RunDir, manifest: &RunManifest) -> Result<Stri
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::metrics::manifest::RunManifest;
+    use crate::metrics::manifest::{RunManifest, RunTimeouts};
     use crate::metrics::run_dir::RunDir;
     use crate::metrics::writers::JsonlWriter;
 
@@ -276,6 +361,7 @@ mod tests {
             scenario_name: "sumtest".into(),
             scenario_config_hash: "sha:0".into(),
             target_tps: 10.0,
+            timeouts: RunTimeouts::default(),
         };
 
         generate_summary(&rd, &manifest).unwrap();
@@ -337,6 +423,7 @@ mod tests {
             scenario_name: "tpstest".into(),
             scenario_config_hash: "".into(),
             target_tps: 50.0,
+            timeouts: RunTimeouts::default(),
         };
         generate_summary(&rd, &manifest).unwrap();
         let md = std::fs::read_to_string(rd.summary_path()).unwrap();
@@ -368,6 +455,7 @@ mod tests {
             scenario_name: "empty".into(),
             scenario_config_hash: "".into(),
             target_tps: 0.0,
+            timeouts: RunTimeouts::default(),
         };
         generate_summary(&rd, &manifest).unwrap();
         assert!(rd.summary_path().exists());
@@ -395,6 +483,7 @@ mod tests {
             scenario_name: "malformed".into(),
             scenario_config_hash: "".into(),
             target_tps: 0.0,
+            timeouts: RunTimeouts::default(),
         };
         generate_summary(&rd, &manifest).unwrap();
         assert!(rd.summary_path().exists());
@@ -418,6 +507,7 @@ mod tests {
             scenario_name: "incomplete".into(),
             scenario_config_hash: "".into(),
             target_tps: 0.0,
+            timeouts: RunTimeouts::default(),
         };
         let md = generate_summary(&rd, &manifest).unwrap();
         assert!(
@@ -456,6 +546,7 @@ mod tests {
             scenario_name: "proving".into(),
             scenario_config_hash: "".into(),
             target_tps: 0.0,
+            timeouts: RunTimeouts::default(),
         };
         let md = generate_summary(&rd, &manifest).unwrap();
         assert!(
@@ -508,6 +599,7 @@ mod tests {
             scenario_name: "mempool".into(),
             scenario_config_hash: "".into(),
             target_tps: 0.0,
+            timeouts: RunTimeouts::default(),
         };
         let md = generate_summary(&rd, &manifest).unwrap();
         assert!(
@@ -555,6 +647,7 @@ mod tests {
             scenario_name: "errcode".into(),
             scenario_config_hash: "".into(),
             target_tps: 0.0,
+            timeouts: RunTimeouts::default(),
         };
         let md = generate_summary(&rd, &manifest).unwrap();
         assert!(
@@ -568,6 +661,77 @@ mod tests {
         assert!(
             md.contains("sendrawtransaction"),
             "method name must appear with error code; got:\n{md}"
+        );
+    }
+
+    #[test]
+    fn generate_summary_outcomes_by_flow_type_from_intents_jsonl() {
+        use crate::data_model::{FlowType, IntentRecord};
+        use chrono::Utc;
+        let base = tempfile::tempdir().unwrap();
+        let rd = RunDir::create(base.path(), "intents").unwrap();
+        std::fs::write(rd.rpc_calls_path(), "").unwrap();
+        std::fs::write(rd.metrics_path(), "").unwrap();
+
+        let iwriter = JsonlWriter::<IntentRecord>::open(&rd.intents_path()).unwrap();
+        iwriter.write_record(&IntentRecord {
+            run_id: rd.run_id.clone(),
+            intent_id: "i-1".into(),
+            flow_type: FlowType::TToZ,
+            outcome: "confirmed".into(),
+            error: None,
+            timeout_context: None,
+            recorded_at: Utc::now(),
+        });
+        iwriter.write_record(&IntentRecord {
+            run_id: rd.run_id.clone(),
+            intent_id: "i-2".into(),
+            flow_type: FlowType::TToZ,
+            outcome: "timed_out".into(),
+            error: None,
+            timeout_context: Some("operation op-1 did not complete within the deadline".into()),
+            recorded_at: Utc::now(),
+        });
+        iwriter.write_record(&IntentRecord {
+            run_id: rd.run_id.clone(),
+            intent_id: "i-3".into(),
+            flow_type: FlowType::ZToT,
+            outcome: "timed_out".into(),
+            error: None,
+            timeout_context: Some(
+                "tx abc did not reach 3 confirmations within the deadline".into(),
+            ),
+            recorded_at: Utc::now(),
+        });
+        drop(iwriter);
+
+        let manifest = RunManifest {
+            run_id: rd.run_id.clone(),
+            run_started_at: Utc::now(),
+            run_completed_at: Some(Utc::now()),
+            simulator_commit: "".into(),
+            zebra_commit: "".into(),
+            zaino_commit: "".into(),
+            zallet_commit: "".into(),
+            scenario_name: "intents".into(),
+            scenario_config_hash: "".into(),
+            target_tps: 0.0,
+            timeouts: RunTimeouts::default(),
+        };
+        let md = generate_summary(&rd, &manifest).unwrap();
+        assert!(
+            md.contains("## Outcomes by flow type"),
+            "missing outcomes-by-flow-type section; got:\n{md}"
+        );
+        assert!(md.contains("t_to_z"), "missing t_to_z row; got:\n{md}");
+        assert!(md.contains("z_to_t"), "missing z_to_t row; got:\n{md}");
+        assert!(
+            md.contains("async operation (ZK proving) wait"),
+            "missing async-operation timeout stage; got:\n{md}"
+        );
+        assert!(
+            md.contains("on-chain confirmation wait"),
+            "missing confirmation-wait timeout stage; got:\n{md}"
         );
     }
 
@@ -589,6 +753,7 @@ mod tests {
             scenario_name: "retval".into(),
             scenario_config_hash: "".into(),
             target_tps: 0.0,
+            timeouts: RunTimeouts::default(),
         };
         let returned = generate_summary(&rd, &manifest).unwrap();
         let on_disk = std::fs::read_to_string(rd.summary_path()).unwrap();
@@ -616,6 +781,7 @@ mod tests {
             scenario_name: "norpc".into(),
             scenario_config_hash: "".into(),
             target_tps: 0.0,
+            timeouts: RunTimeouts::default(),
         };
         let md = generate_summary(&rd, &manifest).unwrap();
         assert!(
@@ -643,6 +809,7 @@ mod tests {
             scenario_name: "zerotx".into(),
             scenario_config_hash: "".into(),
             target_tps: 0.0,
+            timeouts: RunTimeouts::default(),
         };
         // Must not panic or return Err.
         let md = generate_summary(&rd, &manifest).unwrap();

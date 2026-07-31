@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use chrono::Utc;
 
-use crate::data_model::{MetricSample, RpcCall};
+use crate::data_model::{IntentRecord, MetricSample, RpcCall};
 
 use super::error::MetricsError;
 use super::latency::LatencyAccumulator;
@@ -13,6 +13,7 @@ use super::MetricsRecorder;
 pub struct JsonlRecorder {
     rpc_writer: JsonlWriter<RpcCall>,
     metric_writer: JsonlWriter<MetricSample>,
+    intent_writer: JsonlWriter<IntentRecord>,
     pub(crate) latency: LatencyAccumulator,
 }
 
@@ -21,8 +22,15 @@ impl JsonlRecorder {
         Ok(Self {
             rpc_writer: JsonlWriter::open(&run_dir.rpc_calls_path())?,
             metric_writer: JsonlWriter::open(&run_dir.metrics_path())?,
+            intent_writer: JsonlWriter::open(&run_dir.intents_path())?,
             latency: LatencyAccumulator::new(),
         })
+    }
+
+    /// Persist one intent's final outcome. Called once per dispatched intent
+    /// after the load phase completes — see `docs/architecture/observability.md`.
+    pub fn record_intent(&self, record: IntentRecord) {
+        self.intent_writer.write_record(&record);
     }
 
     pub fn flush_latency_samples(&self, run_id: &str) {
@@ -79,6 +87,28 @@ mod tests {
         let _rec = JsonlRecorder::new(&rd).unwrap();
         assert!(rd.rpc_calls_path().exists());
         assert!(rd.metrics_path().exists());
+        assert!(rd.intents_path().exists());
+    }
+
+    #[test]
+    fn record_intent_writes_to_intents_file() {
+        use crate::data_model::{FlowType, IntentRecord};
+        use chrono::Utc;
+        let base = tempfile::tempdir().unwrap();
+        let rd = RunDir::create(base.path(), "intent-test").unwrap();
+        let rec = JsonlRecorder::new(&rd).unwrap();
+        rec.record_intent(IntentRecord {
+            run_id: "r-1".into(),
+            intent_id: "i-1".into(),
+            flow_type: FlowType::TToT,
+            outcome: "timed_out".into(),
+            error: None,
+            timeout_context: Some("tx abc did not reach 3 confirmations".into()),
+            recorded_at: Utc::now(),
+        });
+        let content = std::fs::read_to_string(rd.intents_path()).unwrap();
+        assert!(content.contains("timed_out"));
+        assert!(content.contains("did not reach 3 confirmations"));
     }
 
     #[test]

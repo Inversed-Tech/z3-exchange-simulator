@@ -72,6 +72,10 @@ impl RunDir {
         self.path.join("metrics.jsonl")
     }
 
+    pub fn intents_path(&self) -> PathBuf {
+        self.path.join("intents.jsonl")
+    }
+
     pub fn manifest_path(&self) -> PathBuf {
         self.path.join("manifest.json")
     }
@@ -189,6 +193,7 @@ mod tests {
         let rd = RunDir::create(base.path(), "paths").unwrap();
         assert_eq!(rd.rpc_calls_path().file_name().unwrap(), "rpc_calls.jsonl");
         assert_eq!(rd.metrics_path().file_name().unwrap(), "metrics.jsonl");
+        assert_eq!(rd.intents_path().file_name().unwrap(), "intents.jsonl");
         assert_eq!(rd.manifest_path().file_name().unwrap(), "manifest.json");
         assert_eq!(rd.summary_path().file_name().unwrap(), "summary.md");
         assert_eq!(
