@@ -247,6 +247,32 @@ pub async fn run(scenario: ScenarioConfig, opts: RunOptions) -> Result<RunResult
     )
     .await;
 
+    // Tally stats and persist per-intent outcomes to intents.jsonl *before*
+    // teardown — teardown calls finalize_run_artifacts(), which generates
+    // summary.md from whatever intents.jsonl contains at that moment. Doing
+    // this after teardown (as an earlier version of this code did) meant
+    // summary.md was always generated before any intent was recorded, so its
+    // "Outcomes by flow type" section silently never appeared.
+    let stats = if let Ok((total_attempted, outcomes)) = &load_result {
+        let mut stats = RunStats {
+            total_attempted: *total_attempted,
+            ..Default::default()
+        };
+        for o in outcomes {
+            match o {
+                IntentOutcome::WithdrawalOk { .. } | IntentOutcome::DepositOk { .. } => {
+                    stats.confirmed += 1;
+                }
+                IntentOutcome::Failed { .. } => stats.failed += 1,
+                IntentOutcome::TimedOut { .. } => stats.timed_out += 1,
+            }
+            recorder.record_intent(crate::data_model::IntentRecord::from_outcome(o, &run_id));
+        }
+        Some(stats)
+    } else {
+        None
+    };
+
     // 8. Teardown always runs; propagate its error only when load succeeded.
     let load_succeeded = load_result.is_ok();
     let teardown_result = teardown(
@@ -260,27 +286,13 @@ pub async fn run(scenario: ScenarioConfig, opts: RunOptions) -> Result<RunResult
     .await;
 
     match load_result {
-        Ok((total_attempted, outcomes)) => {
+        Ok((_, outcomes)) => {
             teardown_result?;
-            let mut stats = RunStats {
-                total_attempted,
-                ..Default::default()
-            };
-            for o in &outcomes {
-                match o {
-                    IntentOutcome::WithdrawalOk { .. } | IntentOutcome::DepositOk { .. } => {
-                        stats.confirmed += 1;
-                    }
-                    IntentOutcome::Failed { .. } => stats.failed += 1,
-                    IntentOutcome::TimedOut { .. } => stats.timed_out += 1,
-                }
-                recorder.record_intent(crate::data_model::IntentRecord::from_outcome(o, &run_id));
-            }
             Ok(RunResult {
                 run_id,
                 output_dir: Some(run_dir.path.clone()),
                 dry_run: false,
-                stats,
+                stats: stats.expect("stats computed above whenever load_result is Ok"),
                 outcomes,
             })
         }
