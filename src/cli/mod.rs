@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use clap::{Parser, Subcommand, ValueEnum};
 use tokio_util::sync::CancellationToken;
 
+use crate::report::{load_runs, render_report, ReportError};
 use crate::scenarios::runner::run as runner_run;
 use crate::scenarios::runner::{
     load_scenario, validate_scenario, ConfigError, LoadShape, RunOptions, RunnerError,
@@ -40,6 +41,18 @@ pub enum Commands {
     Run(RunArgs),
     GenerateFixtures(GenerateFixturesArgs),
     ValidateScenario { path: PathBuf },
+    Report(ReportArgs),
+}
+
+#[derive(clap::Args)]
+pub struct ReportArgs {
+    /// Run directories to include in the report (one or more, in the order
+    /// they should appear).
+    #[arg(long = "run", required = true, num_args = 1..)]
+    pub runs: Vec<PathBuf>,
+    /// Output path for the rendered Markdown report.
+    #[arg(long, default_value = "report.md")]
+    pub out: PathBuf,
 }
 
 #[derive(clap::Args)]
@@ -103,6 +116,7 @@ pub enum CliError {
     Run(RunnerError),
     Fixture(FixtureError),
     Generator(GeneratorError),
+    Report(ReportError),
     /// Bad flag combination (e.g. --burst-multiplier <= 0); distinct from Io.
     InvalidArgs(String),
     /// Actual filesystem errors not covered by Scenario/Fixture variants.
@@ -126,6 +140,7 @@ impl std::fmt::Display for CliError {
             CliError::Run(e) => write!(f, "{e}"),
             CliError::Fixture(e) => write!(f, "{e}"),
             CliError::Generator(e) => write!(f, "{e}"),
+            CliError::Report(e) => write!(f, "{e}"),
             CliError::InvalidArgs(s) => write!(f, "invalid arguments: {s}"),
             CliError::Io(e) => write!(f, "{e}"),
             CliError::Interrupted => write!(f, "interrupted"),
@@ -140,6 +155,7 @@ impl std::error::Error for CliError {
             CliError::Run(e) => Some(e),
             CliError::Fixture(e) => Some(e),
             CliError::Generator(e) => Some(e),
+            CliError::Report(e) => Some(e),
             CliError::Io(e) => Some(e),
             _ => None,
         }
@@ -210,6 +226,20 @@ fn validate_scenario_command(path: &Path) -> Result<(), CliError> {
     println!("  name : {}", config.name);
     println!("  seed : {}", config.seed);
     println!("  hash : {}", config.config_hash);
+    Ok(())
+}
+
+// ── report_command ────────────────────────────────────────────────────────────
+
+fn report_command(args: &ReportArgs) -> Result<(), CliError> {
+    let runs = load_runs(&args.runs).map_err(CliError::Report)?;
+    let md = render_report(&runs);
+    std::fs::write(&args.out, &md).map_err(CliError::Io)?;
+    println!("Runs included : {}", runs.len());
+    for run in &runs {
+        println!("  {}", run.manifest.run_id);
+    }
+    println!("Report written: {}", args.out.display());
     Ok(())
 }
 
@@ -308,6 +338,7 @@ pub async fn dispatch(cli: Cli) -> Result<(), CliError> {
         Commands::Run(args) => run_command(args, None).await,
         Commands::GenerateFixtures(args) => generate_fixtures_command(&args),
         Commands::ValidateScenario { path } => validate_scenario_command(&path),
+        Commands::Report(args) => report_command(&args),
     }
 }
 

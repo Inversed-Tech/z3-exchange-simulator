@@ -7,6 +7,7 @@
 pub mod cli;
 pub mod data_model;
 pub mod metrics;
+pub mod report;
 pub mod rpc;
 pub mod scenarios;
 pub mod synthetic;
