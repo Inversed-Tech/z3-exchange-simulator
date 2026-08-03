@@ -260,6 +260,6 @@ result after the fact.
 
 | Item | Status |
 |---|---|
-| Specific TPS and account count targets for load scenarios | TBD — calibrated from initial load runs |
+| Specific TPS and account count targets for load scenarios | Confirmed — calibrated from initial load runs; see `configs/scenarios/*.yaml` |
 | Z3 pinned commit | Confirmed — `main` @ `dfb9d0ea` (frozen for the engagement) |
 | Zaino coverage | Confirmed — JSON-RPC mirror (`:28237`); gRPC `CompactTxStreamer` out of scope |

@@ -4,7 +4,11 @@
 this repo's source comments; the discrepancy that the first revision left unresolved has
 since been **resolved by measurement on `v0.1.0-beta.1`** (2026-07-29; see
 [`regtest-funding-plan.md`](regtest-funding-plan.md) for the probe evidence).
-**Applies to:** Zallet `v0.1.0-alpha.3` (our pin) through `v0.1.0-beta.1`; `librustzcash` `main`
+**Applies to:** Zallet `v0.1.0-alpha.3` through `v0.1.0-beta.2` (current pin); `librustzcash`
+`main`. The beta.1→beta.2 bump fixed a sync crash-loop
+([`zallet-restart-sync-failure.md`](zallet-restart-sync-failure.md)) and did not touch spend
+policy or gap limits, so this analysis is expected to still hold on beta.2 — not
+independently re-measured there.
 **Relevant to:** per-account transparent deposit addresses, TToT/ZToT flow fidelity
 
 ---
@@ -23,7 +27,7 @@ since been **resolved by measurement on `v0.1.0-beta.1`** (2026-07-29; see
 
 ---
 
-## Correction of a previous claim — and an unresolved discrepancy
+## Correction of a previous claim
 
 Three sites in this repo asserted a wallet-global gap counter:
 

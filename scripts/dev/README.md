@@ -5,6 +5,8 @@ Shell scripts for setting up and managing the local Z3 development environment.
 | Script | Purpose |
 |---|---|
 | `clone-z3.sh` | Clone Zebra, Zaino, and Zallet at their pinned commits |
+| `regtest-miner-setup.sh` | Fund coinbase into Zallet: point `ZEBRA_MINING__MINER_ADDRESS` at the hot wallet's receiver |
+| `zallet-release-image/build.sh` | Build a local Zallet Docker image from the official release tarball (used for pins with no published image, e.g. beta.2) |
 
 ## Prerequisites
 

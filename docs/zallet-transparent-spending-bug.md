@@ -120,28 +120,6 @@ This holds regardless of:
 > See [`zallet-transparent-gap-limit.md`](zallet-transparent-gap-limit.md) for the full
 > analysis, including why the gap limit is *not* implicated.
 
-## Root cause hypothesis (original, superseded)
-
-Zallet's `z_sendmany` implementation calls `zcash_client_backend::propose_transaction`
-internally. The proposal engine selects inputs from the wallet's tracked pools. Based on
-the evidence:
-
-- `z_listunspent` queries `transparent_received_outputs` directly → sees 115 UTXOs ✓
-- `z_gettotalbalance` queries `v_received_outputs` view (includes transparent pool) → sees 718 ZEC ✓
-- `z_sendmany` proposal selects 0 inputs from the transparent pool → reports "have 0" ✗
-
-The most likely cause is one of:
-1. `propose_transaction` in this version of `zcash_client_backend` does not select
-   transparent (coinbase) UTXOs when the `from` address is a Unified Address
-2. Coinbase outputs are excluded from the spending proposal (e.g. treated as
-   "not yet mature" by a different maturity definition than `z_listunspent` uses)
-3. The transparent input selection is not yet wired up in Zallet alpha's `z_sendmany`
-   implementation
-
-Zallet version: `6fc85f68cf5ebe456160c6518255a83129e7d21c`
-
----
-
 ## What does pass
 
 The warmup check (`z_gettotalbalance > 0`) gives a **false positive**: the wallet shows
@@ -196,19 +174,3 @@ simulator. Options:
 3. **Implement `z_shieldcoinbase` support** in the simulator once Zallet exposes it:
    shield the coinbase outputs to Orchard first, then use `z_sendmany` from the
    shielded balance. The spending proposal for Orchard notes is expected to work.
-
----
-
-## Simulator code changes made during this investigation
-
-All changes are in the simulator repo, not in `external/z3`:
-
-| File | Change | Status |
-|---|---|---|
-| `src/rpc/mod.rs` | Added optional `diversifier_index` param to `z_get_address_for_account` | ✅ Merged |
-| `src/scenarios/runner/lifecycle.rs` | Find hot wallet by `name == "hot_wallet"` instead of list position | ✅ Merged |
-| `src/scenarios/runner/lifecycle.rs` | Use `diversifier_index=0` to retrieve the existing funded address | ✅ Merged |
-| `src/scenarios/runner/dispatch.rs` | Background miner task (replaces per-transaction `generate()`) | ✅ Merged |
-| `src/scenarios/exchange.rs` | Remove per-transaction `generate()` calls | ✅ Merged |
-| `external/z3/scripts/init-regtest-fresh.sh` | Replace broken Python bech32m decoder with SQLite wallet.db query | ✅ Merged |
-| `external/z3/scripts/init-regtest-fresh.sh` | Use `docker compose up -d zebra` instead of `restart` to apply new env vars | ✅ Merged |

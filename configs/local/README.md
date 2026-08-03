@@ -15,4 +15,6 @@ Use this directory for:
 
 ## Usage
 
-TBD — local config loading will be documented once the simulator CLI is implemented (Week 2).
+The simulator does not currently read any file from this directory automatically —
+it is reserved for developer-specific values (local paths, ports, chain data
+locations) to reference manually or copy into a scenario override when needed.

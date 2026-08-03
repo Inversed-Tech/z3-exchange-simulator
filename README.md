@@ -156,9 +156,11 @@ make build               # Build the simulator binary (debug)
 make build-release       # Build an optimized release binary
 make test                # Run all tests
 make fmt                 # Format source code
+make fmt-check           # Check formatting without modifying files (CI)
 make lint                # Run clippy lints
 make generate-fixtures   # Generate synthetic fixture data
 make scenario-dry-run    # Validate a scenario config without issuing RPC calls
+make validate-scenario   # Validate a scenario YAML file (usage: SCENARIO=<path>)
 make clean               # Remove build artifacts
 ```
 
@@ -217,10 +219,11 @@ Run directories are gitignored and are not tracked by version control.
 | [`docs/integration/pinned-commits.md`](docs/integration/pinned-commits.md) | Commit pinning rationale |
 | [`docs/rpc/rpc-coverage-matrix.md`](docs/rpc/rpc-coverage-matrix.md) | RPC coverage and zcashd parity matrix |
 | [`docs/rpc/method-scope.md`](docs/rpc/method-scope.md) | Confirmed method list: stress vs smoke split |
-| [`docs/rpc/proposed-method-scope.md`](docs/rpc/proposed-method-scope.md) | Proposed method list for Foundation confirmation |
 | [`docs/scenarios/scenario-design.md`](docs/scenarios/scenario-design.md) | Scenario library design |
 | [`docs/zallet-transparent-spending-bug.md`](docs/zallet-transparent-spending-bug.md) | Zallet alpha: transparent coinbase not spendable via `z_sendmany` |
 | [`docs/zallet-transparent-gap-limit.md`](docs/zallet-transparent-gap-limit.md) | Transparent address gap limit at exchange scale: what it really constrains, and the upstream recommendation |
+| [`docs/zallet-restart-sync-failure.md`](docs/zallet-restart-sync-failure.md) | Zallet crash-loop after a container restart with existing wallet history |
+| [`docs/zallet-post-restart-setup-retry-exhaustion.md`](docs/zallet-post-restart-setup-retry-exhaustion.md) | `z_listaccounts` parse-failure retry exhaustion after a stack restart |
 | [`docs/regtest-funding-plan.md`](docs/regtest-funding-plan.md) | Measured regtest funding pipeline: probes, the beta.1 override stack, and the fan-out design |
 
 ---

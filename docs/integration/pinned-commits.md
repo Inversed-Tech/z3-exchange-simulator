@@ -40,18 +40,27 @@ The manifest records the exact state of all components at the time of the run:
 {
   "run_id": "<timestamp-or-uuid>",
   "run_started_at": "<ISO-8601 timestamp>",
-  "simulator_commit": "<git SHA of this repository>",
-  "z3_commit": "<SHA from z3-commits.lock>",
-  "zebra_commit": "<SHA from z3-commits.lock>",
-  "zebra_image": "<image tag from z3-commits.lock>",
-  "zaino_commit": "<SHA from z3-commits.lock>",
-  "zaino_image": "<image tag from z3-commits.lock>",
-  "zallet_commit": "<SHA from z3-commits.lock>",
-  "zallet_image": "<image tag from z3-commits.lock>",
+  "run_completed_at": "<ISO-8601 timestamp, null until the run finishes>",
+  "simulator_commit": "<git SHA the running binary was compiled from, embedded at build time>",
+  "zebra_commit": "<SHA from z3-commits.lock — the override commit when one exists, else the frozen pin>",
+  "zaino_commit": "<SHA from z3-commits.lock — the override commit when one exists, else the frozen pin>",
+  "zallet_commit": "<SHA from z3-commits.lock — the override commit when one exists, else the frozen pin>",
   "scenario_name": "<name from scenario YAML>",
-  "scenario_config_hash": "<SHA-256 of scenario YAML content>"
+  "scenario_config_hash": "<SHA-256 of scenario YAML content>",
+  "target_tps": "<load_target_tps from the scenario YAML>",
+  "timeouts": {
+    "rpc_timeout_ms": "<effective RPC transport timeout>",
+    "operation_poll_interval_ms": "<effective async-operation poll interval>",
+    "max_operation_wait_ms": "<effective async-operation wait budget>",
+    "confirmation_poll_interval_ms": "<effective confirmation poll interval>",
+    "max_confirmation_wait_ms": "<effective confirmation wait budget>"
+  }
 }
 ```
 
-This manifest is generated automatically at the start of each run. A finding in the
-report always references a `run_id`, which in turn references this manifest.
+This manifest is generated automatically at the start of each run (`run_completed_at`
+and the final content are written when the run finishes). A finding in the report
+always references a `run_id`, which in turn references this manifest. See
+[`src/metrics/manifest.rs`](../../src/metrics/manifest.rs) for the exact schema and
+[`docs/architecture/observability.md`](../architecture/observability.md) for the
+`timeouts` rationale.

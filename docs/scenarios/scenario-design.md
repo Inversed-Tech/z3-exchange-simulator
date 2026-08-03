@@ -34,14 +34,15 @@ Flow fractions must sum to 1.0.
 | Name | Load shape | Accounts | Transaction mix | Notes |
 |---|---|---|---|---|
 | `smoke` | Minimal (1 TPS, 60 s) | 10 | 100% transparent | CI sanity check |
-| `steady-state` | Constant TPS | TBD | TBD | Baseline exchange behavior |
-| `ramp` | Linearly increasing TPS | TBD | TBD | Find inflection point |
-| `burst` | Spike then recovery | TBD | TBD | Model sudden volume events |
-| `mixed` | Steady with shielded mix | TBD | TBD | Exercise full shielded RPC surface |
-| `reorg` | Regtest-control | N/A | N/A | Mine a branch, `invalidateblock`, `reconsiderblock`; verify rollback/restore (`src/scenarios/regtest_control.rs`) |
+| `steady-state` | Constant TPS (5 TPS, 300 s) | 100 | 100% transparent | Baseline exchange behavior |
+| `ramp` | Linearly increasing TPS (ceiling 10 TPS, 300 s) | 100 | 100% transparent | Find inflection point |
+| `burst` | Spike then recovery (base 3 TPS, 300 s) | 50 | 100% transparent | Model sudden volume events |
+| `mixed` | Steady with shielded mix (2 TPS, 300 s) | 50 | 50% T→Z, 50% Z→Z | Exercise full shielded RPC surface |
+| `reorg` | Regtest-control | N/A | N/A | Mine a branch, `invalidateblock`, `reconsiderblock`; verify rollback/restore. `run_reorg` is implemented and unit-tested in `src/scenarios/regtest_control.rs`, but has no scenario YAML or CLI wiring yet — not runnable as a scenario. |
 
-Account counts and TPS targets for non-smoke scenarios are calibrated after initial
-load runs establish baseline performance.
+Account counts and TPS targets for `steady-state`, `ramp`, `burst`, and `mixed` have
+been calibrated from initial load runs (see `configs/scenarios/*.yaml` for exact
+values); further tuning may follow as more runs accumulate.
 
 The `reorg` scenario uses the regtest-control methods (`generate`, `invalidateblock`,
 `reconsiderblock`); it exercises chain manipulation rather than transaction load, so it
