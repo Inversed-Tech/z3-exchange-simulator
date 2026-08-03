@@ -190,21 +190,27 @@ pub struct AccountInfo {
 
 impl AccountInfo {
     /// The account's primary address: the existing UA with the lowest
-    /// diversifier index (the one created with the account). Empty only if
-    /// this `AccountInfo` came from a call that omits addresses.
+    /// diversifier index (the one created with the account). `None` if the
+    /// account has no addresses, or none of them are Unified Addresses (e.g.
+    /// only bare transparent gap-limit addresses have been derived).
     pub fn primary_address(&self) -> Option<&str> {
         self.addresses
             .iter()
-            .min_by_key(|a| a.diversifier_index)
-            .map(|a| a.ua.as_str())
+            .filter_map(|a| a.ua.as_deref().map(|ua| (a.diversifier_index, ua)))
+            .min_by_key(|(index, _)| *index)
+            .map(|(_, ua)| ua)
     }
 }
 
-/// One derived address inside `z_listaccounts`' `addresses` array.
+/// One derived address inside `z_listaccounts`' `addresses` array. Zallet
+/// omits `ua` for addresses that aren't Unified Addresses (bare transparent
+/// or Sapling addresses use `transparent`/`sapling` instead) and omits
+/// `diversifier_index` for addresses with no known derivation path (e.g.
+/// imported transparent keys) — both fields are therefore optional.
 #[derive(Debug, Clone, Deserialize)]
 pub struct AccountAddress {
-    pub diversifier_index: u64,
-    pub ua: String,
+    pub diversifier_index: Option<u128>,
+    pub ua: Option<String>,
 }
 
 /// Returned by `z_getaddressforaccount`.
@@ -1622,6 +1628,37 @@ mod tests {
         assert_eq!(accounts[0].account, "uuid-1");
         assert_eq!(accounts[0].name.as_deref(), Some("Alice"));
         assert!(accounts[1].name.is_none());
+    }
+
+    /// Regression test for the post-restart setup failure documented in
+    /// `docs/zallet-post-restart-setup-retry-exhaustion.md`: once an account
+    /// has confirmed transaction history, Zallet's transparent gap-limit
+    /// maintenance derives extra bare addresses with no `ua` field (only
+    /// `transparent`/`sapling`, per the real Zallet response schema) — a
+    /// fresh wallet's default diversifier-0 UA never exercises that shape.
+    #[tokio::test]
+    async fn z_list_accounts_tolerates_addresses_without_ua() {
+        use wiremock::{matchers, Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(matchers::method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [{
+                    "account_uuid": "uuid-1",
+                    "name": "hot_wallet",
+                    "addresses": [
+                        { "diversifier_index": 0, "ua": "u1defaultaddress" },
+                        { "diversifier_index": 1, "transparent": "t1gapaddress" },
+                        { "transparent": "t1importedaddress" }
+                    ]
+                }],
+                "error": null, "id": 1
+            })))
+            .mount(&server)
+            .await;
+        let accounts = client(&server.uri()).z_list_accounts().await.unwrap();
+        assert_eq!(accounts.len(), 1);
+        assert_eq!(accounts[0].addresses.len(), 3);
+        assert_eq!(accounts[0].primary_address(), Some("u1defaultaddress"));
     }
 
     #[tokio::test]
