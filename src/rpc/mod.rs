@@ -231,11 +231,55 @@ pub struct AddressEntry {
 }
 
 /// Returned by `z_gettotalbalance`. Amounts are ZEC strings (e.g. `"0.50000000"`).
+///
+/// This is a WALLET-WIDE total across every account. Do not use it to decide
+/// whether a specific account can cover a send — on a wallet holding more
+/// than one funded account (i.e. any wallet with prior run history) it says
+/// nothing about what any single account actually has spendable. Use
+/// [`RpcClient::z_get_balance_for_account`] for that.
 #[derive(Debug, Clone, Deserialize)]
 pub struct TotalBalance {
     pub transparent: String,
     pub private: String,
     pub total: String,
+}
+
+/// Returned by `z_getbalanceforaccount`. Zallet omits a pool entirely when its
+/// spendable balance is zero, so every field is optional.
+#[derive(Debug, Clone, Deserialize)]
+pub struct AccountBalance {
+    #[serde(default)]
+    pub pools: AccountBalancePools,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct AccountBalancePools {
+    pub transparent: Option<PoolBalance>,
+    pub sapling: Option<PoolBalance>,
+    pub orchard: Option<PoolBalance>,
+    pub ironwood: Option<PoolBalance>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PoolBalance {
+    #[serde(rename = "valueZat")]
+    pub value_zat: u64,
+}
+
+impl AccountBalance {
+    /// Total spendable shielded balance (Sapling + Orchard + Ironwood), in zatoshis.
+    pub fn shielded_zatoshis(&self) -> u64 {
+        [&self.pools.sapling, &self.pools.orchard, &self.pools.ironwood]
+            .into_iter()
+            .filter_map(|p| p.as_ref())
+            .map(|p| p.value_zat)
+            .sum()
+    }
+
+    /// Spendable transparent balance, in zatoshis.
+    pub fn transparent_zatoshis(&self) -> u64 {
+        self.pools.transparent.as_ref().map_or(0, |p| p.value_zat)
+    }
 }
 
 /// The outcome detail inside a completed `OperationStatus` or `OperationResult`.
@@ -455,6 +499,7 @@ fn routing_table() -> HashMap<&'static str, Backend> {
         ("z_getaccount", Backend::Zallet),
         ("listaddresses", Backend::Zallet),
         ("z_gettotalbalance", Backend::Zallet),
+        ("z_getbalanceforaccount", Backend::Zallet),
         ("z_sendmany", Backend::Zallet),
         ("z_getoperationstatus", Backend::Zallet),
         ("z_getoperationresult", Backend::Zallet),
@@ -933,6 +978,22 @@ impl RpcClient {
     pub async fn z_get_total_balance(&self) -> Result<TotalBalance, RpcError> {
         self.call("z_gettotalbalance", serde_json::json!([null, true]))
             .await
+    }
+
+    /// Spendable balance of one account, split by value pool, at `minconf`
+    /// confirmations. Unlike [`Self::z_get_total_balance`] (wallet-wide), this
+    /// is scoped to a single account — use it to check whether a specific
+    /// `from` account can actually cover a send.
+    pub async fn z_get_balance_for_account(
+        &self,
+        account: &str,
+        minconf: Option<u32>,
+    ) -> Result<AccountBalance, RpcError> {
+        self.call(
+            "z_getbalanceforaccount",
+            serde_json::json!([account, minconf]),
+        )
+        .await
     }
 
     /// Send funds to one or more recipients. Fee is always `null` (auto-computed
@@ -1706,6 +1767,54 @@ mod tests {
             .await;
         // Would fail if params were wrong (no matching mock → error).
         client(&server.uri()).z_get_total_balance().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn z_get_balance_for_account_sums_shielded_pools() {
+        use wiremock::{matchers, Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(matchers::method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": {
+                    "pools": {
+                        "orchard": {"valueZat": 100},
+                        "sapling": {"valueZat": 50}
+                    },
+                    "minimum_confirmations": 10
+                },
+                "error": null, "id": 1
+            })))
+            .mount(&server)
+            .await;
+        let bal = client(&server.uri())
+            .z_get_balance_for_account("uuid-1", Some(10))
+            .await
+            .unwrap();
+        assert_eq!(bal.shielded_zatoshis(), 150);
+        assert_eq!(bal.transparent_zatoshis(), 0);
+    }
+
+    /// Zallet omits every pool key entirely when the account's balance is
+    /// zero in that pool (`skip_serializing_if`) — the same optional-field
+    /// pattern behind the z_listaccounts bug this client used to hit. An
+    /// account with genuinely zero balance sends `{"pools": {}}`.
+    #[tokio::test]
+    async fn z_get_balance_for_account_tolerates_all_pools_omitted() {
+        use wiremock::{matchers, Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(matchers::method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": {"pools": {}, "minimum_confirmations": 10},
+                "error": null, "id": 1
+            })))
+            .mount(&server)
+            .await;
+        let bal = client(&server.uri())
+            .z_get_balance_for_account("uuid-1", Some(10))
+            .await
+            .unwrap();
+        assert_eq!(bal.shielded_zatoshis(), 0);
+        assert_eq!(bal.transparent_zatoshis(), 0);
     }
 
     #[tokio::test]

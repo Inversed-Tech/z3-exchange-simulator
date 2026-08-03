@@ -114,7 +114,7 @@ pub async fn setup(
 
     // 5. Warmup: mine blocks before provisioning. The hot wallet account was
     //    created above so Zallet will credit coinbase outputs as blocks arrive.
-    if let Err(e) = warmup(&rpc, scenario, run_id, metrics.clone()).await {
+    if let Err(e) = warmup(&rpc, scenario, run_id, metrics.clone(), &hot_wallet_uuid).await {
         let _ = stack.stop().await;
         return Err(e);
     }
@@ -305,6 +305,7 @@ pub async fn warmup(
     scenario: &ScenarioConfig,
     run_id: &str,
     metrics: Arc<dyn MetricsRecorder>,
+    hot_wallet_uuid: &str,
 ) -> Result<(), RunnerError> {
     // Mine warmup blocks in chunks — see mine_blocks for why a single
     // generate(warmup_blocks) call cannot work with shielded coinbase.
@@ -322,10 +323,17 @@ pub async fn warmup(
         .await
         .map_err(|e| RunnerError::Warmup(format!("get_wallet_info failed: {e}")))?;
 
-    // Verify that warmup mining funded the hot wallet. generate() returns once
-    // Zebra has mined the blocks, but Zallet's sync is asynchronous: it pulls
-    // from Zaino's block cache in a background loop. Poll for up to 60 seconds
-    // so the check isn't racy against Zallet's sync lag.
+    // Verify that warmup mining funded the hot wallet specifically. generate()
+    // returns once Zebra has mined the blocks, but Zallet's sync is
+    // asynchronous: it pulls from Zaino's block cache in a background loop.
+    // Poll for up to 60 seconds so the check isn't racy against Zallet's sync
+    // lag.
+    //
+    // Scoped to hot_wallet_uuid via z_getbalanceforaccount, NOT
+    // z_gettotalbalance (wallet-wide): on a wallet with prior run history,
+    // other accounts' leftover balance makes the wallet-wide total trivially
+    // positive regardless of whether the hot wallet itself received anything
+    // this run, defeating this check's entire purpose.
     //
     // Persistent 0 balance means either Zebra's miner_address is not pointing at
     // the hot_wallet account (run scripts/dev/regtest-miner-setup.sh), or
@@ -333,11 +341,10 @@ pub async fn warmup(
     let mut funded = false;
     for _ in 0..30 {
         let balance = rpc
-            .z_get_total_balance()
+            .z_get_balance_for_account(hot_wallet_uuid, None)
             .await
             .map_err(|e| RunnerError::Warmup(format!("balance check failed: {e}")))?;
-        let total_zec: f64 = balance.total.parse().unwrap_or(0.0);
-        if total_zec > 0.0 {
+        if balance.shielded_zatoshis() > 0 || balance.transparent_zatoshis() > 0 {
             funded = true;
             break;
         }

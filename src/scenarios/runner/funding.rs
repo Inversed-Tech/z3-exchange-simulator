@@ -338,15 +338,23 @@ pub async fn fund_accounts(
 ) -> Result<String, FundingError> {
     // 1. If the shielded pool is empty but transparent coinbase is present,
     //    shield it. With Orchard-coinbase mining this is a no-op.
+    //
+    // Scoped to `source` specifically via z_getbalanceforaccount, NOT
+    // z_gettotalbalance: the latter is wallet-wide, so on a wallet with prior
+    // run history (other accounts already holding shielded balance) it would
+    // report plenty of funds regardless of whether `source` itself has
+    // anything spendable — the subsequent z_sendmany is scoped to `source`
+    // alone and would fail with "Insufficient balance (have 0, ...)" no
+    // matter how much other accounts hold.
     let balance = rpc
-        .z_get_total_balance()
+        .z_get_balance_for_account(&source.uuid, Some(ANCHOR_CONFIRMATIONS))
         .await
         .map_err(|e| FundingError::Rpc {
-            step: "z_gettotalbalance",
+            step: "z_getbalanceforaccount",
             source: e,
         })?;
-    let private: f64 = balance.private.parse().unwrap_or(0.0);
-    let transparent: f64 = balance.transparent.parse().unwrap_or(0.0);
+    let private = zat_to_zec(balance.shielded_zatoshis());
+    let transparent = zat_to_zec(balance.transparent_zatoshis());
     let needed = plan.per_sink_total() * sinks.len() as f64;
 
     if private < needed && transparent > 0.0 {
