@@ -127,6 +127,7 @@ pub async fn setup(
         run_id,
         metrics.clone(),
         Some(hot_wallet_uuid.clone()),
+        opts.provision_concurrency,
     )
     .await
     {

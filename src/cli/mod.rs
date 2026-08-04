@@ -81,6 +81,12 @@ pub struct RunArgs {
     /// Max concurrent in-flight transactions
     #[arg(long, default_value_t = 64)]
     pub max_in_flight: usize,
+    /// Max concurrent account-creation calls during provisioning. Concurrent
+    /// requests above ~11 fail outright on the override stack (see
+    /// docs/z3-concurrent-request-ceiling.md); keep this at or below that
+    /// margin regardless of the scenario's accounts_count.
+    #[arg(long, default_value_t = 8)]
+    pub provision_concurrency: usize,
     /// Base directory for run output
     #[arg(long, default_value = "experiments/runs")]
     pub output_base: PathBuf,
@@ -277,6 +283,7 @@ async fn run_command(
             output_base: args.output_base.clone(),
             load_shape,
             max_in_flight: args.max_in_flight,
+            provision_concurrency: args.provision_concurrency,
             dry_run: true,
             hot_wallet_uuid: args.hot_wallet_uuid.clone(),
             cancel: None,
@@ -304,6 +311,7 @@ async fn run_command(
         output_base: args.output_base.clone(),
         load_shape,
         max_in_flight: args.max_in_flight,
+        provision_concurrency: args.provision_concurrency,
         dry_run: false,
         hot_wallet_uuid: args.hot_wallet_uuid.clone(),
         cancel: Some(token.clone()),
@@ -395,6 +403,7 @@ observability:
             burst_secs: 30,
             burst_multiplier: 3.0,
             max_in_flight: 64,
+            provision_concurrency: 8,
             output_base,
             hot_wallet_uuid: None,
         }
@@ -410,6 +419,7 @@ observability:
             burst_secs: 30,
             burst_multiplier: 3.0,
             max_in_flight: 64,
+            provision_concurrency: 8,
             output_base,
             hot_wallet_uuid: None,
         }
@@ -599,6 +609,7 @@ observability:
             burst_secs: 30,
             burst_multiplier: -1.0,
             max_in_flight: 64,
+            provision_concurrency: 8,
             output_base: PathBuf::from("experiments/runs"),
             hot_wallet_uuid: None,
         };
@@ -702,6 +713,30 @@ observability:
         .unwrap();
         if let Commands::Run(args) = cli.command {
             assert_eq!(args.max_in_flight, 128);
+        }
+    }
+
+    #[test]
+    fn round_trip_provision_concurrency() {
+        let cli = Cli::try_parse_from([
+            "z3sim",
+            "run",
+            "--scenario",
+            "foo.yaml",
+            "--provision-concurrency",
+            "5",
+        ])
+        .unwrap();
+        if let Commands::Run(args) = cli.command {
+            assert_eq!(args.provision_concurrency, 5);
+        }
+    }
+
+    #[test]
+    fn provision_concurrency_defaults_to_8() {
+        let cli = Cli::try_parse_from(["z3sim", "run", "--scenario", "foo.yaml"]).unwrap();
+        if let Commands::Run(args) = cli.command {
+            assert_eq!(args.provision_concurrency, 8);
         }
     }
 

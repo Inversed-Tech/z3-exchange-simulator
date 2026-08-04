@@ -87,6 +87,12 @@ pub struct RunOptions {
     pub load_shape: LoadShape,
     /// Maximum number of concurrently in-flight intents.
     pub max_in_flight: usize,
+    /// Maximum number of concurrent `z_getnewaccount` / `z_listunifiedreceivers`
+    /// calls during provisioning. See `docs/z3-concurrent-request-ceiling.md` —
+    /// concurrent requests above ~11 fail outright on the override stack, so
+    /// this should stay at or below that margin regardless of how many
+    /// accounts the scenario provisions.
+    pub provision_concurrency: usize,
     /// If true, print a summary and exit without starting the Z3 stack.
     pub dry_run: bool,
     /// Override the default `PollingConfig`.
@@ -108,6 +114,7 @@ impl Default for RunOptions {
             output_base: PathBuf::from("experiments/runs"),
             load_shape: LoadShape::SteadyState,
             max_in_flight: 64,
+            provision_concurrency: 8,
             dry_run: false,
             polling: None,
             hot_wallet_uuid: None,

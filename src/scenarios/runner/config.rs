@@ -177,6 +177,7 @@ pub fn print_dry_run_summary(config: &ScenarioConfig, opts: &RunOptions, plan: &
     );
     println!("Load shape  : {:?}", opts.load_shape);
     println!("Max in-flight: {}", opts.max_in_flight);
+    println!("Provision concurrency: {}", opts.provision_concurrency);
     println!("Warmup blocks: {}", config.warmup_blocks);
     println!("Config hash : {}", config.config_hash);
     println!("Source path : {}", config.source_path);

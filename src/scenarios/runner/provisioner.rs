@@ -75,17 +75,22 @@ impl std::error::Error for ProvisionerError {
 
 // ── provision ─────────────────────────────────────────────────────────────────
 
-const PROVISION_CONCURRENCY: usize = 16;
-
 /// Generate a synthetic population, create Zallet accounts for each member,
 /// derive Unified Addresses, and add both transparent and Orchard address
 /// entries to each wallet.
+///
+/// `provision_concurrency` bounds how many `z_getnewaccount` /
+/// `z_listunifiedreceivers` calls are in flight at once. See
+/// `docs/z3-concurrent-request-ceiling.md`: concurrent requests above ~11
+/// fail outright on the override stack, so callers should keep this at or
+/// below that margin regardless of `scenario.accounts_count`.
 pub async fn provision(
     rpc: Arc<RpcClient>,
     scenario: &ScenarioConfig,
     run_id: &str,
     metrics: Arc<dyn MetricsRecorder>,
     hot_wallet_uuid_override: Option<String>,
+    provision_concurrency: usize,
 ) -> Result<ProvisionedPopulation, ProvisionerError> {
     // Step 1: generate the synthetic population (takes ownership of scenario clone).
     let mut generator =
@@ -120,7 +125,7 @@ pub async fn provision(
     // Sapling-valid diversifier index — on an unfunded account the transparent
     // gap window is indices 0..9, so a few such calls fail with ReachedGapLimit
     // "index 10" (the June smoke failure; docs/zallet-transparent-gap-limit.md).
-    let sem = Arc::new(Semaphore::new(PROVISION_CONCURRENCY));
+    let sem = Arc::new(Semaphore::new(provision_concurrency));
     let mut tasks: JoinSet<Result<(String, String), RpcError>> = JoinSet::new();
 
     for account in &population.accounts {
@@ -398,6 +403,7 @@ mod tests {
             "test-run",
             Arc::new(NullRecorder),
             Some("hw-uuid".to_string()),
+            8,
         )
         .await
         .expect("provision should succeed");
@@ -424,6 +430,7 @@ mod tests {
             "test-run",
             Arc::new(NullRecorder),
             Some("hw-uuid".to_string()),
+            8,
         )
         .await
         .expect("provision should succeed");
@@ -454,6 +461,7 @@ mod tests {
             "test-run",
             metrics,
             Some("hw-uuid".to_string()),
+            8,
         )
         .await
         .expect("provision should succeed");
@@ -478,7 +486,7 @@ mod tests {
         let rpc = Arc::new(RpcClient::new(&server.uri(), "test-run", None, None));
         let scenario = test_scenario();
 
-        let result = provision(rpc, &scenario, "test-run", Arc::new(NullRecorder), None).await;
+        let result = provision(rpc, &scenario, "test-run", Arc::new(NullRecorder), None, 8).await;
         let err = match result {
             Ok(_) => panic!("provision must fail when RPC returns an error"),
             Err(e) => e,
