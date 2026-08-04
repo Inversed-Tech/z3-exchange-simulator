@@ -1123,6 +1123,30 @@ impl RpcClient {
         self.call("z_listunspent", params).await
     }
 
+    /// List unspent shielded notes, passing a non-empty `addresses` filter.
+    ///
+    /// A wallet containing any shielded coinbase note with non-UTF8 memo bytes
+    /// makes an unfiltered `z_listunspent` call fail wallet-wide with
+    /// `WalletDb::get_memo failed` (measured on Zallet beta.2; see
+    /// `docs/regtest-funding-plan.md`). Measured on the same wallet state,
+    /// back-to-back: an unfiltered call fails with that error while a call
+    /// passing a non-empty `addresses` array (with an explicit `max_conf`
+    /// value, not `null`, matching what was measured) succeeds — regardless of
+    /// whether the given addresses match the notes returned, which are not
+    /// scoped to exactly those addresses. Callers that need results limited to
+    /// a specific account should still filter the returned notes by
+    /// `account_uuid`. `max_conf` has no verified-safe "no upper bound" form
+    /// for this call; pass a value comfortably above the current chain height.
+    pub async fn z_list_unspent_for_addresses(
+        &self,
+        min_conf: u32,
+        max_conf: u32,
+        addresses: &[String],
+    ) -> Result<Vec<UnspentNote>, RpcError> {
+        let params = serde_json::json!([min_conf, max_conf, false, addresses]);
+        self.call("z_listunspent", params).await
+    }
+
     pub async fn get_wallet_info(&self) -> Result<WalletInfo, RpcError> {
         self.call("getwalletinfo", serde_json::json!([])).await
     }
@@ -2000,6 +2024,35 @@ mod tests {
             .await;
         let notes = client(&server.uri()).z_list_unspent(1, None).await.unwrap();
         assert!(notes[0].address.is_none());
+    }
+
+    #[tokio::test]
+    async fn z_list_unspent_for_addresses_sends_addresses_param() {
+        use wiremock::{matchers, Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(matchers::method("POST"))
+            .and(matchers::body_partial_json(serde_json::json!({
+                "params": [1, 4294967295u32, false, ["addr-1"]]
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [{
+                    "txid": "ghi",
+                    "confirmations": 12,
+                    "account_uuid": "uuid-3",
+                    "address": "addr-1",
+                    "value": 0.25,
+                    "valueZat": 25_000_000u64
+                }],
+                "error": null, "id": 1
+            })))
+            .mount(&server)
+            .await;
+        let notes = client(&server.uri())
+            .z_list_unspent_for_addresses(1, u32::MAX, &["addr-1".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].account, "uuid-3");
     }
 
     #[tokio::test]

@@ -395,3 +395,114 @@ measured while wiring (each one produced a distinct live failure first):
 5. **Zebra ≥ 6.0.0 requires `getrawtransaction`'s verbosity as a NUMBER** (v5 tolerated a
    JSON boolean; v6 answers `-32602 Invalid params`), which silently broke every
    confirmation wait — sends succeeded while all 60 intents were reported failed.
+
+---
+
+## 7. `run_sweep()`'s two defects, exposed by exercising ZToT in isolation
+
+Both fixed in `src/scenarios/exchange.rs` and `src/rpc/mod.rs`. Neither was visible in the
+59/60 result above because that run's flow mix did not isolate ZToT enough to trigger
+either one at the funding scale then in use; both reproduced 100% of the time once ZToT was
+run as the only flow type.
+
+### 7.1 `z_listunspent`'s wallet-wide memo crash breaks every ZToT intent, not just warmup
+
+The warmup step's own `z_listunspent` call (§ how the runner is wired, above) already
+degrades gracefully when it hits the beta.1/beta.2 memo defect (`WalletDb::get_memo
+failed`, triggered by any shielded coinbase note's non-UTF8 memo bytes existing anywhere in
+the wallet). `run_sweep()`'s own `z_listunspent` call, used to find the notes to consolidate
+into the hot wallet, had no equivalent handling — it propagated the error directly, failing
+100% of ZToT intents on this override stack, since warmup's own orchard-coinbase mining
+guarantees the defect-triggering note exists in every run.
+
+**Fix — measured, not assumed.** `z_listunspent` accepts an `addresses` filter
+(confirmed via `rpc.discover`'s parameter schema). Measured directly, back-to-back, same
+wallet state: an unfiltered call fails with the memo error every time; a call passing a
+non-empty `addresses` array (with a concrete `max_conf`, not `null` — untested and not
+relied upon) succeeds every time. `run_sweep()` now calls `z_list_unspent_for_addresses`
+with the sweeping account's own address, added to `src/rpc/mod.rs`.
+
+### 7.2 The `addresses` filter scopes by account, not by pool — mixing transparent and shielded balance
+
+Initially assumed (incorrectly) that the `addresses` filter didn't scope results at all,
+based on an early manual test against a wallet with 38 accounts accumulated over many prior
+sessions, where it returned notes across dozens of unrelated accounts. Retested against a
+controlled, freshly-funded wallet (accounts funded with known, precise amounts, ground-truthed
+against `z_getbalanceforaccount`): the filter correctly scopes to the queried address's
+*account* — the earlier result is presumed to have been an artifact of that wallet's
+long, reused history, not a defect in the filter itself, though this was not independently
+re-isolated.
+
+What the filter does **not** do is scope by *pool*. Querying with an account's shielded UA
+returns that account's notes from every pool it holds — transparent UTXOs included, not
+only the shielded ones matching the queried address's type. Measured directly: an account
+funded with 100,000,000 zat shielded and 3,000,000 zat transparent (matching what the
+funding fan-out allocates to every account regardless of scenario flow mix — see §2) returns
+all three notes, correctly attributed to that account, when queried by its shielded UA
+alone.
+
+`run_sweep()`'s existing account-scope filter summed every note across both pools into the
+sweep amount. But its `z_sendmany` call passes the account's UA as `from`, and a UA `from`
+draws shielded funds only ([zallet#644](https://github.com/zcash/zallet/issues/644); already
+noted in §4, rule 2) — it cannot reach the account's transparent UTXOs at all. The result
+was a sweep amount inflated by the account's transparent balance, systematically exceeding
+what the UA-scoped send could actually supply: every ZToT intent in an affected run failed
+identically with `Insufficient balance (have <shielded total>, need <shielded + transparent
+total, plus fee>)`.
+
+**Fix.** `run_sweep()` now filters to notes whose `pool` is not `"transparent"` (and is
+present — a missing `pool` defaults to transparent, the same conservative reading already
+used in the warmup check) before summing for the sweep amount and the ZIP-317 fee's note
+count.
+
+**Validated end to end**, `health-z2t.yaml` (6 accounts, ZToT only), fresh datadir:
+
+| Run | `--max-in-flight` | Confirmed | Notes |
+|---|---|---|---|
+| Before either fix | 64 | 0/25 | 100% memo-crash failures (§7.1) |
+| After §7.1 only | 64 | 0/25 | 100% inflated-balance failures (§7.2) |
+| After both fixes | 4 | 2/6 | Remainder: concurrency-driven rejection + same-account exhaustion, both documented in `docs/z3-concurrent-request-ceiling.md` |
+| After both fixes | 1 (serialized) | 5/6 | Remaining failure: same-account exhaustion (structural, not a defect — see that document) |
+
+With both fixes in place and dispatch concurrency kept low, ZToT confirms cleanly; the
+residual failures are accounted for by findings already documented elsewhere, not by any
+remaining defect in `run_sweep()`.
+
+---
+
+## 8. Load-phase shielded sends had no anchor-confirmation retry, unlike the funding fan-out
+
+`fund_accounts()` (§ how the runner is wired, above) already retries its own `z_sendmany`
+call on "Insufficient balance" specifically, mining a block and waiting between attempts
+(`send_with_anchor_retries`, `src/scenarios/runner/funding.rs`) — because a shielded
+source's notes need roughly 10 confirmations before Zallet treats them as spendable (the
+anchor policy noted in §4, rule 3), and a source funded moments earlier has not
+necessarily reached that depth yet. The three load-phase functions that also send from a
+shielded source — `run_deposit` (used by both TToZ and ZToZ), `run_withdrawal` (ZToT's
+second leg), and `run_sweep` (ZToT's first leg) — had no equivalent retry: a single-shot
+`z_sendmany` call that failed outright if the source's confirmations had not yet caught up.
+
+This was invisible for TToZ, whose source is a transparent UTXO (no anchor-depth
+requirement), and mostly invisible for ZToT's withdrawal leg, whose source is the hot
+wallet (funded and confirmed well before the run's own dispatch started). It was fully
+exposed running `health-z2z.yaml` (ZToZ only) in isolation: every account's shielded
+balance is funded once, at setup, and any ZToZ intent dispatched before that funding
+reaches anchor depth fails immediately with `Insufficient balance (have 0, need <amount>)`
+— the "have 0" distinguishing it from the funding-inflation defect in §7.2, whose "have"
+was always the account's true (non-zero) shielded total.
+
+**Fix.** Added `send_many_with_anchor_retries` (`src/scenarios/exchange.rs`), mirroring
+`funding::send_with_anchor_retries`'s retry-only-on-"Insufficient balance" behavior, and
+wired it into all three call sites in place of their direct `z_sendmany` /
+`z_sendmany_with_policy` calls.
+
+**Validated end to end**, `health-z2z.yaml` (6 accounts, ZToZ only), `--max-in-flight 4`:
+
+| Run | Confirmed | Failure breakdown |
+|---|---|---|
+| Before the fix | 6/25 | 17× `have 0` (this defect), 2× already-spent-input rejection |
+| After the fix | 21/25 | 0× `have 0`; remainder is 3× already-spent-input rejection + 1× confirmation-polling race — both already documented in `docs/z3-concurrent-request-ceiling.md`, not this defect |
+
+The `have 0` failure class is fully eliminated; the residual failures are the same
+concurrency-driven class already characterized for the other flows, not a new or
+remaining defect in the affected functions.

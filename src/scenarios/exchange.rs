@@ -101,6 +101,48 @@ fn zip317_sweep_fee(note_count: usize) -> u64 {
     MARGINAL_FEE_ZAT * ((note_count as u64) + 1).max(GRACE_ACTIONS)
 }
 
+const SEND_RETRIES: u32 = 12;
+
+/// `z_sendmany`, retrying while the reported failure is specifically
+/// "Insufficient balance". A shielded source's notes need ~10 confirmations
+/// before Zallet treats them as spendable (the anchor policy documented in
+/// `docs/regtest-funding-plan.md`); a source funded moments earlier in the
+/// same run has not necessarily reached that depth yet, so a single-shot send
+/// can fail even though the funds are genuinely present and will clear within
+/// a few more blocks. Non-balance errors are not retried. Mirrors
+/// `funding::send_with_anchor_retries`, applied here to the load-phase sends
+/// (deposit, withdrawal, sweep) rather than the initial funding fan-out.
+async fn send_many_with_anchor_retries(
+    rpc: &RpcClient,
+    from: &str,
+    recipients: &[Recipient],
+    policy: Option<&str>,
+) -> Result<String, RpcError> {
+    let mut last_err: Option<RpcError> = None;
+    for _ in 0..SEND_RETRIES {
+        let result = match policy {
+            Some(p) => rpc.z_send_many_with_policy(from, recipients, p).await,
+            None => rpc.z_send_many(from, recipients).await,
+        };
+        match result {
+            Ok(opid) => return Ok(opid),
+            Err(e) => {
+                let retryable = matches!(
+                    &e,
+                    RpcError::JsonRpc { message, .. } if message.contains("Insufficient balance")
+                );
+                last_err = Some(e);
+                if !retryable {
+                    break;
+                }
+            }
+        }
+        let _ = rpc.generate(1).await;
+        sleep(Duration::from_secs(5)).await;
+    }
+    Err(last_err.expect("at least one attempt was made"))
+}
+
 /// Poll `z_get_operation_status` until the operation completes or the deadline passes.
 /// Returns the completed status on success; errors on operation failure or timeout.
 async fn poll_operation_until_complete(
@@ -275,8 +317,7 @@ pub async fn run_deposit(
         amount: zat_to_zec(amount_zatoshis),
         memo: None,
     }];
-    let op_id = rpc
-        .z_send_many_with_policy(from_account, &recipients, privacy_policy)
+    let op_id = send_many_with_anchor_retries(rpc, from_account, &recipients, Some(privacy_policy))
         .await
         .map_err(ExchangeError::Rpc)?;
 
@@ -363,13 +404,14 @@ pub async fn run_withdrawal(
 
     withdrawal.status = WithdrawalStatus::Processing;
 
-    // Measure proving time from z_send_many call to operation completion.
-    let prove_start = Instant::now();
-    let op_id = rpc
-        .z_send_many_with_policy(from_account, &recipients, privacy_policy)
+    let op_id = send_many_with_anchor_retries(rpc, from_account, &recipients, Some(privacy_policy))
         .await
         .map_err(ExchangeError::Rpc)?;
 
+    // Measure proving time from the accepted call to operation completion —
+    // excludes any anchor-confirmation retries above, which are wait time,
+    // not proving time.
+    let prove_start = Instant::now();
     // poll_operation_until_complete confirms success via z_get_operation_status.
     // Then z_get_operation_result retrieves the authoritative final result with
     // txid, as specified in the work track.
@@ -439,15 +481,30 @@ pub async fn run_sweep(
 ) -> Result<Sweep, ExchangeError> {
     let start = Instant::now();
 
-    // Collect all confirmed unspent notes, filter to this account.
+    // Collect all confirmed unspent notes, filter to this account. Passing a
+    // non-empty `addresses` filter avoids a Zallet defect where an unfiltered
+    // z_listunspent call fails wallet-wide (`WalletDb::get_memo failed`) if
+    // any shielded coinbase note anywhere in the wallet has non-UTF8 memo
+    // bytes — see `z_list_unspent_for_addresses`'s doc comment.
     let all_notes = rpc
-        .z_list_unspent(1, None)
+        .z_list_unspent_for_addresses(1, u32::MAX, &[from_address.to_string()])
         .await
         .map_err(ExchangeError::Rpc)?;
 
+    // Scope to this account's SHIELDED notes only. `from_address` is the
+    // account's UA, and a UA `from` in z_sendmany draws shielded funds only
+    // (zallet#644) — it cannot spend the account's transparent UTXOs, which
+    // the funding fan-out also allocates to every account regardless of
+    // scenario flow mix. Summing across pools here would size the sweep
+    // beyond what a UA-scoped send can actually supply, producing an
+    // "insufficient balance" error at the true (shielded-only) amount. A
+    // missing pool defaults to transparent (the stricter reading), matching
+    // the convention in lifecycle.rs's warmup check.
     let account_notes: Vec<_> = all_notes
         .into_iter()
-        .filter(|n| n.account == from_account)
+        .filter(|n| {
+            n.account == from_account && n.pool.as_deref().is_some_and(|p| p != "transparent")
+        })
         .collect();
 
     if account_notes.is_empty() {
@@ -492,8 +549,7 @@ pub async fn run_sweep(
         memo: None,
     }];
 
-    let op_id = rpc
-        .z_send_many(from_address, &recipients)
+    let op_id = send_many_with_anchor_retries(rpc, from_address, &recipients, None)
         .await
         .map_err(ExchangeError::Rpc)?;
 
@@ -1326,12 +1382,12 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "result": [
                     {
-                        "txid": "note1", "confirmations": 5,
+                        "txid": "note1", "pool": "orchard", "confirmations": 5,
                         "account_uuid": "sweep-account",
                         "address": "u1addr1", "value": 0.5, "valueZat": 50_000_000u64
                     },
                     {
-                        "txid": "note2", "confirmations": 3,
+                        "txid": "note2", "pool": "orchard", "confirmations": 3,
                         "account_uuid": "sweep-account",
                         "address": "u1addr2", "value": 0.3, "valueZat": 30_000_000u64
                     }
@@ -1411,6 +1467,99 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_sweep_excludes_transparent_notes_from_the_same_account() {
+        use wiremock::{matchers, Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+
+        // A UA `from` in z_sendmany draws shielded funds only, so a
+        // transparent note belonging to the same account must not be summed
+        // into the sweep amount even though the account filter matches it.
+        Mock::given(matchers::method("POST"))
+            .and(matchers::body_partial_json(
+                serde_json::json!({ "method": "z_listunspent" }),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [
+                    {
+                        "txid": "shielded-note", "pool": "orchard", "confirmations": 5,
+                        "account_uuid": "sweep-account",
+                        "address": "u1addr1", "value": 1.0, "valueZat": 100_000_000u64
+                    },
+                    {
+                        "txid": "transparent-note", "pool": "transparent", "confirmations": 5,
+                        "account_uuid": "sweep-account",
+                        "address": "t1addr", "value": 0.03, "valueZat": 3_000_000u64
+                    }
+                ],
+                "error": null, "id": 1
+            })))
+            .mount(&server)
+            .await;
+
+        Mock::given(matchers::method("POST"))
+            .and(matchers::body_partial_json(
+                serde_json::json!({ "method": "z_sendmany" }),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": "opid-sweep-2", "error": null, "id": 1
+            })))
+            .mount(&server)
+            .await;
+
+        Mock::given(matchers::method("POST"))
+            .and(matchers::body_partial_json(
+                serde_json::json!({ "method": "z_getoperationstatus" }),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [{
+                    "id": "opid-sweep-2", "status": "success",
+                    "result": { "txid": "sweeptxid2" }, "error": null
+                }],
+                "error": null, "id": 1
+            })))
+            .mount(&server)
+            .await;
+
+        Mock::given(matchers::method("POST"))
+            .and(matchers::body_partial_json(
+                serde_json::json!({ "method": "generate" }),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": ["h1"], "error": null, "id": 1
+            })))
+            .mount(&server)
+            .await;
+
+        Mock::given(matchers::method("POST"))
+            .and(matchers::body_partial_json(
+                serde_json::json!({ "method": "getrawtransaction" }),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": { "txid": "sweeptxid2", "hex": "dead", "confirmations": 1 },
+                "error": null, "id": 1
+            })))
+            .mount(&server)
+            .await;
+
+        let sweep = run_sweep(
+            &rpc(&server.uri()),
+            "sweep-account",
+            "u1sweepfrom",
+            "u1hotwallet",
+            "run-1",
+            None,
+            &instant_polling(),
+        )
+        .await
+        .unwrap();
+
+        // Only the shielded note counts; the transparent note (same account)
+        // must not inflate the amount beyond what a UA `from` can spend.
+        assert_eq!(sweep.total_amount_zatoshis, 100_000_000);
+        assert_eq!(sweep.source_addresses, vec!["u1addr1"]);
+    }
+
+    #[tokio::test]
     async fn run_sweep_returns_err_when_no_notes_found() {
         use wiremock::{matchers, Mock, MockServer, ResponseTemplate};
         let server = MockServer::start().await;
@@ -1485,7 +1634,7 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "result": [
                     {
-                        "txid": "note1", "confirmations": 2,
+                        "txid": "note1", "pool": "orchard", "confirmations": 2,
                         "account_uuid": "my-account",
                         "address": null, "value": 0.1, "valueZat": 10_000_000u64
                     }
@@ -1594,7 +1743,7 @@ mod tests {
             ))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "result": [{
-                    "txid": "note1", "confirmations": 3,
+                    "txid": "note1", "pool": "orchard", "confirmations": 3,
                     "account_uuid": "my-account",
                     "address": "u1addr", "value": 0.00009, "valueZat": 9_000u64
                 }],
