@@ -23,6 +23,16 @@ use crate::z3::{Z3Config, Z3Stack};
 /// `zcash_protocol`'s `COINBASE_MATURITY_BLOCKS`.
 const COINBASE_MATURITY_BLOCKS: u64 = 100;
 
+/// How many times `warmup()` polls the hot wallet's balance before giving up,
+/// and how long it sleeps between attempts. Sized well above the slowest
+/// measured Zallet resync-after-restart time (222s, on a wallet with ~100
+/// accounts and a few hundred blocks of history) — this budget scales with
+/// wallet history, not with `warmup_blocks`, so it does not shrink for
+/// smaller scenarios; a genuinely misconfigured miner address still fails
+/// after the full wait, just later than before.
+const WARMUP_BALANCE_CHECK_ATTEMPTS: u32 = 150;
+const WARMUP_BALANCE_CHECK_INTERVAL: Duration = Duration::from_secs(2);
+
 // ── SetupState ────────────────────────────────────────────────────────────────
 
 /// Everything needed to run the load phase, produced by [`setup`].
@@ -326,9 +336,14 @@ pub async fn warmup(
 
     // Verify that warmup mining funded the hot wallet specifically. generate()
     // returns once Zebra has mined the blocks, but Zallet's sync is
-    // asynchronous: it pulls from Zaino's block cache in a background loop.
-    // Poll for up to 60 seconds so the check isn't racy against Zallet's sync
-    // lag.
+    // asynchronous: it rescans from scratch on every container restart, and
+    // how long that takes grows with the wallet's accumulated history (account
+    // count, prior transactions) — not just with warmup_blocks. Measured on a
+    // wallet with ~100 accounts and a few hundred blocks of history: 222s to
+    // reach the chain tip and drain its backlog of pending transaction-data
+    // requests. Poll for up to WARMUP_BALANCE_CHECK_ATTEMPTS ×
+    // WARMUP_BALANCE_CHECK_INTERVAL so the check isn't racy against that lag
+    // regardless of how much history the wallet has accumulated.
     //
     // Scoped to hot_wallet_uuid via z_getbalanceforaccount, NOT
     // z_gettotalbalance (wallet-wide): on a wallet with prior run history,
@@ -336,11 +351,13 @@ pub async fn warmup(
     // positive regardless of whether the hot wallet itself received anything
     // this run, defeating this check's entire purpose.
     //
-    // Persistent 0 balance means either Zebra's miner_address is not pointing at
-    // the hot_wallet account (run scripts/dev/regtest-miner-setup.sh), or
-    // warmup_blocks is below the regtest coinbase maturity window.
+    // Persistent 0 balance after the full retry budget means either Zebra's
+    // miner_address is not pointing at the hot_wallet account (run
+    // scripts/dev/regtest-miner-setup.sh), or warmup_blocks is below the
+    // regtest coinbase maturity window — Zallet sync lag alone should not
+    // exhaust this budget on any reasonably-sized wallet.
     let mut funded = false;
-    for _ in 0..30 {
+    for attempt in 0..WARMUP_BALANCE_CHECK_ATTEMPTS {
         let balance = rpc
             .z_get_balance_for_account(hot_wallet_uuid, None)
             .await
@@ -349,16 +366,23 @@ pub async fn warmup(
             funded = true;
             break;
         }
-        sleep(Duration::from_secs(2)).await;
+        if attempt > 0 && attempt % 15 == 0 {
+            eprintln!(
+                "warmup: hot wallet still shows 0 balance after {}s — likely Zallet \
+                 still syncing against accumulated wallet history, not a failure yet",
+                attempt as u64 * WARMUP_BALANCE_CHECK_INTERVAL.as_secs()
+            );
+        }
+        sleep(WARMUP_BALANCE_CHECK_INTERVAL).await;
     }
     if !funded {
-        return Err(RunnerError::Warmup(
-            "hot wallet has 0 balance after warmup mining — verify that Zebra's \
-             miner_address is the hot_wallet account's transparent receiver (run \
-             scripts/dev/regtest-miner-setup.sh), and that warmup_blocks exceeds \
-             the regtest coinbase maturity window"
-                .into(),
-        ));
+        return Err(RunnerError::Warmup(format!(
+            "hot wallet has 0 balance after warmup mining and {}s of retries — verify \
+             that Zebra's miner_address is the hot_wallet account's transparent \
+             receiver (run scripts/dev/regtest-miner-setup.sh), and that warmup_blocks \
+             exceeds the regtest coinbase maturity window",
+            WARMUP_BALANCE_CHECK_ATTEMPTS as u64 * WARMUP_BALANCE_CHECK_INTERVAL.as_secs()
+        )));
     }
 
     // A non-zero balance is necessary but NOT sufficient: it counts outputs the
