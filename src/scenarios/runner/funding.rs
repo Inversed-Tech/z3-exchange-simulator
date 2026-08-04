@@ -33,6 +33,12 @@
 //!   them, notes and transparent UTXOs alike. Younger funds produce error -4
 //!   "Insufficient balance (have 0, …)" while the balance plainly shows them,
 //!   so sends are retried while blocks are mined rather than failed fast.
+//! - **`warmup_blocks` is sized for coinbase maturity, not funding value.**
+//!   It produces a fixed amount of mined value regardless of a scenario's
+//!   scale (`accounts_count` x TPS x duration), so a large enough scenario
+//!   can need far more than warmup ever mined. [`fund_accounts`] tops up
+//!   mining itself, on top of the existing shield-if-short step, until the
+//!   source account's balance covers the plan — see [`ensure_funded`].
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -64,6 +70,99 @@ pub fn zat_to_zec(zatoshis: u64) -> f64 {
 
 /// How long to keep polling an async wallet operation before giving up.
 const OPERATION_TIMEOUT: Duration = Duration::from_secs(240);
+
+/// `generate` must be chunked on this stack: an Orchard `miner_address` costs
+/// ~2s of halo2 proving per block (emulated host), so one large `generate`
+/// call can outlive the 30s HTTP timeout while Zebra keeps mining
+/// server-side (see docs/regtest-funding-plan.md, "generate must be
+/// chunked").
+const GENERATE_CHUNK_BLOCKS: u64 = 5;
+
+/// How many blocks [`ensure_funded`] mines per top-up round, before
+/// re-measuring the balance. Deliberately not "mine exactly the computed
+/// shortfall": only the oldest blocks in a batch have reached
+/// [`ANCHOR_CONFIRMATIONS`] by the time the batch finishes, so a single
+/// round under-counts newly mined value — the loop compensates by running
+/// more, smaller rounds rather than trying to calculate an exact one-shot
+/// amount from an assumed, possibly stale, per-block reward.
+const FUND_TOPUP_BLOCKS_PER_ROUND: u64 = 30;
+
+/// Cap on top-up rounds before [`ensure_funded`] gives up. Mining is cheap on
+/// regtest (no real proof-of-work), so this is sized generously rather than
+/// tightly: a large scenario's funding requirement can be a five-figure ZEC
+/// amount (see docs/z3-regtest-bootstrap-nu5-miner-address.md's sibling
+/// finding on funding scale), needing well over a thousand extra blocks.
+const FUND_TOPUP_MAX_ROUNDS: u32 = 100;
+
+/// Mine additional coinbase blocks, if necessary, until `source`'s spendable
+/// balance (transparent + shielded, at [`ANCHOR_CONFIRMATIONS`]) covers
+/// `needed` ZEC.
+///
+/// `warmup_blocks` mines a fixed number of blocks sized for coinbase
+/// maturity, not for funding value — nothing else scales the amount mined to
+/// a scenario's actual funding requirement, so a scenario large enough
+/// (`accounts_count` x TPS x duration) can need far more value than a fixed
+/// warmup ever produces. Without this, [`fund_accounts`]'s fan-out send
+/// fails with "Insufficient balance (have 0, …)" and never recovers, no
+/// matter how many times it retries — the retry loop is designed for a
+/// confirmation-*depth* race (funds exist but are too young), not a
+/// magnitude shortfall.
+async fn ensure_funded(
+    rpc: &Arc<RpcClient>,
+    source: &FundedAccount,
+    needed: f64,
+) -> Result<(), FundingError> {
+    for _ in 0..FUND_TOPUP_MAX_ROUNDS {
+        if current_balance_zec(rpc, source).await? >= needed {
+            return Ok(());
+        }
+        mine_chunked(rpc, FUND_TOPUP_BLOCKS_PER_ROUND).await?;
+    }
+
+    let balance = current_balance_zec(rpc, source).await?;
+    if balance >= needed {
+        return Ok(());
+    }
+    Err(FundingError::Failed {
+        step: "ensure_funded",
+        detail: format!(
+            "source account {} holds {balance} ZEC after {FUND_TOPUP_MAX_ROUNDS} top-up \
+             rounds ({} blocks), still short of the {needed} ZEC the funding plan requires",
+            source.uuid,
+            FUND_TOPUP_MAX_ROUNDS as u64 * FUND_TOPUP_BLOCKS_PER_ROUND
+        ),
+    })
+}
+
+/// `source`'s spendable balance (transparent + shielded, at
+/// [`ANCHOR_CONFIRMATIONS`]), in ZEC.
+async fn current_balance_zec(rpc: &RpcClient, source: &FundedAccount) -> Result<f64, FundingError> {
+    let balance = rpc
+        .z_get_balance_for_account(&source.uuid, Some(ANCHOR_CONFIRMATIONS))
+        .await
+        .map_err(|e| FundingError::Rpc {
+            step: "z_getbalanceforaccount",
+            source: e,
+        })?;
+    Ok(zat_to_zec(balance.shielded_zatoshis()) + zat_to_zec(balance.transparent_zatoshis()))
+}
+
+/// Mine `blocks` blocks in chunks of [`GENERATE_CHUNK_BLOCKS`], so a large
+/// request never risks outliving the RPC client's HTTP timeout.
+async fn mine_chunked(rpc: &RpcClient, blocks: u64) -> Result<(), FundingError> {
+    let mut remaining = blocks;
+    while remaining > 0 {
+        let chunk = remaining.min(GENERATE_CHUNK_BLOCKS);
+        rpc.generate(chunk as u32)
+            .await
+            .map_err(|e| FundingError::Rpc {
+                step: "generate",
+                source: e,
+            })?;
+        remaining -= chunk;
+    }
+    Ok(())
+}
 
 /// How many times a send is retried while the wallet catches up to freshly
 /// mined anchor blocks (one block is mined between attempts). Sized to
@@ -371,18 +470,14 @@ pub async fn fund_accounts(
             })?;
         wait_operation(rpc, &shield.opid).await?;
         // The shielding tx itself needs anchor confirmations before the notes
-        // it created are spendable. Mined in two chunks: with a shielded miner
-        // address each block carries a ~2s coinbase proof (emulated host), and
-        // one call for all 10 blocks would flirt with the 30s HTTP timeout.
-        for _ in 0..2 {
-            rpc.generate(ANCHOR_CONFIRMATIONS / 2)
-                .await
-                .map_err(|e| FundingError::Rpc {
-                    step: "generate",
-                    source: e,
-                })?;
-        }
+        // it created are spendable.
+        mine_chunked(rpc, ANCHOR_CONFIRMATIONS as u64).await?;
     }
+
+    // Shielding only redistributes existing coinbase between pools — it
+    // cannot make the account hold more value than warmup already mined
+    // into it. If that still isn't enough for this plan, mine more.
+    ensure_funded(rpc, source, needed).await?;
 
     // 2. Fan out in rounds. Each sink needs `plan.transparent_outputs`
     //    separate UTXOs at ONE address, but z_sendmany rejects duplicate
