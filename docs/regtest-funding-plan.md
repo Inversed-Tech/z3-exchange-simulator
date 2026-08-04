@@ -506,3 +506,30 @@ wired it into all three call sites in place of their direct `z_sendmany` /
 The `have 0` failure class is fully eliminated; the residual failures are the same
 concurrency-driven class already characterized for the other flows, not a new or
 remaining defect in the affected functions.
+
+---
+
+## 9. The funding fan-out's own retry budget was occasionally too narrow
+
+`fund_accounts()`'s round 0 (§ how the runner is wired, above) combines every sink
+account's shielded output and first transparent output into a single, larger
+multi-recipient transaction — bigger than any individual load-phase send. Exercising
+`health-mixed.yaml` (all four flow types, needing the same funding structure as every
+other scenario) surfaced this failing at the funding step itself, deterministically, on
+two separate fresh datadirs: `Setup error: ... insufficient balance (have 0, need
+609060000 including fee)`, exhausting all `SEND_RETRIES` (12 at the time) attempts.
+
+**Confirmed not a structural defect.** Immediately after one such failure, with the stack
+still up, the identical send (same source, same 12 recipients, same amounts) was replayed
+manually via raw RPC — and succeeded on the first attempt. The source account's coinbase
+balance was never in question (confirmed separately via `z_getbalanceforaccount`); the
+existing 12-retry budget (one block mined per retry, ~60 s total) was simply narrower than
+this particular transaction needed to reach sufficient input confirmations on this host.
+
+**Fix.** Increased `SEND_RETRIES` (`src/scenarios/runner/funding.rs`) from 12 to 24.
+
+**Validated end to end**, `health-mixed.yaml`, `--max-in-flight 4`, fresh datadir: setup
+completed cleanly (no retry exhaustion), and the load phase confirmed 25/30 intents
+(83%); the 5 failures are 3× already-spent-input rejection and 2× same-account
+exhaustion — both already documented in `docs/z3-concurrent-request-ceiling.md`, not a
+new failure class.

@@ -66,8 +66,13 @@ pub fn zat_to_zec(zatoshis: u64) -> f64 {
 const OPERATION_TIMEOUT: Duration = Duration::from_secs(240);
 
 /// How many times a send is retried while the wallet catches up to freshly
-/// mined anchor blocks (one block is mined between attempts).
-const SEND_RETRIES: u32 = 12;
+/// mined anchor blocks (one block is mined between attempts). 12 (one block
+/// per retry, ~60s) was measured insufficient for the round-0 fan-out send —
+/// which combines every sink's shielded and first transparent output into one
+/// multi-recipient transaction, larger than any single load-phase send — on a
+/// wallet whose only funds are fresh warmup coinbase: the identical send,
+/// replayed manually once confirmations caught up, succeeded immediately.
+const SEND_RETRIES: u32 = 24;
 
 /// Errors from the funding pipeline. Wraps the failing step so a probe-style
 /// "which operation broke" reading survives into the error message.
