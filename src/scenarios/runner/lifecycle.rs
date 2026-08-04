@@ -294,6 +294,19 @@ async fn fund_active_accounts(
 /// (see `FundingPlan`). The shielded side is one output; shielded change
 /// stays in the account's own pool.
 ///
+/// `transparent_outputs` carries NO extra headroom multiplier (unlike the
+/// value budgets below) — `fund_accounts` can only mint one transparent
+/// UTXO per sink per round (`z_sendmany` rejects duplicate recipient
+/// addresses within one transaction), so this number is also the fan-out's
+/// round count, and rounds run strictly sequentially. Doubling it for
+/// headroom, as an earlier version of this function did, doubles setup
+/// wall-clock time for every scenario, and for a small `active_count` with
+/// a high per-account intent count that setup time can come to dominate or
+/// exceed the scenario's own `load_duration_seconds` — see
+/// `docs/funding-round-count-scaling-pending-fix.md` for the measured
+/// numbers and why a further structural fix (rather than just this
+/// headroom removal) is still needed for that case.
+///
 /// Budgets off the amount distribution's MEAN, not its ceiling: intent
 /// amounts are sampled uniformly between `min_zatoshis` and `max_zatoshis`
 /// (`synthetic/generators.rs`'s `IntentGenerator`), so budgeting every
@@ -316,7 +329,7 @@ fn compute_funding_plan(scenario: &ScenarioConfig, active_count: usize) -> fundi
     let transparent_zat_each = (mean_zat + mean_zat / 2).max(1_000_000);
     let shielded_zat = (per_account_intents * mean_zat * 3 / 2).max(100_000_000);
     funding::FundingPlan {
-        transparent_outputs: (per_account_intents * 2) as u32,
+        transparent_outputs: per_account_intents as u32,
         transparent_zec_each: funding::zat_to_zec(transparent_zat_each),
         shielded_zec: funding::zat_to_zec(shielded_zat),
     }
@@ -392,6 +405,32 @@ mod funding_plan_tests {
         assert!(
             per_sink_total > old_max_based_total / 10.0,
             "budget should not collapse to near-zero: got {per_sink_total} ZEC/sink"
+        );
+    }
+
+    /// Reproduces the `ramp-fast` incident (15 accounts, 8 TPS, 100s;
+    /// `20260804T180454Z-ramp-fast`): a funding fan-out that took 27 minutes
+    /// (109 sequential rounds) against a 100-second load duration, because
+    /// `transparent_outputs` — which is also the fan-out's round count, see
+    /// `compute_funding_plan`'s docs — carried an unvalidated x2 headroom on
+    /// top of the per-account intent count. Confirms the headroom is gone:
+    /// round count now equals `per_account_intents` exactly, halving it.
+    /// This does not fix the underlying round-count scaling problem — see
+    /// `docs/funding-round-count-scaling-pending-fix.md`.
+    #[test]
+    fn ramp_fast_incident_round_count_is_halved() {
+        let scenario = scenario_with(8.0, 100, 10_000, 1_000_000);
+        let plan = compute_funding_plan(&scenario, 15);
+
+        let per_account_intents = (8.0_f64 * 100.0 / 15.0).ceil() as u32; // 54
+        assert_eq!(
+            plan.transparent_outputs, per_account_intents,
+            "transparent_outputs (== round count) should equal per_account_intents \
+             exactly, with no extra headroom multiplier"
+        );
+        assert_eq!(
+            plan.transparent_outputs, 54,
+            "sanity check against the incident's own numbers: ceil(8.0 * 100 / 15) = 54"
         );
     }
 
