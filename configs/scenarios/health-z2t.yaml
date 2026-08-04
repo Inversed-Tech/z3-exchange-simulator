@@ -1,0 +1,34 @@
+name: health-z2t
+description: "Health check: shielded-to-transparent flow in isolation. Throwaway values, small scale. load_duration_seconds is intentionally low (~1 intent/account): each ZToT intent sweeps its account's entire shielded balance, so any account hit twice in one run fails its second intent with 'no notes found' by design (see docs/z3-concurrent-request-ceiling.md) — not a defect, but noise this scenario is sized to avoid."
+seed: 20260803
+
+accounts_count: 6
+accounts_active_fraction: 1.0
+
+load_duration_seconds: 6
+load_target_tps: 1.0
+
+flows:
+  transparent_to_transparent: 0.0
+  transparent_to_shielded: 0.0
+  shielded_to_transparent: 1.0
+  shielded_to_shielded: 0.0
+
+warmup_blocks: 20
+
+confirmations_deposit_required: 1
+
+observability:
+  record_rpc_calls: true
+  record_component_logs: true
+  metric_sampling_interval_secs: 2
+  mempool_saturation_threshold: 500
+
+activity_profiles:
+  low_fraction: 0.50
+  medium_fraction: 0.35
+  high_fraction: 0.15
+
+amounts:
+  min_zatoshis: 10000
+  max_zatoshis: 1000000
