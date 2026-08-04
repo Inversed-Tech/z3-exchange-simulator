@@ -416,12 +416,12 @@ async fn load_phase(
         }
     }
 
-    // Signal background tasks to stop.
-    let _ = mempool_tx.send(());
-    let _ = balance_tx.send(());
-    let _ = miner_tx.send(());
-
-    // Drain all in-flight tasks.
+    // Drain all in-flight tasks. The background miner, mempool watcher, and
+    // balance checker are kept running throughout this drain (signalled to
+    // stop only after it completes, below) — otherwise transactions still
+    // in flight when the load window ends are waiting on a chain that has
+    // already been told to stop producing blocks, guaranteeing every one of
+    // them times out regardless of the actual state of the backend.
     let mut outcomes = Vec::with_capacity(tasks.len());
     while let Some(result) = tasks.join_next().await {
         match result {
@@ -435,6 +435,12 @@ async fn load_phase(
             }
         }
     }
+
+    // Signal background tasks to stop now that every in-flight task has
+    // resolved (confirmed, failed, or timed out).
+    let _ = mempool_tx.send(());
+    let _ = balance_tx.send(());
+    let _ = miner_tx.send(());
 
     // Emit end-of-load summary metrics consumed by generate_summary.
     let confirmed = outcomes
