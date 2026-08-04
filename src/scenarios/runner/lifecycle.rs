@@ -187,41 +187,16 @@ pub async fn setup(
 /// ≈ 11 s worst-case. Transparent-coinbase chunks are near-instant either way.
 const MINE_CHUNK_BLOCKS: u32 = 5;
 
-/// Mine `total` blocks in chunks of [`MINE_CHUNK_BLOCKS`].
-///
-/// A single `generate(total)` call cannot work for a large `total` with a
-/// shielded miner address: Zebra keeps proving and submitting blocks
-/// server-side while the HTTP request times out client-side, the retry
-/// re-issues the full request, and the chain over-mines while the caller only
-/// ever sees transport errors (measured: 188 blocks accepted server-side while
-/// warmup "failed"). Chunking keeps every call well inside the timeout.
-///
-/// Transport errors are retried a few times per chunk: right after stack
-/// startup the rpc-router can still be restarting, and an emulated prover can
-/// occasionally push a chunk past the deadline.
+/// Mine `total` blocks in chunks of [`MINE_CHUNK_BLOCKS`], retrying a
+/// transport error a few times per chunk — see
+/// [`RpcClient::generate_in_chunks`] for why this is necessary rather than
+/// treating a chunk's transport error as fatal.
 async fn mine_blocks(rpc: &RpcClient, total: u32) -> Result<(), RunnerError> {
-    let mut remaining = total;
-    while remaining > 0 {
-        let chunk = remaining.min(MINE_CHUNK_BLOCKS);
-        let mut attempts = 0u32;
-        loop {
-            attempts += 1;
-            match rpc.generate(chunk).await {
-                Ok(_) => break,
-                Err(RpcError::Transport(_)) if attempts < 12 => {
-                    sleep(Duration::from_secs(5)).await;
-                }
-                Err(e) => {
-                    return Err(RunnerError::Setup(format!(
-                        "generate({chunk}) failed with {} of {} blocks left: {e}",
-                        remaining, total
-                    )))
-                }
-            }
-        }
-        remaining -= chunk;
-    }
-    Ok(())
+    rpc.generate_in_chunks(total as u64, MINE_CHUNK_BLOCKS)
+        .await
+        .map_err(|e| {
+            RunnerError::Setup(format!("generate failed while mining {total} blocks: {e}"))
+        })
 }
 
 // ── funding ───────────────────────────────────────────────────────────────────

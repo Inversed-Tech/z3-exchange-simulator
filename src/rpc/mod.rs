@@ -864,6 +864,71 @@ impl RpcClient {
         self.call("generate", serde_json::json!([num_blocks])).await
     }
 
+    /// Mine `total_blocks` blocks in chunks of `chunk_size`, retrying a
+    /// transport error a few times per chunk before giving up.
+    ///
+    /// A single `generate(total_blocks)` call cannot work for a large
+    /// `total_blocks` with a shielded miner address: each block carries a
+    /// halo2 coinbase proof (measured ~2.2s/block on an emulated,
+    /// linux/amd64-on-aarch64 Zebra, and observed higher still on a
+    /// long-lived chain with a lot of accumulated history), so Zebra can
+    /// keep proving and submitting blocks server-side well past the RPC
+    /// client's HTTP timeout. The client then sees only a transport error —
+    /// mining did not fail, the response for that chunk just arrived too
+    /// late — and a naive caller that treats this as fatal aborts while the
+    /// chain keeps mining regardless (measured previously: 188 blocks
+    /// accepted server-side while a caller reported failure). Chunking
+    /// keeps most calls well inside the timeout, and retrying instead of
+    /// failing on the first transport error absorbs the rest: the retried
+    /// `generate` call always mines `chunk_size` MORE blocks from the
+    /// current tip, so a retry after a slow-but-successful chunk simply
+    /// over-mines a few extra blocks — harmless on regtest, and cheaper
+    /// than failing setup outright.
+    pub async fn generate_in_chunks(
+        &self,
+        total_blocks: u64,
+        chunk_size: u32,
+    ) -> Result<(), RpcError> {
+        const MAX_ATTEMPTS_PER_CHUNK: u32 = 12;
+        const RETRY_INTERVAL: Duration = Duration::from_secs(5);
+        self.generate_in_chunks_with_retry_policy(
+            total_blocks,
+            chunk_size,
+            MAX_ATTEMPTS_PER_CHUNK,
+            RETRY_INTERVAL,
+        )
+        .await
+    }
+
+    /// [`Self::generate_in_chunks`] with the retry policy as parameters, so
+    /// tests can exercise real retry-then-succeed and retry-exhaustion paths
+    /// without waiting on production-sized delays.
+    async fn generate_in_chunks_with_retry_policy(
+        &self,
+        total_blocks: u64,
+        chunk_size: u32,
+        max_attempts_per_chunk: u32,
+        retry_interval: Duration,
+    ) -> Result<(), RpcError> {
+        let mut remaining = total_blocks;
+        while remaining > 0 {
+            let chunk = remaining.min(chunk_size as u64) as u32;
+            let mut attempts = 0u32;
+            loop {
+                attempts += 1;
+                match self.generate(chunk).await {
+                    Ok(_) => break,
+                    Err(RpcError::Transport(_)) if attempts < max_attempts_per_chunk => {
+                        tokio::time::sleep(retry_interval).await;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            remaining -= chunk as u64;
+        }
+        Ok(())
+    }
+
     /// Mark a block (and its descendants) as invalid, rolling the chain back to
     /// its parent. Regtest chain-reorganization control. Returns `()` on success.
     pub async fn invalidate_block(&self, block_hash: &str) -> Result<(), RpcError> {
@@ -2115,6 +2180,116 @@ mod tests {
         let hashes = client(&server.uri()).generate(3).await.unwrap();
         assert_eq!(hashes.len(), 3);
         assert_eq!(hashes[0], "hash1");
+    }
+
+    // ── generate_in_chunks ────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn generate_in_chunks_splits_into_correct_chunk_sizes() {
+        use wiremock::{matchers, Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(matchers::method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [], "error": null, "id": 1
+            })))
+            .mount(&server)
+            .await;
+
+        client(&server.uri())
+            .generate_in_chunks(12, 5)
+            .await
+            .unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        let chunk_sizes: Vec<u64> = requests
+            .iter()
+            .map(|r| {
+                r.body_json::<serde_json::Value>().unwrap()["params"][0]
+                    .as_u64()
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(chunk_sizes, vec![5, 5, 2]);
+    }
+
+    #[tokio::test]
+    async fn generate_in_chunks_propagates_non_transport_error_immediately() {
+        use wiremock::{matchers, Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(matchers::method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": null,
+                "error": {"code": -1, "message": "some server-side failure"},
+                "id": 1
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let err = client(&server.uri())
+            .generate_in_chunks(10, 5)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, RpcError::JsonRpc { code: -1, .. }));
+        // `.expect(1)` above is checked when the mock server is dropped; a
+        // second, retried request would fail that expectation.
+    }
+
+    #[tokio::test]
+    async fn generate_in_chunks_retries_a_transport_error_then_succeeds() {
+        use wiremock::{matchers, Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        // The first request times out client-side (a short client timeout,
+        // plus a response slower than it, is a deterministic way to produce
+        // RpcError::Transport without faking a dropped connection); the
+        // second succeeds normally.
+        Mock::given(matchers::method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"result": [], "error": null, "id": 1}))
+                    .set_delay(Duration::from_millis(200)),
+            )
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(matchers::method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [], "error": null, "id": 1
+            })))
+            .mount(&server)
+            .await;
+
+        let short_timeout_client = RpcClient::new(
+            server.uri(),
+            "test-run",
+            None,
+            Some(Duration::from_millis(20)),
+        );
+
+        short_timeout_client
+            .generate_in_chunks_with_retry_policy(5, 5, 3, Duration::from_millis(1))
+            .await
+            .unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(
+            requests.len(),
+            2,
+            "expected the timed-out attempt plus one retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn generate_in_chunks_gives_up_after_exhausting_retries() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let err = client(&format!("http://{addr}"))
+            .generate_in_chunks_with_retry_policy(5, 5, 1, Duration::from_millis(1))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, RpcError::Transport(_)));
     }
 
     // ── Added stress-test methods ─────────────────────────────────────────────

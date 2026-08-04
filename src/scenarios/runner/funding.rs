@@ -147,21 +147,17 @@ async fn current_balance_zec(rpc: &RpcClient, source: &FundedAccount) -> Result<
     Ok(zat_to_zec(balance.shielded_zatoshis()) + zat_to_zec(balance.transparent_zatoshis()))
 }
 
-/// Mine `blocks` blocks in chunks of [`GENERATE_CHUNK_BLOCKS`], so a large
-/// request never risks outliving the RPC client's HTTP timeout.
+/// Mine `blocks` blocks in chunks of [`GENERATE_CHUNK_BLOCKS`], retrying a
+/// transport error a few times per chunk — see
+/// [`RpcClient::generate_in_chunks`] for why this is necessary rather than
+/// treating a chunk's transport error as fatal.
 async fn mine_chunked(rpc: &RpcClient, blocks: u64) -> Result<(), FundingError> {
-    let mut remaining = blocks;
-    while remaining > 0 {
-        let chunk = remaining.min(GENERATE_CHUNK_BLOCKS);
-        rpc.generate(chunk as u32)
-            .await
-            .map_err(|e| FundingError::Rpc {
-                step: "generate",
-                source: e,
-            })?;
-        remaining -= chunk;
-    }
-    Ok(())
+    rpc.generate_in_chunks(blocks, GENERATE_CHUNK_BLOCKS as u32)
+        .await
+        .map_err(|e| FundingError::Rpc {
+            step: "generate",
+            source: e,
+        })
 }
 
 /// How many times a send is retried while the wallet catches up to freshly
