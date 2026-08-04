@@ -46,31 +46,25 @@ unique per run (assuming no two runs of the same scenario start in the same seco
 
 **`simulator_commit` is embedded at compile time** (`build.rs` shells out to
 `git rev-parse HEAD` at build time and bakes the result into the binary via
-`SIMULATOR_GIT_COMMIT`), not read from the working tree at run time. A prior
-implementation called `git rev-parse HEAD` when the run started, which silently
-mislabeled every run with whatever commit the source tree happened to be on if the
-binary wasn't rebuilt after a later commit — the binary that actually executed and
-the commit recorded in the manifest could diverge with no indication. Likewise,
-`zebra_commit`/`zaino_commit`/`zallet_commit` are read from `z3-commits.lock` at a path
-anchored to the crate root at compile time (`CARGO_MANIFEST_DIR`), not resolved
-relative to the process's working directory at run time.
+`SIMULATOR_GIT_COMMIT`), not read from the working tree at run time — the binary that
+actually executed and the commit recorded in the manifest must never be able to
+diverge. Likewise, `zebra_commit`/`zaino_commit`/`zallet_commit` are read from
+`z3-commits.lock` at a path anchored to the crate root at compile time
+(`CARGO_MANIFEST_DIR`), not resolved relative to the process's working directory at
+run time.
 
 **`timeouts`** records the RPC transport timeout and the confirmation/operation
-polling patience actually in effect for the run — previously hardcoded constants
-(`src/rpc/mod.rs`, `src/scenarios/exchange.rs::PollingConfig`) with no per-run record
-of their value, which made it impossible to tell whether a low confirmation rate
-reflected the stack under test or an impatient client.
+polling patience actually in effect for the run, so a low confirmation rate can be
+distinguished from an impatient client.
 
 ---
 
 ## Intent outcome log (`intents.jsonl`)
 
 One JSON object per line, one line per dispatched transaction intent, written once
-the load phase completes. Previously an intent's outcome (`IntentOutcome`) existed
-only in memory during a run and was discarded after being folded into the run's
-aggregate confirmed/failed/timed-out counts — there was no way to attribute a failure
-to a specific flow type, or to tell an async-operation (ZK proving) timeout apart from
-a confirmation-depth timeout, from the persisted output alone.
+the load phase completes. This is what lets a failure be attributed to a specific
+flow type, and lets an async-operation (ZK proving) timeout be told apart from a
+confirmation-depth timeout.
 
 ```json
 {"run_id":"20260602T140000Z-smoke","intent_id":"a1b2c3","flow_type":"t_to_z","outcome":"confirmed","error":null,"timeout_context":null,"recorded_at":"2026-06-02T14:00:45Z"}
@@ -214,8 +208,7 @@ the Foundation and component teams without requiring them to parse JSONL files.
 - async operation (ZK proving) wait: <n>
 - on-chain confirmation wait: <n>
 
-(Omitted entirely for runs with no `intents.jsonl`, e.g. runs recorded before this
-section existed.)
+(Omitted entirely for runs with no `intents.jsonl`.)
 
 ## Notable errors and findings
 - ...

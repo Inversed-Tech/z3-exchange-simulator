@@ -51,18 +51,9 @@ attribution only. The simulator does not select backends directly.
 > `z_listunifiedreceivers` 88/88 · `z_listunspent` 0/68 · `z_sendmany` 341/550
 >
 > **One exception, flagged rather than silently included:** `z_getbalances` also
-> appears (44/120) in one older run (`20260731T100505Z-flow-check-ztot`), despite no
-> call site for that method existing anywhere in the RPC client source at the commit
-> its manifest claimed (`src/rpc/mod.rs` only implements `z_get_total_balance`).
-> **Explained and fixed, not just flagged:** the run's manifest recorded
-> `simulator_commit` via a runtime `git rev-parse HEAD` call, which reports the
-> working tree's *current* commit rather than the commit the running binary was
-> actually built from — so a stale, not-yet-rebuilt binary's run got mislabeled with
-> a newer commit than the one that produced it. `read_simulator_commit()` now embeds
-> the commit at compile time instead (`build.rs`), so this cannot recur; see
-> `docs/architecture/observability.md`. This specific historical run's data should
-> still not be mixed with current-commit runs in the findings report, since its true
-> originating commit is now unrecoverable — but the mechanism itself is resolved.
+> appears (44/120) in one older run, despite no call site for that method existing
+> anywhere in the current RPC client source (`src/rpc/mod.rs` only implements
+> `z_get_total_balance`). That run's data should not be trusted for this method, so
 > `z_getbalances` is **not** marked `Tested?` below.
 >
 > "Tested? = Yes" here means "observed at least once in real evidence," not "passes

@@ -127,9 +127,9 @@ pub fn generate_summary(run_dir: &RunDir, manifest: &RunManifest) -> Result<Stri
         }
     }
 
-    // intents.jsonl is optional: runs recorded before this file existed (or
-    // any run whose intents writer failed to open) simply produce no
-    // "Outcomes by flow type" detail below, rather than an error.
+    // intents.jsonl is optional: a run whose intents writer failed to open
+    // simply produces no "Outcomes by flow type" detail below, rather than
+    // an error.
     let mut intent_aggs: HashMap<String, IntentAgg> = HashMap::new();
     let mut timeout_stage_counts: HashMap<&'static str, u64> = HashMap::new();
     let intents_path = run_dir.intents_path();

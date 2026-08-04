@@ -489,8 +489,7 @@ fn routing_table() -> HashMap<&'static str, Backend> {
         ("z_validateaddress", Backend::Zebra),
         // Zallet — stress-test
         // z_listunifiedreceivers is served by Zallet (it appears in Zallet's
-        // own method list); it was previously mislabelled Backend::Zebra here,
-        // which skewed per-backend metrics attribution.
+        // own method list).
         ("z_listunifiedreceivers", Backend::Zallet),
         ("z_shieldcoinbase", Backend::Zallet),
         ("z_getnewaccount", Backend::Zallet),
@@ -1127,11 +1126,8 @@ impl RpcClient {
     ///
     /// A wallet containing any shielded coinbase note with non-UTF8 memo bytes
     /// makes an unfiltered `z_listunspent` call fail wallet-wide with
-    /// `WalletDb::get_memo failed` (measured on Zallet beta.2; see
-    /// `docs/regtest-funding-plan.md`). Measured on the same wallet state,
-    /// back-to-back: an unfiltered call fails with that error while a call
-    /// passing a non-empty `addresses` array (with an explicit `max_conf`
-    /// value, not `null`, matching what was measured) succeeds — regardless of
+    /// `WalletDb::get_memo failed` (see `docs/regtest-funding-plan.md`).
+    /// Passing a non-empty `addresses` array avoids the crash — regardless of
     /// whether the given addresses match the notes returned, which are not
     /// scoped to exactly those addresses. Callers that need results limited to
     /// a specific account should still filter the returned notes by

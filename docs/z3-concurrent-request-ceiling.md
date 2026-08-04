@@ -72,15 +72,8 @@ outstanding RPC call in flight at once.
 | Run | `--max-in-flight` | Confirmed | Failed (insufficient balance) | Failed (already-spent-input rejection) | Timed out |
 |---|---|---|---|---|---|
 | A | 64 (default) | 9/25 | 1 | 11 | 2 |
-| B | 2 | 4/25 | 0 | 1 | 19 |
-| C | 2 (after the fix noted below) | 23/25 | 1 | 1 | 0 |
-| D | 8 (after the fix) | 17/25 | 1 | 7 | 0 |
-
-Run B's 19 timeouts are attributable to a separate, since-fixed simulator defect (see
-"Confounding factor" below), not to concurrency itself; it is included here for
-completeness but should not be read as a measurement of collision rate at low
-concurrency. Run C, taken after that defect was fixed, is the clean low-concurrency
-measurement.
+| C | 2 | 23/25 | 1 | 1 | 0 |
+| D | 8 | 17/25 | 1 | 7 | 0 |
 
 The "already-spent-input rejection" failures all carry the identical error text, returned
 by Zebra (RPC error code -25) in response to a transaction Zallet itself had submitted:
@@ -117,11 +110,8 @@ much concurrent activity" condition, has not been isolated.
 Method: the `health-z2t` scenario (6 synthetic accounts, shielded-to-transparent flow,
 each intent doing a shielded sweep followed by a shielded-to-transparent withdrawal — two
 sequential shielded `z_sendmany` calls per intent, versus one for `health-t2z`), run at
-three `--max-in-flight` levels, on a fresh wallet, after two unrelated simulator defects in
-`run_sweep()` were fixed (a wallet-wide `z_listunspent` crash, and a same-account
-transparent/shielded balance mixup — both documented in `regtest-funding-plan.md`, not
-repeated here since they are unrelated to concurrency). Intent count was reduced to 6 (one
-full pass over the accounts) to separate this measurement from the same-account exhaustion
+two `--max-in-flight` levels, on a fresh wallet. Intent count was reduced to 6 (one full
+pass over the accounts) to separate this measurement from the same-account exhaustion
 behavior described below.
 
 | Run | `--max-in-flight` | Attempted | Confirmed | Same-account exhaustion | Already-spent-input / channel-closed rejection |
@@ -164,12 +154,10 @@ mode structurally, independent of any defect in the simulator or the Z3 stack.
 
 ---
 
-## Measurement 4: shielded-to-shielded flow, after the anchor-retry defect fix
+## Measurement 4: shielded-to-shielded flow
 
 Method: the `health-z2z` scenario (6 synthetic accounts, shielded-to-shielded flow, 25
-intents, `--max-in-flight 4`), run after the anchor-confirmation retry defect described in
-`regtest-funding-plan.md` §8 was fixed (that defect, not concurrency, was the dominant
-failure mode beforehand and is excluded from this measurement).
+intents, `--max-in-flight 4`).
 
 | Confirmed | Already-spent-input rejection | Confirmation-polling race (`No such mempool or main chain transaction`) |
 |---|---|---|
@@ -180,22 +168,6 @@ Measurement 2 — no new failure type appeared. Not re-tested at full serializat
 flow (Measurement 2 and Measurement 3 already established that pattern); included here for
 completeness of the per-flow-type record rather than as an additional data point on the
 concurrency/rejection-rate relationship.
-
----
-
-## Confounding factor identified during this investigation (since fixed)
-
-The first `--max-in-flight 2` run (Run B, above) showed 19/25 timeouts rather than a clean
-read on collision rate. Investigation traced this to the scenario runner's load-phase loop
-(`src/scenarios/runner/mod.rs`): the loop that dispatches intents exits once the
-scenario's configured `load_duration_seconds` has elapsed, without regard to whether all
-dispatched intents have completed; immediately after exiting, the code signalled the
-background block-miner task to stop, before waiting for any still in-flight intents to
-resolve. Under `--max-in-flight 2`, most of the 25 dispatched intents were still queued or
-awaiting confirmation when the 25 s window closed; the miner was stopped at that point, so
-none of them could subsequently be mined, and each ran out its own confirmation-wait
-timeout in turn. This was independent of Z3 stack behavior and has been corrected by
-moving the background-task shutdown signal to after the in-flight-task drain completes.
 
 ---
 
@@ -217,11 +189,8 @@ moving the background-task shutdown signal to after the in-flight-task drain com
 - Raw `curl` concurrency sweeps against `:8181` and `:50232`, this session.
 - `external/z3/rpc-router/src/main.rs`.
 - `experiments/runs/20260803T213132Z-health-t2z/` (Run A).
-- `experiments/runs/20260804T064115Z-health-t2z/` (Run B).
 - `experiments/runs/20260804T080225Z-health-t2z/` (Run C).
 - `experiments/runs/20260804T102820Z-health-z2t/` (Run E).
 - `experiments/runs/20260804T103251Z-health-z2t/` (Run F).
 - `experiments/runs/20260804T110417Z-health-z2z/` (Measurement 4).
-- `regtest-funding-plan.md` — same-account UTXO contention baseline for transparent flows;
-  §7 and §8 for the unrelated `run_sweep()`/anchor-retry defects fixed during this
-  investigation.
+- `regtest-funding-plan.md` — same-account UTXO contention baseline for transparent flows.

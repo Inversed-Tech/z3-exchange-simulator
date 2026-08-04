@@ -1,8 +1,10 @@
 # Zallet Alpha: Transparent UTXOs Tracked But Not Spendable via `z_sendmany`
 
-**Status:** Confirmed bug / alpha limitation in Zallet `6fc85f68`  
-**Impact:** Simulator load phase confirms 0 transactions (100% failure rate)  
-**Blocker for:** All production scenarios (smoke, steady_state, ramp, burst, mixed)
+**Status:** RESOLVED upstream in Zallet `v0.1.0-beta.1` and later (see "Root cause" below);
+confirmed still fixed on the current override pin, `v0.1.0-beta.2`. Kept here as a record
+of an alpha-era Zallet limitation and its measured resolution.
+**Original impact (alpha `6fc85f68`):** Simulator load phase confirmed 0 transactions
+(100% failure rate); blocked all production scenarios.
 
 ---
 

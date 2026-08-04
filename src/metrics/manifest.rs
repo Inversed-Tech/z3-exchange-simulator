@@ -5,10 +5,8 @@ use std::path::Path;
 use super::error::MetricsError;
 
 /// The RPC transport timeout and confirmation/operation polling patience
-/// actually in effect for a run. These were previously hardcoded constants
-/// with no record of their value per run, which made it impossible to tell
-/// whether a low confirmation rate reflected the stack under test or an
-/// impatient client — see docs/scope.md's report data-sufficiency review.
+/// actually in effect for a run, recorded so a low confirmation rate can be
+/// distinguished from an impatient client.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct RunTimeouts {
     pub rpc_timeout_ms: u64,
