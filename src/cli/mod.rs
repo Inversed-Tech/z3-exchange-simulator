@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use clap::{Parser, Subcommand, ValueEnum};
 use tokio_util::sync::CancellationToken;
 
-use crate::report::{load_runs, render_report, ReportError};
+use crate::report::{load_runs, render_report_with_assets, ReportError};
 use crate::scenarios::runner::run as runner_run;
 use crate::scenarios::runner::{
     load_scenario, validate_scenario, ConfigError, LoadShape, RunOptions, RunnerError,
@@ -53,6 +53,11 @@ pub struct ReportArgs {
     /// Output path for the rendered Markdown report.
     #[arg(long, default_value = "report.md")]
     pub out: PathBuf,
+    /// Also render a PDF at this path by shelling out to `pandoc` (must be
+    /// on PATH). Optional — the Markdown report at `--out` is always
+    /// produced regardless of this flag.
+    #[arg(long)]
+    pub pdf: Option<PathBuf>,
 }
 
 #[derive(clap::Args)]
@@ -123,6 +128,10 @@ pub enum CliError {
     Fixture(FixtureError),
     Generator(GeneratorError),
     Report(ReportError),
+    /// `--pdf` was requested but `pandoc` is missing or failed. The
+    /// Markdown report at `--out` has already been written successfully by
+    /// the time this can occur.
+    Pdf(String),
     /// Bad flag combination (e.g. --burst-multiplier <= 0); distinct from Io.
     InvalidArgs(String),
     /// Actual filesystem errors not covered by Scenario/Fixture variants.
@@ -147,6 +156,7 @@ impl std::fmt::Display for CliError {
             CliError::Fixture(e) => write!(f, "{e}"),
             CliError::Generator(e) => write!(f, "{e}"),
             CliError::Report(e) => write!(f, "{e}"),
+            CliError::Pdf(s) => write!(f, "PDF rendering failed: {s}"),
             CliError::InvalidArgs(s) => write!(f, "invalid arguments: {s}"),
             CliError::Io(e) => write!(f, "{e}"),
             CliError::Interrupted => write!(f, "interrupted"),
@@ -239,13 +249,64 @@ fn validate_scenario_command(path: &Path) -> Result<(), CliError> {
 
 fn report_command(args: &ReportArgs) -> Result<(), CliError> {
     let runs = load_runs(&args.runs).map_err(CliError::Report)?;
-    let md = render_report(&runs);
+
+    let assets_dir = {
+        let stem = args.out.file_stem().unwrap_or_default().to_string_lossy().into_owned();
+        let dir_name = format!("{stem}_assets");
+        match args.out.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent.join(dir_name),
+            _ => PathBuf::from(dir_name),
+        }
+    };
+    let assets_dir = std::fs::canonicalize(assets_dir.parent().unwrap_or(Path::new(".")))
+        .map(|base| base.join(assets_dir.file_name().unwrap()))
+        .unwrap_or(assets_dir);
+
+    let md = render_report_with_assets(&runs, &assets_dir);
     std::fs::write(&args.out, &md).map_err(CliError::Io)?;
     println!("Runs included : {}", runs.len());
     for run in &runs {
         println!("  {}", run.manifest.run_id);
     }
     println!("Report written: {}", args.out.display());
+
+    if let Some(pdf_path) = &args.pdf {
+        render_pdf_via_pandoc(&args.out, pdf_path)?;
+        println!("PDF written   : {}", pdf_path.display());
+    }
+    Ok(())
+}
+
+/// Shells out to `pandoc` to convert the already-written Markdown report
+/// into a PDF. Deliberately not a Rust-native PDF renderer: the report is
+/// plain tables and prose that Markdown->PDF conversion already handles
+/// well, and `pandoc` is a common, widely available tool rather than a new
+/// dependency baked into the binary.
+fn render_pdf_via_pandoc(md_path: &Path, pdf_path: &Path) -> Result<(), CliError> {
+    // Smaller font and tighter margins give the report's widest tables (the
+    // RPC matrix has 9 columns) more usable page width before their content
+    // needs to wrap at all.
+    let output = std::process::Command::new("pandoc")
+        .arg(md_path)
+        .arg("-o")
+        .arg(pdf_path)
+        .arg("-V")
+        .arg("fontsize=9pt")
+        .arg("-V")
+        .arg("geometry:margin=0.6in")
+        .output()
+        .map_err(|e| {
+            CliError::Pdf(format!(
+                "could not run `pandoc` (is it installed and on PATH?): {e}"
+            ))
+        })?;
+    if !output.status.success() {
+        return Err(CliError::Pdf(format!(
+            "pandoc exited with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
     Ok(())
 }
 

@@ -453,6 +453,7 @@ mod tests {
     use crate::data_model::{Backend, IntentRecord, RpcCall};
     use crate::metrics::{RunManifest, RunTimeouts};
     use chrono::Utc;
+    use std::path::Path;
 
     fn run_with_calls(calls: Vec<RpcCall>) -> RunData {
         RunData {
@@ -571,5 +572,65 @@ mod tests {
                 entry.method
             );
         }
+    }
+
+    /// Extracts every `| `method_name` | ...` first-column entry from the
+    /// "## Matrix" section of `rpc-coverage-matrix.md`, stopping before
+    /// "## Removed or replaced from zcashd" (whose first-column entries are
+    /// zcashd methods, not Z3 ones) so those rows can't spuriously count as
+    /// roster methods.
+    fn methods_documented_in_coverage_matrix() -> HashSet<String> {
+        let path = Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/docs/rpc/rpc-coverage-matrix.md"
+        ));
+        let content = std::fs::read_to_string(path)
+            .expect("docs/rpc/rpc-coverage-matrix.md must be readable");
+        let matrix_start = content
+            .find("## Matrix")
+            .expect("rpc-coverage-matrix.md must have a ## Matrix section");
+        let matrix_end = content
+            .find("## Removed or replaced from zcashd")
+            .expect("rpc-coverage-matrix.md must have a ## Removed or replaced section");
+        let section = &content[matrix_start..matrix_end];
+
+        // Explicitly excluded per the module doc comment: gRPC-only mempool
+        // notification mechanisms (not JSON-RPC methods at all) and
+        // `decoderawtransaction`, which the doc marks "not in the
+        // Foundation's confirmed list."
+        let excluded: HashSet<&str> = [
+            "decoderawtransaction",
+            "GetMempoolStream",
+            "Indexer.mempool_change()",
+        ]
+        .into_iter()
+        .collect();
+
+        section
+            .lines()
+            .filter_map(|line| {
+                let line = line.trim();
+                let rest = line.strip_prefix("| `")?;
+                let end = rest.find('`')?;
+                Some(rest[..end].to_string())
+            })
+            .filter(|m| !excluded.contains(m.as_str()))
+            .collect()
+    }
+
+    #[test]
+    fn roster_matches_documented_coverage_matrix_exactly() {
+        let documented = methods_documented_in_coverage_matrix();
+        let roster: HashSet<String> = IN_SCOPE_METHODS.iter().map(|e| e.method.to_string()).collect();
+
+        let missing_from_roster: Vec<&String> = documented.difference(&roster).collect();
+        let extra_in_roster: Vec<&String> = roster.difference(&documented).collect();
+
+        assert!(
+            missing_from_roster.is_empty() && extra_in_roster.is_empty(),
+            "IN_SCOPE_METHODS has drifted from docs/rpc/rpc-coverage-matrix.md — \
+             documented but missing from roster: {missing_from_roster:?}; \
+             in roster but not documented: {extra_in_roster:?}"
+        );
     }
 }

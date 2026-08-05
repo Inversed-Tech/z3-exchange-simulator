@@ -1,15 +1,17 @@
-//! Candidate-finding detection: computes objective aggregates and flags
-//! statistical outliers as *candidates* for review. Deliberately does not
-//! generate severity ratings, root-cause narratives, or recommendations —
-//! those require judgment and are authored by reading this evidence, the
-//! same way the existing crash-loop/spending-bug docs were produced. This
-//! module's job stops at "here is what the data shows and why it's worth a
-//! second look," with every claim traceable to specific evidence.
+//! Candidate-finding detection: computes objective aggregates, flags
+//! statistical outliers as *candidates* for review, and assigns each a
+//! simple, rate-based severity plus a reproducibility signal (how many of
+//! the provided runs the pattern actually shows up in). Root-cause
+//! narratives and remediation recommendations still require judgment and
+//! are authored by reading this evidence, the same way the existing
+//! crash-loop/spending-bug docs were produced — severity/reproducibility
+//! are mechanical enough to compute automatically, root cause is not.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
+use super::load_curve::load_degradation_candidates;
 use super::loader::RunData;
-use super::rpc_matrix::{build_matrix, MatrixStatus};
+use super::rpc_matrix::{build_matrix, Category, MatrixStatus};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FindingCategory {
@@ -17,6 +19,7 @@ pub enum FindingCategory {
     Timeout,
     LatencyOutlier,
     FlowTypeDisparity,
+    LoadDegradation,
     DataCompleteness,
 }
 
@@ -27,62 +30,159 @@ impl std::fmt::Display for FindingCategory {
             FindingCategory::Timeout => write!(f, "Timeout"),
             FindingCategory::LatencyOutlier => write!(f, "Latency outlier"),
             FindingCategory::FlowTypeDisparity => write!(f, "Flow-type disparity"),
+            FindingCategory::LoadDegradation => write!(f, "Load degradation"),
             FindingCategory::DataCompleteness => write!(f, "Data completeness"),
         }
     }
 }
 
+/// Rate-based severity tier. Variant declaration order is deliberate: it is
+/// also the `Ord` derive's ranking, so `sort_by_key(|f| f.severity)` sorts
+/// High-first without a separate comparator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Severity {
+    High,
+    Medium,
+    Low,
+}
+
+impl std::fmt::Display for Severity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Severity::High => write!(f, "High"),
+            Severity::Medium => write!(f, "Medium"),
+            Severity::Low => write!(f, "Low"),
+        }
+    }
+}
+
+pub(crate) const HIGH_RATE: f64 = 0.20;
+pub(crate) const MEDIUM_RATE: f64 = 0.05;
+
+/// Simple rate-based tiering shared by every category whose signal is
+/// "how often did this happen out of how many chances." Thresholds are
+/// deliberately coarse — this is meant to triage a long findings list, not
+/// to stand in for a human severity assessment.
+fn severity_from_rate(rate: f64) -> Severity {
+    if rate >= HIGH_RATE {
+        Severity::High
+    } else if rate >= MEDIUM_RATE {
+        Severity::Medium
+    } else {
+        Severity::Low
+    }
+}
+
 /// A flagged candidate, not a finished finding. `summary` states only what
-/// was observed; `evidence` gives the specific facts a reader needs to judge
-/// severity and cause themselves.
+/// was observed; `evidence` gives the specific facts a reader needs to
+/// confirm severity and judge cause themselves. `severity` and the
+/// run-occurrence counts in `evidence` are mechanically derived from rate/
+/// ratio thresholds — they triage the list, they do not replace reading it.
 #[derive(Debug, Clone)]
 pub struct Finding {
     pub category: FindingCategory,
+    pub severity: Severity,
     pub summary: String,
     pub evidence: Vec<String>,
 }
 
-const TAIL_LATENCY_MULTIPLE: f64 = 5.0;
-const MIN_TAIL_LATENCY_SAMPLE: u64 = 5;
+pub(crate) const TAIL_LATENCY_MULTIPLE: f64 = 5.0;
+pub(crate) const HIGH_TAIL_LATENCY_MULTIPLE: f64 = 10.0;
+pub(crate) const MIN_TAIL_LATENCY_SAMPLE: u64 = 5;
 /// A P99/P50 ratio alone flags noise for very fast methods (e.g. "P99 11ms is
 /// 11x P50 1ms" is not a meaningful tail — it's sub-millisecond jitter). Also
 /// requiring the absolute P99 to clear this floor keeps the ratio check
 /// meaningful only where the tail itself is large enough to matter.
-const MIN_ABSOLUTE_P99_MS: f64 = 50.0;
+pub(crate) const MIN_ABSOLUTE_P99_MS: f64 = 50.0;
 
-/// Flags every method with at least one recorded failure.
+pub(crate) const HIGH_DISPARITY_GAP: f64 = 0.40;
+pub(crate) const MIN_DISPARITY_GAP: f64 = 0.20;
+
+/// For a given method, how many of the provided runs called it at all, and
+/// how many saw at least one failure — a cheap reproducibility signal: a
+/// failure seen in 4/4 runs is a materially different claim than one seen
+/// in 1/4, even at the same aggregate failure rate.
+fn run_occurrence(runs: &[RunData], method: &str) -> (usize, usize) {
+    let mut with_call = 0;
+    let mut with_failure = 0;
+    for run in runs {
+        let mut called = false;
+        let mut failed = false;
+        for call in &run.rpc_calls {
+            if call.method == method {
+                called = true;
+                if !call.success {
+                    failed = true;
+                }
+            }
+        }
+        if called {
+            with_call += 1;
+        }
+        if failed {
+            with_failure += 1;
+        }
+    }
+    (with_call, with_failure)
+}
+
+/// Flags every non-regtest-control method with at least one recorded
+/// failure. Regtest-control methods (`generate` and friends) shape the test
+/// rather than being part of the measured workload — see
+/// docs/rpc/method-scope.md — so a failed `generate` call is excluded here
+/// the same way it is excluded from the stress latency histograms.
 fn rpc_failure_candidates(runs: &[RunData]) -> Vec<Finding> {
     build_matrix(runs)
         .into_iter()
+        .filter(|row| row.category != Category::RegtestControl)
         .filter(|row| {
             matches!(
                 row.status,
                 MatrixStatus::ExercisedPartialFailure | MatrixStatus::ExercisedAllFailed
             )
         })
-        .map(|row| Finding {
-            category: FindingCategory::RpcFailure,
-            summary: format!(
-                "{}: {}/{} calls succeeded ({})",
-                row.method, row.successes, row.calls, row.status
-            ),
-            evidence: vec![format!(
-                "error codes observed: {:?}; backend(s): {:?}",
-                row.error_codes, row.observed_backends
-            )],
+        .map(|row| {
+            let failure_rate = (row.calls - row.successes) as f64 / row.calls as f64;
+            let (runs_with_call, runs_with_failure) = run_occurrence(runs, row.method);
+            Finding {
+                category: FindingCategory::RpcFailure,
+                severity: severity_from_rate(failure_rate),
+                summary: format!(
+                    "{}: {}/{} calls succeeded ({}, {:.1}% failure rate)",
+                    row.method,
+                    row.successes,
+                    row.calls,
+                    row.status,
+                    failure_rate * 100.0
+                ),
+                evidence: vec![
+                    format!(
+                        "error codes observed: {:?}; backend(s): {:?}",
+                        row.error_codes, row.observed_backends
+                    ),
+                    format!(
+                        "failed in {runs_with_failure}/{runs_with_call} run(s) that called this method"
+                    ),
+                ],
+            }
         })
         .collect()
 }
 
-/// Flags any observed timeout, grouped by (flow type, timeout stage).
+/// Flags any observed timeout, grouped by (flow type, timeout stage), rated
+/// against how often that flow type timed out at that stage overall.
 fn timeout_candidates(runs: &[RunData]) -> Vec<Finding> {
-    let mut by_key: HashMap<(String, String), u64> = HashMap::new();
+    let mut by_key: HashMap<(String, String), (u64, HashSet<String>)> = HashMap::new();
+    let mut flow_totals: HashMap<String, u64> = HashMap::new();
+
     for run in runs {
         for intent in &run.intents {
+            let flow = format!("{:?}", intent.flow_type);
+            *flow_totals.entry(flow.clone()).or_default() += 1;
+
             if intent.outcome != "timed_out" {
                 continue;
             }
-            let flow = format!("{:?}", intent.flow_type);
             let stage = intent
                 .timeout_context
                 .as_deref()
@@ -96,15 +196,30 @@ fn timeout_candidates(runs: &[RunData]) -> Vec<Finding> {
                     }
                 })
                 .unwrap_or_else(|| "unknown".to_string());
-            *by_key.entry((flow, stage)).or_default() += 1;
+            let entry = by_key.entry((flow, stage)).or_insert((0, HashSet::new()));
+            entry.0 += 1;
+            entry.1.insert(run.manifest.run_id.clone());
         }
     }
+
     let mut out: Vec<Finding> = by_key
         .into_iter()
-        .map(|((flow, stage), count)| Finding {
-            category: FindingCategory::Timeout,
-            summary: format!("{count} timeout(s) for {flow} intents during {stage}"),
-            evidence: vec![format!("flow_type={flow}, stage={stage}, count={count}")],
+        .map(|((flow, stage), (count, contributing_runs))| {
+            let total = flow_totals.get(&flow).copied().unwrap_or(count).max(1);
+            let rate = count as f64 / total as f64;
+            Finding {
+                category: FindingCategory::Timeout,
+                severity: severity_from_rate(rate),
+                summary: format!(
+                    "{count} timeout(s) for {flow} intents during {stage} \
+                     ({:.1}% of {flow} intents)",
+                    rate * 100.0
+                ),
+                evidence: vec![
+                    format!("flow_type={flow}, stage={stage}, count={count}, of_total={total}"),
+                    format!("observed in {} run(s)", contributing_runs.len()),
+                ],
+            }
         })
         .collect();
     out.sort_by(|a, b| a.summary.cmp(&b.summary));
@@ -114,10 +229,12 @@ fn timeout_candidates(runs: &[RunData]) -> Vec<Finding> {
 /// Flags methods whose P99 latency is disproportionate to their P50 — a
 /// signal of tail-latency behavior worth a closer look, not necessarily a
 /// defect. Requires at least `MIN_TAIL_LATENCY_SAMPLE` calls to avoid flagging
-/// noise from a single slow call.
+/// noise from a single slow call, and excludes regtest-control methods for
+/// the same reason `rpc_failure_candidates` does.
 fn latency_outlier_candidates(runs: &[RunData]) -> Vec<Finding> {
     build_matrix(runs)
         .into_iter()
+        .filter(|row| row.category != Category::RegtestControl)
         .filter(|row| row.calls >= MIN_TAIL_LATENCY_SAMPLE)
         .filter_map(|row| match (row.p50_ms, row.p99_ms) {
             (Some(p50), Some(p99))
@@ -125,23 +242,30 @@ fn latency_outlier_candidates(runs: &[RunData]) -> Vec<Finding> {
                     && p99 >= p50 * TAIL_LATENCY_MULTIPLE
                     && p99 >= MIN_ABSOLUTE_P99_MS =>
             {
+                let ratio = p99 / p50;
+                let severity = if ratio >= HIGH_TAIL_LATENCY_MULTIPLE {
+                    Severity::High
+                } else {
+                    Severity::Medium
+                };
+                let (runs_with_call, _) = run_occurrence(runs, row.method);
                 Some(Finding {
                     category: FindingCategory::LatencyOutlier,
+                    severity,
                     summary: format!(
                         "{}: P99 ({:.0} ms) is {:.1}x P50 ({:.0} ms) over {} calls",
-                        row.method,
-                        p99,
-                        p99 / p50,
-                        p50,
-                        row.calls
+                        row.method, p99, ratio, p50, row.calls
                     ),
-                    evidence: vec![format!(
-                        "p50={:.0}ms p95={:.0}ms p99={:.0}ms calls={}",
-                        p50,
-                        row.p95_ms.unwrap_or(0.0),
-                        p99,
-                        row.calls
-                    )],
+                    evidence: vec![
+                        format!(
+                            "p50={:.0}ms p95={:.0}ms p99={:.0}ms calls={}",
+                            p50,
+                            row.p95_ms.unwrap_or(0.0),
+                            p99,
+                            row.calls
+                        ),
+                        format!("observed across {runs_with_call} run(s)"),
+                    ],
                 })
             }
             _ => None,
@@ -178,11 +302,18 @@ fn flow_type_disparity_candidates(runs: &[RunData]) -> Vec<Finding> {
         .filter(|(_, (_, total))| *total > 0)
         .filter_map(|(flow, (confirmed, total))| {
             let rate = confirmed as f64 / total as f64;
+            let gap = overall_rate - rate;
             // Flag if this flow type's rate trails the overall rate by more
-            // than 20 percentage points.
-            if overall_rate - rate > 0.20 {
+            // than MIN_DISPARITY_GAP percentage points.
+            if gap > MIN_DISPARITY_GAP {
+                let severity = if gap >= HIGH_DISPARITY_GAP {
+                    Severity::High
+                } else {
+                    Severity::Medium
+                };
                 Some(Finding {
                     category: FindingCategory::FlowTypeDisparity,
+                    severity,
                     summary: format!(
                         "{flow}: {confirmed}/{total} confirmed ({:.0}%) vs. {:.0}% overall across all flow types",
                         rate * 100.0,
@@ -204,12 +335,14 @@ fn flow_type_disparity_candidates(runs: &[RunData]) -> Vec<Finding> {
 
 /// Surfaces parse warnings (malformed JSONL lines) recorded while loading —
 /// evidence gaps in the underlying data, not a claim about the system under
-/// test.
+/// test. Always `Low`: this category flags incomplete evidence, not a
+/// defect, so it never competes with real findings for a reader's attention.
 fn data_completeness_candidates(runs: &[RunData]) -> Vec<Finding> {
     runs.iter()
         .filter(|r| !r.parse_warnings.is_empty())
         .map(|r| Finding {
             category: FindingCategory::DataCompleteness,
+            severity: Severity::Low,
             summary: format!(
                 "{}: {} malformed line(s) skipped while loading",
                 r.manifest.run_id,
@@ -221,14 +354,17 @@ fn data_completeness_candidates(runs: &[RunData]) -> Vec<Finding> {
 }
 
 /// Runs every candidate-detection rule over the provided runs and returns
-/// the combined, unranked list. Severity, reproducibility, and attribution
-/// are deliberately not assigned here.
+/// the combined, unranked (by category) list — each `Finding` carries its
+/// own `severity` for the caller to sort/filter by. Root cause and
+/// remediation recommendations are still not assigned here; those require
+/// judgment and are authored separately, same as before.
 pub fn flag_candidates(runs: &[RunData]) -> Vec<Finding> {
     let mut out = Vec::new();
     out.extend(rpc_failure_candidates(runs));
     out.extend(timeout_candidates(runs));
     out.extend(latency_outlier_candidates(runs));
     out.extend(flow_type_disparity_candidates(runs));
+    out.extend(load_degradation_candidates(runs));
     out.extend(data_completeness_candidates(runs));
     out
 }
@@ -301,6 +437,13 @@ mod tests {
     }
 
     #[test]
+    fn severity_sorts_high_first() {
+        let mut sevs = vec![Severity::Low, Severity::High, Severity::Medium];
+        sevs.sort();
+        assert_eq!(sevs, vec![Severity::High, Severity::Medium, Severity::Low]);
+    }
+
+    #[test]
     fn flags_rpc_failures() {
         let r = run(
             "r1",
@@ -312,6 +455,58 @@ mod tests {
             .iter()
             .any(|f| f.category == FindingCategory::RpcFailure
                 && f.summary.contains("z_listunspent")));
+    }
+
+    #[test]
+    fn rpc_failure_severity_matches_failure_rate() {
+        // 1 failure out of 20 calls = 5% => Medium.
+        let mut calls = vec![call("z_sendmany", true, Some(10), None); 19];
+        calls.push(call("z_sendmany", false, None, Some(-4)));
+        let r = run("r1", calls, vec![]);
+        let findings = flag_candidates(&[r]);
+        let f = findings
+            .iter()
+            .find(|f| f.category == FindingCategory::RpcFailure)
+            .expect("expected an rpc failure finding");
+        assert_eq!(f.severity, Severity::Medium);
+    }
+
+    #[test]
+    fn rpc_failure_high_severity_above_20_percent() {
+        let mut calls = vec![call("z_sendmany", true, Some(10), None); 3];
+        calls.push(call("z_sendmany", false, None, Some(-4)));
+        let r = run("r1", calls, vec![]); // 1/4 = 25% failure
+        let findings = flag_candidates(&[r]);
+        let f = findings
+            .iter()
+            .find(|f| f.category == FindingCategory::RpcFailure)
+            .expect("expected an rpc failure finding");
+        assert_eq!(f.severity, Severity::High);
+    }
+
+    #[test]
+    fn rpc_failure_evidence_reports_run_occurrence() {
+        let r1 = run("r1", vec![call("z_sendmany", false, None, Some(-4))], vec![]);
+        let r2 = run("r2", vec![call("z_sendmany", true, Some(10), None)], vec![]);
+        let findings = flag_candidates(&[r1, r2]);
+        let f = findings
+            .iter()
+            .find(|f| f.category == FindingCategory::RpcFailure)
+            .expect("expected an rpc failure finding");
+        assert!(
+            f.evidence.iter().any(|e| e.contains("1/2 run(s)")),
+            "evidence: {:?}",
+            f.evidence
+        );
+    }
+
+    #[test]
+    fn regtest_control_failures_are_not_flagged() {
+        let r = run("r1", vec![call("generate", false, None, Some(-1))], vec![]);
+        let findings = flag_candidates(&[r]);
+        assert!(!findings
+            .iter()
+            .any(|f| f.category == FindingCategory::RpcFailure));
     }
 
     #[test]
@@ -344,6 +539,7 @@ mod tests {
             .find(|f| f.category == FindingCategory::Timeout)
             .expect("expected a timeout finding");
         assert!(f.summary.contains("async operation"));
+        assert_eq!(f.severity, Severity::High); // 1/1 = 100%
     }
 
     #[test]
@@ -352,10 +548,25 @@ mod tests {
         calls.push(call("z_sendmany", true, Some(200), None)); // 20x P50-ish outlier
         let r = run("r1", calls, vec![]);
         let findings = flag_candidates(&[r]);
-        assert!(findings
+        let f = findings
             .iter()
-            .any(|f| f.category == FindingCategory::LatencyOutlier
-                && f.summary.contains("z_sendmany")));
+            .find(|f| f.category == FindingCategory::LatencyOutlier
+                && f.summary.contains("z_sendmany"))
+            .expect("expected a latency outlier finding");
+        assert_eq!(f.severity, Severity::High); // ratio >= 10x
+    }
+
+    #[test]
+    fn latency_outlier_medium_severity_below_10x_ratio() {
+        let mut calls = vec![call("z_sendmany", true, Some(20), None); 5];
+        calls.push(call("z_sendmany", true, Some(150), None)); // 7.5x, >=5 but <10
+        let r = run("r1", calls, vec![]);
+        let findings = flag_candidates(&[r]);
+        let f = findings
+            .iter()
+            .find(|f| f.category == FindingCategory::LatencyOutlier)
+            .expect("expected a latency outlier finding");
+        assert_eq!(f.severity, Severity::Medium);
     }
 
     #[test]
@@ -395,9 +606,11 @@ mod tests {
         }
         let r = run("r1", vec![], intents);
         let findings = flag_candidates(&[r]);
-        assert!(findings.iter().any(
-            |f| f.category == FindingCategory::FlowTypeDisparity && f.summary.contains("ZToT")
-        ));
+        let f = findings
+            .iter()
+            .find(|f| f.category == FindingCategory::FlowTypeDisparity && f.summary.contains("ZToT"))
+            .expect("expected a flow type disparity finding");
+        assert_eq!(f.severity, Severity::High); // 100% vs 50% overall = 50pp gap
     }
 
     #[test]
@@ -416,9 +629,11 @@ mod tests {
         r.parse_warnings
             .push("intents.jsonl:3: malformed line skipped: x".into());
         let findings = flag_candidates(&[r]);
-        assert!(findings
+        let f = findings
             .iter()
-            .any(|f| f.category == FindingCategory::DataCompleteness && f.summary.contains("r1")));
+            .find(|f| f.category == FindingCategory::DataCompleteness && f.summary.contains("r1"))
+            .expect("expected a data completeness finding");
+        assert_eq!(f.severity, Severity::Low);
     }
 
     #[test]
