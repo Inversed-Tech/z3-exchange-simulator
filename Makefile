@@ -5,7 +5,7 @@ CARGO  := cargo
 BINARY := z3sim
 
 .DEFAULT_GOAL := help
-.PHONY: help setup clone-z3 build build-release test fmt fmt-check lint \
+.PHONY: help setup clone-z3 regtest-reset build build-release test fmt fmt-check lint \
         generate-fixtures scenario-dry-run validate-scenario clean
 
 help: ## Show this help message
@@ -21,6 +21,9 @@ setup: ## Check local development dependencies
 
 clone-z3: ## Clone the pinned Z3 Docker Compose stack (meta-repo) into external/z3
 	@bash scripts/dev/clone-z3.sh
+
+regtest-reset: ## Wipe and reinitialize the regtest chain/wallet (fixes funding failures from accumulated history)
+	@bash scripts/dev/regtest-reset.sh --yes
 
 build: ## Build the simulator binary (debug mode)
 	$(CARGO) build

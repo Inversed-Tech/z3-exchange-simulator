@@ -122,6 +122,35 @@ make build
 ./target/debug/z3sim run --scenario configs/scenarios/smoke.yaml
 ```
 
+## Resetting the regtest environment
+
+Every `z3sim run` restarts the Docker containers but **not** the underlying
+Docker volumes — the regtest chain and Zallet's wallet database persist and
+accumulate across every scenario run ever attempted against them. This is
+useful (accounts and coinbase carry over between runs), but it does not
+resolve itself: the more history accumulates, the longer a fresh container
+takes to rescan back to the live chain tip on its next restart. Past a
+certain point, that rescan can no longer finish inside a scenario's time
+budget, and funding fails with a transaction-expiry consensus error no
+matter how many times it's retried — see
+[`docs/zallet-wallet-scan-lag.md`](docs/zallet-wallet-scan-lag.md).
+
+Reset the environment with:
+
+```sh
+make regtest-reset
+# or: bash scripts/dev/regtest-reset.sh --yes
+```
+
+**Run this immediately if a scenario fails during account funding with an
+error mentioning `expiry Height` or `SendTransaction: Transaction commit
+failed`** — that is this exact issue, and retrying without resetting will
+fail identically. It's also worth running periodically during any extended
+session of repeated scenario attempts against the same environment, rather
+than waiting for it to fail. This wipes the current chain/wallet state
+(regtest coinbase has no real value, so that's safe) and reinitializes it
+using the same scripts the Quickstart above uses on a fresh clone.
+
 ## Pinned commits
 
 All benchmark runs reference the commits in [`z3-commits.lock`](z3-commits.lock).
@@ -224,6 +253,7 @@ Run directories are gitignored and are not tracked by version control.
 | [`docs/zallet-transparent-gap-limit.md`](docs/zallet-transparent-gap-limit.md) | Transparent address gap limit at exchange scale: what it really constrains, and the upstream recommendation |
 | [`docs/zallet-restart-sync-failure.md`](docs/zallet-restart-sync-failure.md) | Zallet crash-loop after a container restart with existing wallet history |
 | [`docs/zallet-post-restart-setup-retry-exhaustion.md`](docs/zallet-post-restart-setup-retry-exhaustion.md) | `z_listaccounts` parse-failure retry exhaustion after a stack restart |
+| [`docs/zallet-wallet-scan-lag.md`](docs/zallet-wallet-scan-lag.md) | Funding fails with a transaction-expiry consensus rejection once accumulated chain history outpaces Zallet's rescan-on-restart |
 | [`docs/regtest-funding-plan.md`](docs/regtest-funding-plan.md) | Measured regtest funding pipeline: probes, the beta.1 override stack, and the fan-out design |
 | [`docs/z3-concurrent-request-ceiling.md`](docs/z3-concurrent-request-ceiling.md) | Concurrent RPC requests above ~11 fail; concurrent shielded sends collide above that threshold |
 

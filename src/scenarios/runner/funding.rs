@@ -40,7 +40,6 @@
 //!   mining itself, on top of the existing shield-if-short step, until the
 //!   source account's balance covers the plan — see [`ensure_funded`].
 
-use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -168,13 +167,6 @@ async fn mine_chunked(rpc: &RpcClient, blocks: u64) -> Result<(), FundingError> 
 /// transaction — larger than any single load-phase send, and so needing more
 /// margin against confirmation-depth delay.
 const SEND_RETRIES: u32 = 24;
-
-/// How many times [`submit_with_expiry_retry`] rebuilds and resubmits an
-/// operation after it loses an expiry race (see that function's docs).
-/// Small: each retry only helps if Zallet's internal wallet-view height has
-/// caught up to the real chain tip since the last attempt, which is a
-/// bookkeeping lag rather than a long-running condition.
-const EXPIRY_RACE_RETRIES: u32 = 3;
 
 /// Errors from the funding pipeline. Wraps the failing step so a probe-style
 /// "which operation broke" reading survives into the error message.
@@ -339,11 +331,28 @@ pub async fn wait_operation(rpc: &RpcClient, opid: &str) -> Result<String, Fundi
                             step: "z_getoperationresult",
                             source: e,
                         })?;
-                let detail = results
+                let mut detail = results
                     .first()
                     .and_then(|r| r.error.as_ref())
                     .map(|e| format!("code {}: {}", e.code, e.message))
                     .unwrap_or_else(|| format!("operation ended as `{}`", status.status));
+                if is_expiry_race(&detail) {
+                    // Not a transient race: Zallet computed this operation's
+                    // expiry from its own wallet-scan height, which can trail
+                    // the real chain tip by hundreds of blocks once the
+                    // regtest volumes have accumulated enough history that a
+                    // fresh container's rescan can no longer catch up inside
+                    // one run's budget. Resubmitting doesn't help — it only
+                    // costs an operation timeout's worth of retries with the
+                    // identical result (see docs/zallet-wallet-scan-lag.md).
+                    // The environment needs a reset, not a retry.
+                    detail.push_str(
+                        " [likely cause: Zallet's wallet-scan is far behind the chain tip, \
+                         probably because the regtest environment has accumulated too much \
+                         history across repeated runs — reset it with \
+                         scripts/dev/regtest-reset.sh before retrying]",
+                    );
+                }
                 return match results.first().and_then(|r| r.result.as_ref()) {
                     Some(detail) => Ok(detail.txid.clone()),
                     None => Err(FundingError::Failed {
@@ -406,49 +415,6 @@ async fn send_with_anchor_retries(
 /// the variable heights either side of it.
 fn is_expiry_race(detail: &str) -> bool {
     detail.contains("greater than its expiry Height")
-}
-
-/// Submit an operation via `submit` and wait for it to complete, resubmitting
-/// from scratch (up to [`EXPIRY_RACE_RETRIES`] times) if it fails because it
-/// lost an expiry race (see [`is_expiry_race`]).
-///
-/// An operation's expiry is fixed relative to Zallet's own wallet-view
-/// height at build time, not the real chain tip. Rapid `generate()` bursts —
-/// [`ensure_funded`]'s top-up rounds chief among them — can outrun that
-/// bookkeeping, so an operation is occasionally built against a wallet-view
-/// height that already trails the real tip by more than the expiry window,
-/// and it is rejected on commit no matter how long it is given to complete.
-/// Waiting longer does not help (the operation is already terminal); only a
-/// fresh operation, built once the wallet view has caught up, can succeed.
-///
-/// `submit` must build and dispatch a genuinely new operation on every call
-/// (never replay the same opid) — that fresh build is what picks up a
-/// current wallet-view height and, with it, a current expiry.
-async fn submit_with_expiry_retry<F, Fut>(
-    rpc: &RpcClient,
-    mut submit: F,
-) -> Result<String, FundingError>
-where
-    F: FnMut() -> Fut,
-    Fut: Future<Output = Result<String, FundingError>>,
-{
-    let mut attempts_left = EXPIRY_RACE_RETRIES;
-    loop {
-        let opid = submit().await?;
-        match wait_operation(rpc, &opid).await {
-            Ok(txid) => return Ok(txid),
-            Err(FundingError::Failed { detail, .. })
-                if attempts_left > 0 && is_expiry_race(&detail) =>
-            {
-                attempts_left -= 1;
-                tracing::warn!(
-                    "funding: operation {opid} lost an expiry race against the chain tip, \
-                     resubmitting ({attempts_left} attempts left): {detail}"
-                );
-            }
-            Err(e) => return Err(e),
-        }
-    }
 }
 
 /// How each sink account is funded by [`fund_accounts`].
@@ -517,16 +483,14 @@ pub async fn fund_accounts(
     let needed = plan.per_sink_total() * sinks.len() as f64;
 
     if private < needed && transparent > 0.0 {
-        submit_with_expiry_retry(rpc, || async {
-            rpc.z_shield_coinbase(&source.uuid, &source.address)
-                .await
-                .map(|r| r.opid)
-                .map_err(|e| FundingError::Rpc {
-                    step: "z_shieldcoinbase",
-                    source: e,
-                })
-        })
-        .await?;
+        let shield = rpc
+            .z_shield_coinbase(&source.uuid, &source.address)
+            .await
+            .map_err(|e| FundingError::Rpc {
+                step: "z_shieldcoinbase",
+                source: e,
+            })?;
+        wait_operation(rpc, &shield.opid).await?;
         // The shielding tx itself needs anchor confirmations before the notes
         // it created are spendable.
         mine_chunked(rpc, ANCHOR_CONFIRMATIONS as u64).await?;
@@ -582,11 +546,10 @@ pub async fn fund_accounts(
         if recipients.is_empty() {
             continue;
         }
-        let txid = submit_with_expiry_retry(rpc, || {
+        let opid =
             send_with_anchor_retries(rpc, &source.address, &recipients, "AllowRevealedRecipients")
-        })
-        .await?;
-        last_txid = Some(txid);
+                .await?;
+        last_txid = Some(wait_operation(rpc, &opid).await?);
     }
 
     last_txid.ok_or_else(|| FundingError::Failed {
@@ -597,11 +560,9 @@ pub async fn fund_accounts(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
     use wiremock::{matchers, Mock, MockServer, ResponseTemplate};
 
-    use super::{submit_with_expiry_retry, FundingError};
+    use super::{is_expiry_race, wait_operation, FundingError};
     use crate::rpc::{AccountInfo, RpcClient};
 
     fn account(uuid: &str, addrs: &[(u64, &str)]) -> AccountInfo {
@@ -637,13 +598,19 @@ mod tests {
         assert_eq!(info.primary_address(), None);
     }
 
-    // ── submit_with_expiry_retry ─────────────────────────────────────────────
+    // ── is_expiry_race / wait_operation diagnostics ─────────────────────────
 
     const EXPIRY_RACE_MESSAGE: &str = "SendTransaction: Transaction commit failed:: chain \
          backend error: unexpected error response from server: RPC Error (code: -25): failed \
          to validate tx: WtxId(\"private\"), error: transaction did not pass consensus \
          validation: transaction must not be mined at a block Height(1697) greater than its \
          expiry Height(1199), failing transaction transaction::Hash(\"deb3ebf3\")";
+
+    #[test]
+    fn is_expiry_race_matches_the_observed_zallet_message() {
+        assert!(is_expiry_race(EXPIRY_RACE_MESSAGE));
+        assert!(!is_expiry_race("code -6: Insufficient funds"));
+    }
 
     /// Mount both `z_getoperationstatus` and `z_getoperationresult` for one
     /// `opid`, terminal from the first status poll (matching real Zallet
@@ -672,48 +639,34 @@ mod tests {
         }
     }
 
-    async fn mount_expiry_race_failure(server: &MockServer, opid: &'static str) {
+    #[tokio::test]
+    async fn wait_operation_annotates_an_expiry_race_with_the_likely_cause_and_fix() {
+        let server = MockServer::start().await;
         mount_operation(
-            server,
-            opid,
+            &server,
+            "op-1",
             "failed",
             serde_json::Value::Null,
             serde_json::json!({"code": -4, "message": EXPIRY_RACE_MESSAGE}),
         )
         .await;
-    }
-
-    #[tokio::test]
-    async fn resubmits_once_on_an_expiry_race_then_succeeds() {
-        let server = MockServer::start().await;
-        mount_expiry_race_failure(&server, "op-1").await;
-        mount_operation(
-            &server,
-            "op-2",
-            "success",
-            serde_json::json!({"txid": "abc123"}),
-            serde_json::Value::Null,
-        )
-        .await;
 
         let rpc = RpcClient::new(&server.uri(), "test-run", None, None);
-        let calls = AtomicUsize::new(0);
-        let result = submit_with_expiry_retry(&rpc, || {
-            let attempt = calls.fetch_add(1, Ordering::SeqCst);
-            async move { Ok(if attempt == 0 { "op-1" } else { "op-2" }.to_string()) }
-        })
-        .await;
+        let err = wait_operation(&rpc, "op-1").await.unwrap_err();
 
-        assert_eq!(result.unwrap(), "abc123");
-        assert_eq!(
-            calls.load(Ordering::SeqCst),
-            2,
-            "expected exactly one resubmission"
+        let FundingError::Failed { step, detail } = err else {
+            panic!("expected FundingError::Failed, got {err:?}");
+        };
+        assert_eq!(step, "wait_operation");
+        assert!(detail.contains(EXPIRY_RACE_MESSAGE));
+        assert!(
+            detail.contains("regtest-reset.sh"),
+            "expected the diagnostic to point at the reset script, got: {detail}"
         );
     }
 
     #[tokio::test]
-    async fn does_not_retry_a_non_expiry_operation_failure() {
+    async fn wait_operation_leaves_unrelated_failures_unannotated() {
         let server = MockServer::start().await;
         mount_operation(
             &server,
@@ -725,49 +678,11 @@ mod tests {
         .await;
 
         let rpc = RpcClient::new(&server.uri(), "test-run", None, None);
-        let calls = AtomicUsize::new(0);
-        let result = submit_with_expiry_retry(&rpc, || {
-            calls.fetch_add(1, Ordering::SeqCst);
-            async { Ok("op-1".to_string()) }
-        })
-        .await;
+        let err = wait_operation(&rpc, "op-1").await.unwrap_err();
 
-        assert!(matches!(
-            result,
-            Err(FundingError::Failed {
-                step: "wait_operation",
-                ..
-            })
-        ));
-        assert_eq!(
-            calls.load(Ordering::SeqCst),
-            1,
-            "an unrelated failure must not be retried"
-        );
-    }
-
-    #[tokio::test]
-    async fn gives_up_after_exhausting_expiry_race_retries() {
-        let server = MockServer::start().await;
-        let opids: Vec<&'static str> = vec!["op-1", "op-2", "op-3", "op-4"];
-        for &opid in &opids {
-            mount_expiry_race_failure(&server, opid).await;
-        }
-
-        let rpc = RpcClient::new(&server.uri(), "test-run", None, None);
-        let calls = AtomicUsize::new(0);
-        let result = submit_with_expiry_retry(&rpc, || {
-            let attempt = calls.fetch_add(1, Ordering::SeqCst);
-            let opid = opids[attempt];
-            async move { Ok(opid.to_string()) }
-        })
-        .await;
-
-        assert!(result.is_err());
-        assert_eq!(
-            calls.load(Ordering::SeqCst),
-            4,
-            "expected the initial attempt plus all EXPIRY_RACE_RETRIES resubmissions"
-        );
+        let FundingError::Failed { detail, .. } = err else {
+            panic!("expected FundingError::Failed, got {err:?}");
+        };
+        assert_eq!(detail, "code -6: Insufficient funds");
     }
 }
