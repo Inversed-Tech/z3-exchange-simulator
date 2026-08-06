@@ -110,8 +110,17 @@ const SEND_RETRIES: u32 = 12;
 /// same run has not necessarily reached that depth yet, so a single-shot send
 /// can fail even though the funds are genuinely present and will clear within
 /// a few more blocks. Non-balance errors are not retried. Mirrors
-/// `funding::send_with_anchor_retries`, applied here to the load-phase sends
-/// (deposit, withdrawal, sweep) rather than the initial funding fan-out.
+/// `funding::send_with_anchor_retries`'s retry condition, applied here to the
+/// load-phase sends (deposit, withdrawal, sweep) rather than the initial
+/// funding fan-out — but, unlike that function, this one only sleeps between
+/// attempts rather than also mining: the load phase's `background_miner`
+/// task is already advancing the chain on its own fixed cadence for the
+/// entire load phase (funding's version predates that task even starting).
+/// A concurrently-retrying task calling `generate()` itself, on top of that,
+/// is not just redundant — under this scenario's concurrency, many intents
+/// retry at once, and the resulting pile of concurrent `generate` calls
+/// stalls Zebra (and, transitively, every other RPC call routed through it)
+/// for tens of seconds at a time (see docs/concurrent-generate-pileup.md).
 async fn send_many_with_anchor_retries(
     rpc: &RpcClient,
     from: &str,
@@ -137,7 +146,6 @@ async fn send_many_with_anchor_retries(
                 }
             }
         }
-        let _ = rpc.generate(1).await;
         sleep(Duration::from_secs(5)).await;
     }
     Err(last_err.expect("at least one attempt was made"))
@@ -361,9 +369,10 @@ pub async fn run_deposit(
 /// Execute an outbound withdrawal from a Zallet account.
 ///
 /// Sends `amount_zatoshis` from `from_account` to `destination_address` via
-/// `z_send_many`. Mines one regtest block after the operation proves, then waits
-/// for confirmation. Emits `withdrawal_proving_time_ms` and
-/// `withdrawal_broadcast_latency_ms` to the metrics recorder.
+/// `z_send_many`, then waits for confirmation — relying on the load phase's
+/// `background_miner` to mine it rather than mining here. Emits
+/// `withdrawal_proving_time_ms` and `withdrawal_broadcast_latency_ms` to the
+/// metrics recorder.
 ///
 /// `privacy_policy` must match the pools involved: `AllowFullyTransparent` for
 /// a t-addr `from` paying a t-addr, `AllowRevealedRecipients` for a UA
@@ -564,7 +573,10 @@ pub async fn run_sweep(
     sweep.txid = Some(txid.clone());
     sweep.status = SweepStatus::Broadcast;
 
-    rpc.generate(1).await.map_err(ExchangeError::Rpc)?;
+    // Rely on the load phase's background_miner (already running on its own
+    // fixed cadence) rather than mining here — see send_many_with_anchor_retries's
+    // doc comment for why a per-intent generate() call during the load phase
+    // is redundant and, under concurrency, actively harmful.
     wait_for_tx_confirmations(rpc, &txid, 1, polling).await?;
 
     sweep.status = SweepStatus::Confirmed;
@@ -1331,15 +1343,6 @@ mod tests {
             .await;
         Mock::given(matchers::method("POST"))
             .and(matchers::body_partial_json(
-                serde_json::json!({ "method": "generate" }),
-            ))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "result": ["h1"], "error": null, "id": 1
-            })))
-            .mount(&server)
-            .await;
-        Mock::given(matchers::method("POST"))
-            .and(matchers::body_partial_json(
                 serde_json::json!({ "method": "getrawtransaction" }),
             ))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -1417,16 +1420,6 @@ mod tests {
                     "result": { "txid": "sweeptxid" }, "error": null
                 }],
                 "error": null, "id": 1
-            })))
-            .mount(&server)
-            .await;
-
-        Mock::given(matchers::method("POST"))
-            .and(matchers::body_partial_json(
-                serde_json::json!({ "method": "generate" }),
-            ))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "result": ["h1"], "error": null, "id": 1
             })))
             .mount(&server)
             .await;
@@ -1516,16 +1509,6 @@ mod tests {
                     "result": { "txid": "sweeptxid2" }, "error": null
                 }],
                 "error": null, "id": 1
-            })))
-            .mount(&server)
-            .await;
-
-        Mock::given(matchers::method("POST"))
-            .and(matchers::body_partial_json(
-                serde_json::json!({ "method": "generate" }),
-            ))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "result": ["h1"], "error": null, "id": 1
             })))
             .mount(&server)
             .await;
@@ -1664,16 +1647,6 @@ mod tests {
                     "result": { "txid": "txid1" }, "error": null
                 }],
                 "error": null, "id": 1
-            })))
-            .mount(&server)
-            .await;
-
-        Mock::given(matchers::method("POST"))
-            .and(matchers::body_partial_json(
-                serde_json::json!({ "method": "generate" }),
-            ))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "result": ["h1"], "error": null, "id": 1
             })))
             .mount(&server)
             .await;

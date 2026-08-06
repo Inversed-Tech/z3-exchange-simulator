@@ -256,6 +256,7 @@ Run directories are gitignored and are not tracked by version control.
 | [`docs/zallet-wallet-scan-lag.md`](docs/zallet-wallet-scan-lag.md) | Funding fails with a transaction-expiry consensus rejection once accumulated chain history outpaces Zallet's rescan-on-restart |
 | [`docs/regtest-funding-plan.md`](docs/regtest-funding-plan.md) | Measured regtest funding pipeline: probes, the beta.1 override stack, and the fan-out design |
 | [`docs/z3-concurrent-request-ceiling.md`](docs/z3-concurrent-request-ceiling.md) | Concurrent RPC requests above ~11 fail; concurrent shielded sends collide above that threshold |
+| [`docs/concurrent-generate-pileup.md`](docs/concurrent-generate-pileup.md) | Redundant per-retry `generate` calls in the load phase pile up under concurrency, stalling Zebra and every RPC method routed through it |
 
 ---
 
