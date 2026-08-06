@@ -72,6 +72,28 @@ impl Scheduler {
             _ => self.instantaneous_tps(Duration::ZERO).max(0.001),
         }
     }
+
+    /// The interval the dispatch loop should apply via `ticker.reset_after`
+    /// for its next tick, or `None` if it should leave the ticker alone.
+    ///
+    /// Returns `None` for the very first tick: the caller primes the ticker
+    /// with [`initial_tps`](Self::initial_tps)'s interval *before* the loop
+    /// starts (via `interval_at`), specifically to avoid a zero-delay start
+    /// for `Ramp`. `elapsed` is ~0 at that point, and recomputing from it
+    /// would immediately discard that priming with the same near-zero
+    /// result `initial_tps` exists to avoid — for `Ramp`,
+    /// `instantaneous_tps(~0)` is itself ~0, floored to the 0.001 TPS
+    /// minimum, producing a fixed ~1000s period before the very first
+    /// dispatch, every time, regardless of scenario config. Every tick
+    /// after the first recomputes normally, once `elapsed` is meaningfully
+    /// nonzero.
+    pub fn dispatch_tick_period(&self, elapsed: Duration, is_first_tick: bool) -> Option<Duration> {
+        if is_first_tick {
+            return None;
+        }
+        let tps = self.instantaneous_tps(elapsed).max(0.001);
+        Some(Duration::from_secs_f64(1.0 / tps))
+    }
 }
 
 // ── Mixed flow override ───────────────────────────────────────────────────────
@@ -153,5 +175,72 @@ mod tests {
         // After burst (>=15s): base TPS
         let after = sched.instantaneous_tps(Duration::from_secs(20));
         assert!((after - 4.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn dispatch_tick_period_is_none_on_the_first_tick() {
+        let ramp = Scheduler::new(LoadShape::Ramp { ramp_secs: 60 }, 5.0);
+        assert_eq!(ramp.dispatch_tick_period(Duration::ZERO, true), None);
+        assert_eq!(
+            ramp.dispatch_tick_period(Duration::from_secs(30), true),
+            None
+        );
+
+        let steady = Scheduler::new(LoadShape::SteadyState, 5.0);
+        assert_eq!(steady.dispatch_tick_period(Duration::ZERO, true), None);
+    }
+
+    #[test]
+    fn dispatch_tick_period_recomputes_from_elapsed_after_the_first_tick() {
+        // Ramp { ramp_secs: 60 }, target 10.0, at elapsed=30s: 10.0 * 30/60 = 5.0 TPS.
+        let sched = Scheduler::new(LoadShape::Ramp { ramp_secs: 60 }, 10.0);
+        let period = sched
+            .dispatch_tick_period(Duration::from_secs(30), false)
+            .expect("expected a period once past the first tick");
+        assert!((period.as_secs_f64() - 0.2).abs() < 1e-9);
+    }
+
+    #[test]
+    fn reproduces_the_reported_thousand_second_stall_if_the_first_tick_is_wrongly_recomputed() {
+        // Demonstrates the reported bug's exact mechanism: if the first
+        // dispatch tick's period were (incorrectly) recomputed from ~0
+        // elapsed instead of skipped, Ramp's near-zero instantaneous_tps
+        // floors to the 0.001 TPS minimum — a fixed 1000s period, every
+        // time, regardless of scenario config. `is_first_tick: true`
+        // (tested above) exists specifically to avoid ever taking this path
+        // on the first tick.
+        let sched = Scheduler::new(LoadShape::Ramp { ramp_secs: 60 }, 5.0);
+        let period = sched
+            .dispatch_tick_period(Duration::ZERO, false)
+            .expect("dispatch_tick_period always returns Some when is_first_tick is false");
+        assert_eq!(period, Duration::from_secs(1000));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn first_dispatch_tick_fires_at_the_initial_tps_interval_not_after_1000s() {
+        // End-to-end reproduction of mod.rs's actual ticker setup and first
+        // loop iteration, using tokio's virtual clock so the test resolves
+        // instantly regardless of which interval actually gets applied.
+        let sched = Scheduler::new(LoadShape::Ramp { ramp_secs: 60 }, 5.0);
+
+        let initial_tps = sched.initial_tps();
+        let initial_interval = Duration::from_secs_f64(1.0 / initial_tps);
+        let mut ticker = tokio::time::interval_at(
+            tokio::time::Instant::now() + initial_interval,
+            initial_interval,
+        );
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        // Mirrors mod.rs's dispatch loop: first tick, elapsed ~0.
+        if let Some(period) = sched.dispatch_tick_period(Duration::ZERO, true) {
+            ticker.reset_after(period);
+        }
+
+        let tick_at = tokio::time::Instant::now();
+        ticker.tick().await;
+        let waited = tick_at.elapsed();
+
+        assert_eq!(waited, initial_interval);
+        assert!(waited < Duration::from_secs(5), "waited {waited:?}");
     }
 }

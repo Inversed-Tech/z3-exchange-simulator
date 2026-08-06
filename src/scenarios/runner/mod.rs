@@ -385,6 +385,7 @@ async fn load_phase(
     );
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
+    let mut is_first_tick = true;
     loop {
         let elapsed = start.elapsed();
         if elapsed >= load_duration {
@@ -398,10 +399,14 @@ async fn load_phase(
             }
         }
 
-        // Update the tick interval based on current TPS.
-        let tps = scheduler.instantaneous_tps(elapsed).max(0.001);
-        let period = Duration::from_secs_f64(1.0 / tps);
-        ticker.reset_after(period);
+        // Update the tick interval based on current TPS — except on the
+        // first tick, which the ticker was already primed for above via
+        // `initial_tps` (see `Scheduler::dispatch_tick_period`'s doc comment
+        // for why recomputing here on that first tick is wrong).
+        if let Some(period) = scheduler.dispatch_tick_period(elapsed, is_first_tick) {
+            ticker.reset_after(period);
+        }
+        is_first_tick = false;
         ticker.tick().await;
 
         // Dispatch next intent.
