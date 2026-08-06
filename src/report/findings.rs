@@ -273,6 +273,68 @@ fn latency_outlier_candidates(runs: &[RunData]) -> Vec<Finding> {
         .collect()
 }
 
+/// A method's P99/P50 *ratio* is blind to a method that is slow more or
+/// less uniformly: "P50 11188ms, P99 25675ms" is only a 2.3x ratio — nowhere
+/// near [`TAIL_LATENCY_MULTIPLE`] — even though a call that takes 11+
+/// seconds more than half the time is pathological regardless of its tail
+/// shape. This floor catches that case directly, on the median alone.
+pub(crate) const UNIFORM_SLOWNESS_FLOOR_MS: f64 = 1000.0;
+
+/// Flags methods whose *median* latency alone clears
+/// [`UNIFORM_SLOWNESS_FLOOR_MS`] — "uniformly slow," as distinct from
+/// [`latency_outlier_candidates`]'s "usually fast, occasionally slow." A
+/// method already flagged there is skipped here, so a method that is both
+/// uniformly slow and disproportionately tailed is reported once.
+///
+/// Unlike `latency_outlier_candidates`, regtest-control methods (`generate`
+/// and friends) are deliberately NOT excluded: those calls don't count
+/// toward the measured workload's own latency, but a control-plane call
+/// that is itself pathologically slow is exactly the signal that predicts —
+/// and, concurrently, can directly cause — degraded latency for every other
+/// RPC method sharing the same backend (see
+/// docs/concurrent-generate-pileup.md).
+fn uniformly_slow_candidates(runs: &[RunData]) -> Vec<Finding> {
+    build_matrix(runs)
+        .into_iter()
+        .filter(|row| row.calls >= MIN_TAIL_LATENCY_SAMPLE)
+        .filter_map(|row| {
+            let p50 = row.p50_ms?;
+            if p50 < UNIFORM_SLOWNESS_FLOOR_MS {
+                return None;
+            }
+            // Already covered by the ratio-based check above.
+            if let Some(p99) = row.p99_ms {
+                if p50 > 0.0 && p99 >= p50 * TAIL_LATENCY_MULTIPLE && p99 >= MIN_ABSOLUTE_P99_MS {
+                    return None;
+                }
+            }
+            let (runs_with_call, _) = run_occurrence(runs, row.method);
+            Some(Finding {
+                category: FindingCategory::LatencyOutlier,
+                severity: Severity::High,
+                summary: format!(
+                    "{}: uniformly slow — P50 ({:.0} ms) alone clears the {:.0} ms floor over {} calls (P99 {:.0} ms)",
+                    row.method,
+                    p50,
+                    UNIFORM_SLOWNESS_FLOOR_MS,
+                    row.calls,
+                    row.p99_ms.unwrap_or(p50)
+                ),
+                evidence: vec![
+                    format!(
+                        "p50={:.0}ms p95={:.0}ms p99={:.0}ms calls={}",
+                        p50,
+                        row.p95_ms.unwrap_or(0.0),
+                        row.p99_ms.unwrap_or(0.0),
+                        row.calls
+                    ),
+                    format!("observed across {runs_with_call} run(s)"),
+                ],
+            })
+        })
+        .collect()
+}
+
 /// Flags a flow type whose confirmation rate is markedly below the overall
 /// average across all flow types with intents recorded.
 fn flow_type_disparity_candidates(runs: &[RunData]) -> Vec<Finding> {
@@ -363,6 +425,7 @@ pub fn flag_candidates(runs: &[RunData]) -> Vec<Finding> {
     out.extend(rpc_failure_candidates(runs));
     out.extend(timeout_candidates(runs));
     out.extend(latency_outlier_candidates(runs));
+    out.extend(uniformly_slow_candidates(runs));
     out.extend(flow_type_disparity_candidates(runs));
     out.extend(load_degradation_candidates(runs));
     out.extend(data_completeness_candidates(runs));
@@ -588,6 +651,72 @@ mod tests {
             call("z_sendmany", true, Some(10), None),
             call("z_sendmany", true, Some(200), None),
         ];
+        let r = run("r1", calls, vec![]);
+        let findings = flag_candidates(&[r]);
+        assert!(!findings
+            .iter()
+            .any(|f| f.category == FindingCategory::LatencyOutlier));
+    }
+
+    #[test]
+    fn flags_uniformly_slow_methods_even_with_a_low_ratio() {
+        // P50 11000ms, P99 12000ms: ~1.1x ratio, nowhere near the 5x tail
+        // threshold, but every call takes over 11 seconds — exactly the
+        // `generate`-under-concurrency case the ratio check missed.
+        let mut calls = vec![call("generate", true, Some(11000), None); 5];
+        calls.push(call("generate", true, Some(12000), None));
+        let r = run("r1", calls, vec![]);
+        let findings = flag_candidates(&[r]);
+        let f = findings
+            .iter()
+            .find(|f| {
+                f.category == FindingCategory::LatencyOutlier && f.summary.contains("generate")
+            })
+            .expect("expected a latency outlier finding for a uniformly slow method");
+        assert_eq!(f.severity, Severity::High);
+        assert!(
+            f.summary.contains("uniformly slow"),
+            "summary: {}",
+            f.summary
+        );
+    }
+
+    #[test]
+    fn regtest_control_methods_are_not_exempt_from_the_uniform_slowness_floor() {
+        // regtest_control_failures_are_not_flagged (above) confirms `generate`
+        // failures are excluded from RpcFailure findings — that exclusion must
+        // NOT extend to this check: a pathologically slow `generate` predicts
+        // (and can cause) degraded latency for every other RPC method sharing
+        // its backend, so it is exactly the signal worth surfacing here.
+        let calls = vec![call("generate", true, Some(15000), None); 6];
+        let r = run("r1", calls, vec![]);
+        let findings = flag_candidates(&[r]);
+        assert!(findings.iter().any(|f| {
+            f.category == FindingCategory::LatencyOutlier && f.summary.contains("generate")
+        }));
+    }
+
+    #[test]
+    fn does_not_double_flag_a_method_caught_by_both_checks() {
+        // P50 1200ms (clears the uniform-slowness floor), P99 15000ms (12.5x
+        // ratio, clears the tail-latency threshold too) — already reported by
+        // latency_outlier_candidates; uniformly_slow_candidates must not add
+        // a second, redundant finding for the same method.
+        let mut calls = vec![call("z_sendmany", true, Some(1200), None); 5];
+        calls.push(call("z_sendmany", true, Some(15000), None));
+        let r = run("r1", calls, vec![]);
+        let findings: Vec<_> = flag_candidates(&[r])
+            .into_iter()
+            .filter(|f| {
+                f.category == FindingCategory::LatencyOutlier && f.summary.contains("z_sendmany")
+            })
+            .collect();
+        assert_eq!(findings.len(), 1, "findings: {findings:?}");
+    }
+
+    #[test]
+    fn does_not_flag_uniform_slowness_below_the_floor() {
+        let calls = vec![call("z_gettotalbalance", true, Some(500), None); 6];
         let r = run("r1", calls, vec![]);
         let findings = flag_candidates(&[r]);
         assert!(!findings

@@ -116,9 +116,16 @@ Separately: the mechanical report's severity criteria (P99/P50 ratio per method)
 flag `generate` itself as anomalous, because `generate`'s P50 (11.2s) is itself already
 enormous — the ratio (P99/P50 ≈ 2.3×) looks unremarkable next to `getrawtransaction`'s
 4291×, even though `generate`'s absolute latency is the actual root cause. A ratio-only
-threshold is blind to "uniformly slow," only to "usually fast, occasionally slow." Not
-fixed here (out of scope for this investigation) but worth knowing when reading future
-mechanical reports from this same tooling.
+threshold is blind to "uniformly slow," only to "usually fast, occasionally slow."
+
+**Update:** fixed in `src/report/findings.rs`. `uniformly_slow_candidates` adds a second
+check alongside the existing ratio-based one: any method whose median (P50) alone clears
+a fixed 1000ms floor is flagged High, regardless of its P99/P50 ratio, and — unlike the
+ratio check — regtest-control methods (`generate` and friends) are deliberately *not*
+exempt from it, since a pathologically slow control-plane call is exactly the signal that
+predicts (and, per this document, can directly cause) degraded latency for every other
+RPC method sharing its backend. A method already flagged by the ratio check is not
+flagged again by this one.
 
 ## Sources
 

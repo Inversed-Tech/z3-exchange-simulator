@@ -10,7 +10,7 @@ use super::charts::{render_latency_chart, render_tps_chart};
 use super::findings::{
     flag_candidates, Finding, FindingCategory, Severity, HIGH_DISPARITY_GAP, HIGH_RATE,
     HIGH_TAIL_LATENCY_MULTIPLE, MEDIUM_RATE, MIN_ABSOLUTE_P99_MS, MIN_DISPARITY_GAP,
-    MIN_TAIL_LATENCY_SAMPLE, TAIL_LATENCY_MULTIPLE,
+    MIN_TAIL_LATENCY_SAMPLE, TAIL_LATENCY_MULTIPLE, UNIFORM_SLOWNESS_FLOOR_MS,
 };
 use super::load_curve::{
     windowed_load_curve, DEFAULT_WINDOW_SECS, DEGRADATION_ERROR_RATE,
@@ -388,11 +388,15 @@ fn render_severity_appendix(md: &mut String) {
         MEDIUM_RATE * 100.0,
     ));
     md.push_str(&format!(
-        "- **Latency outlier** — a method is flagged at all only when its P99 reaches \
-         `{:.0}x` its P50 *and* P99 is at least `{:.0}ms`, over at least `{}` calls (below \
-         that, tail latency is treated as noise). Once flagged: `>= {:.0}x` P50 = **High**, \
-         otherwise **Medium**.\n",
-        TAIL_LATENCY_MULTIPLE, MIN_ABSOLUTE_P99_MS, MIN_TAIL_LATENCY_SAMPLE, HIGH_TAIL_LATENCY_MULTIPLE,
+        "- **Latency outlier** — flagged by either of two independent checks, over at least \
+         `{MIN_TAIL_LATENCY_SAMPLE}` calls (below that, latency is treated as noise), and \
+         reported once per method even if both checks would otherwise fire: \
+         (1) *tail*: P99 reaches `{TAIL_LATENCY_MULTIPLE:.0}x` its own P50 *and* P99 is at \
+         least `{MIN_ABSOLUTE_P99_MS:.0}ms` — **High** at `>= {HIGH_TAIL_LATENCY_MULTIPLE:.0}x` \
+         P50, otherwise **Medium**; (2) *uniform*: P50 alone reaches \
+         `{UNIFORM_SLOWNESS_FLOOR_MS:.0}ms` regardless of ratio — always **High**, and, unlike \
+         check (1), not exempt for regtest-control methods (`generate` and friends), since a \
+         pathologically slow control-plane call is itself a signal worth surfacing.\n",
     ));
     md.push_str(&format!(
         "- **Flow-type disparity** — a flow type is flagged at all only when its confirm \
