@@ -4,6 +4,7 @@
 //! finished prose — see `findings.rs` for why root-cause authorship is a
 //! deliberately separate step from this pipeline.
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use super::charts::{render_latency_chart, render_tps_chart};
@@ -13,11 +14,13 @@ use super::findings::{
     MIN_TAIL_LATENCY_SAMPLE, TAIL_LATENCY_MULTIPLE, UNIFORM_SLOWNESS_FLOOR_MS,
 };
 use super::load_curve::{
-    windowed_load_curve, DEFAULT_WINDOW_SECS, DEGRADATION_ERROR_RATE,
-    DEGRADATION_HIGH_LATENCY_MULTIPLE, DEGRADATION_LATENCY_MULTIPLE, MIN_WINDOW_CALLS,
+    find_degradation_point, peak_tps_point, windowed_load_curve, DEFAULT_WINDOW_SECS,
+    DEGRADATION_ERROR_RATE, DEGRADATION_HIGH_LATENCY_MULTIPLE, DEGRADATION_LATENCY_MULTIPLE,
+    MIN_WINDOW_CALLS,
 };
 use super::loader::RunData;
-use super::rpc_matrix::{build_matrix, Category};
+use super::rpc_matrix::{build_matrix, build_unlisted, load_parity_annotations, Category, ParityInfo};
+use super::system_health::{compute_system_health, SystemHealth};
 
 /// Renders a Markdown pipe table with separator-row dash counts
 /// proportional to each column's actual max content width.
@@ -118,6 +121,28 @@ fn render_executive_summary(runs: &[RunData], findings: &[Finding], md: &mut Str
          \"Candidate findings\" below; tier definitions in the Appendix)\n\n"
     ));
 
+    md.push_str("**Overall read** (mechanically derived from the counts above — not a \
+                  substitute for engineering judgment): ");
+    if high == 0 && medium == 0 {
+        md.push_str(&format!(
+            "no High- or Medium-severity candidates were flagged, and {confirmed_pct:.0}% of \
+             attempted intents confirmed across {} run(s).\n\n",
+            runs.len()
+        ));
+    } else if high == 0 {
+        md.push_str(&format!(
+            "no High-severity candidates were flagged, but {medium} Medium-severity \
+             candidate(s) were, alongside a {confirmed_pct:.0}% confirm rate — worth a closer \
+             look before treating this load level as clean.\n\n"
+        ));
+    } else {
+        md.push_str(&format!(
+            "{high} High-severity candidate(s) were flagged (see below) alongside a \
+             {confirmed_pct:.0}% confirm rate — at least one pattern here likely needs \
+             engineering follow-up before treating the tested load level as validated.\n\n"
+        ));
+    }
+
     let mut high_findings: Vec<&Finding> = findings.iter().filter(|f| f.severity == Severity::High).collect();
     high_findings.sort_by(|a, b| a.category.to_string().cmp(&b.category.to_string()).then(a.summary.cmp(&b.summary)));
     if high_findings.is_empty() {
@@ -202,13 +227,80 @@ fn render_load_results(runs: &[RunData], md: &mut String) {
     render_table(&headers, &rows, md);
 }
 
+/// Confirmed/failed/timed-out breakdown by flow type, shown only for runs
+/// whose intents span more than one flow type — a single-flow-type run's
+/// breakdown is already fully captured by "Load results by run" above it.
+/// Unlike `flow_type_disparity_candidates` in `findings.rs` (which only
+/// surfaces a flow type when it trails the overall rate by >20pp), this
+/// section is unconditional: a "mixed" scenario's whole point is exercising
+/// transparent/shielded flows together, so that comparison shouldn't be
+/// hidden behind a disparity threshold.
+fn render_flow_type_breakdown(runs: &[RunData], md: &mut String) {
+    md.push_str("## Outcomes by flow type\n\n");
+    md.push_str(
+        "Shown only for runs whose intents span more than one flow type — a single-flow-type \
+         run's breakdown is already fully captured by \"Load results by run\" above. Markedly \
+         uneven confirm rates across flow types are additionally flagged under \"Flow-type \
+         disparity\" in Candidate findings.\n\n",
+    );
+    let mut any = false;
+    for run in runs {
+        let mut by_flow: HashMap<String, (u64, u64, u64, u64)> = HashMap::new(); // (confirmed, failed, timed_out, total)
+        for intent in &run.intents {
+            let flow = format!("{:?}", intent.flow_type);
+            let entry = by_flow.entry(flow).or_default();
+            entry.3 += 1;
+            match intent.outcome.as_str() {
+                "confirmed" => entry.0 += 1,
+                "failed" => entry.1 += 1,
+                "timed_out" => entry.2 += 1,
+                _ => {}
+            }
+        }
+        if by_flow.len() < 2 {
+            continue;
+        }
+        any = true;
+        md.push_str(&format!("### {}\n\n", run.manifest.run_id));
+        let headers = ["Flow type", "Confirmed", "Failed", "Timed out", "Confirm rate"];
+        let mut flows: Vec<_> = by_flow.into_iter().collect();
+        flows.sort_by(|a, b| a.0.cmp(&b.0));
+        let rows: Vec<Vec<String>> = flows
+            .iter()
+            .map(|(flow, (confirmed, failed, timed_out, total))| {
+                let rate = if *total > 0 {
+                    *confirmed as f64 / *total as f64 * 100.0
+                } else {
+                    0.0
+                };
+                vec![
+                    flow.clone(),
+                    confirmed.to_string(),
+                    failed.to_string(),
+                    timed_out.to_string(),
+                    format!("{rate:.0}%"),
+                ]
+            })
+            .collect();
+        render_table(&headers, &rows, md);
+    }
+    if !any {
+        md.push_str("No run in this report exercised more than one flow type.\n\n");
+    }
+}
+
 /// Per-run TPS/latency/error-rate curve, all RPC methods combined — the
 /// "load-curve results (TPS vs. latency)" scope.md asks for. Rendered per
 /// run, not aggregated, since two runs' time series only make sense
 /// side-by-side if they share a load shape (see `load_curve.rs`). When
 /// `assets_dir` is provided, a TPS chart and a latency chart are rendered
 /// as PNGs and embedded after each run's table.
-fn render_load_curve(runs: &[RunData], assets_dir: Option<&Path>, md: &mut String) {
+fn render_load_curve(
+    runs: &[RunData],
+    health: &[SystemHealth],
+    assets_dir: Option<&Path>,
+    md: &mut String,
+) {
     md.push_str("## Load curve by run\n\n");
     md.push_str(&format!(
         "Achieved throughput, latency, and error rate in fixed {DEFAULT_WINDOW_SECS}-second \
@@ -216,14 +308,41 @@ fn render_load_curve(runs: &[RunData], assets_dir: Option<&Path>, md: &mut Strin
          compatibility matrix below for per-method detail). Candidate inflection points \
          detected from these curves appear under \"Load degradation\" in Candidate findings.\n\n"
     ));
+    let fmt_ms = |v: Option<f64>| v.map(|v| format!("{v:.0}")).unwrap_or_else(|| "—".into());
     let mut any = false;
-    for run in runs {
+    for (run, h) in runs.iter().zip(health) {
         let points = windowed_load_curve(&run.rpc_calls, DEFAULT_WINDOW_SECS);
         if points.is_empty() {
             continue;
         }
         any = true;
         md.push_str(&format!("### {}\n\n", run.manifest.run_id));
+
+        let achieved = h.achieved_tps.map(|v| format!("{v:.1}")).unwrap_or_else(|| "N/A".into());
+        let peak = peak_tps_point(&points);
+        let peak_offset = peak
+            .map(|p| (p.window_start - points[0].window_start).num_seconds())
+            .unwrap_or(0);
+        md.push_str(&format!(
+            "**Target TPS:** {:.1} · **Achieved TPS:** {achieved} (run average, from the \
+             `tps_achieved` metric) · **Peak window:** {:.1} TPS at +{peak_offset}s\n\n",
+            run.manifest.target_tps,
+            peak.map(|p| p.tps).unwrap_or(0.0),
+        ));
+
+        match find_degradation_point(&points) {
+            Some(d) => md.push_str(&format!(
+                "**Candidate degradation point:** +{}s — {:.1} TPS, P99 {} (baseline P99 {}), \
+                 error rate {:.0}% — **[{}]**\n\n",
+                d.offset_secs,
+                d.tps,
+                fmt_ms(d.p99_ms),
+                fmt_ms(d.baseline_p99_ms),
+                d.error_rate * 100.0,
+                d.severity,
+            )),
+            None => md.push_str("No candidate degradation point detected in this run.\n\n"),
+        }
 
         if let Some(dir) = assets_dir {
             if let Ok(path) = render_tps_chart(dir, &run.manifest.run_id, &points) {
@@ -236,7 +355,6 @@ fn render_load_curve(runs: &[RunData], assets_dir: Option<&Path>, md: &mut Strin
 
         let headers = ["+s", "Calls", "Errors", "TPS", "P50 ms", "P95 ms", "P99 ms"];
         let start = points[0].window_start;
-        let fmt_ms = |v: Option<f64>| v.map(|v| format!("{v:.0}")).unwrap_or_else(|| "—".into());
         let rows: Vec<Vec<String>> = points
             .iter()
             .map(|p| {
@@ -259,18 +377,88 @@ fn render_load_curve(runs: &[RunData], assets_dir: Option<&Path>, md: &mut Strin
     }
 }
 
+/// Figures derived from `metrics.jsonl` rather than `rpc_calls.jsonl` /
+/// `intents.jsonl` — mempool depth/saturation, shielded proving time, and
+/// per-process CPU/memory. Every other section of this report is silent on
+/// these even though the simulator records them on every run (see
+/// `system_health.rs`'s module doc); this section is where they surface.
+fn render_system_health(runs: &[RunData], health: &[SystemHealth], md: &mut String) {
+    md.push_str("## System health by run\n\n");
+    md.push_str(
+        "Metrics collected during each run beyond the RPC call log: mempool depth and \
+         saturation, ZK proving time for shielded withdrawals, and per-process CPU/memory \
+         usage. Sourced from `metrics.jsonl` — see docs/architecture/observability.md for what \
+         each metric measures and how often it is sampled.\n\n",
+    );
+    let mut any = false;
+    for (run, h) in runs.iter().zip(health) {
+        if run.metrics.is_empty() {
+            continue;
+        }
+        any = true;
+        md.push_str(&format!("### {}\n\n", run.manifest.run_id));
+
+        match (h.peak_mempool_tx_count, h.peak_mempool_bytes) {
+            (None, None) => md.push_str("- **Mempool:** no samples recorded.\n"),
+            _ => md.push_str(&format!(
+                "- **Mempool:** peak {} tx ({} bytes); {} saturation event(s) observed.\n",
+                h.peak_mempool_tx_count.map(|v| format!("{v:.0}")).unwrap_or_else(|| "—".into()),
+                h.peak_mempool_bytes.map(|v| format!("{v:.0}")).unwrap_or_else(|| "—".into()),
+                h.saturation_events,
+            )),
+        }
+
+        match &h.proving_time {
+            Some(p) => md.push_str(&format!(
+                "- **Shielded withdrawal proving time:** P50 {:.0}ms, P95 {:.0}ms, P99 {:.0}ms \
+                 over {} sample(s).\n",
+                p.p50_ms, p.p95_ms, p.p99_ms, p.samples
+            )),
+            None => md.push_str(
+                "- **Shielded withdrawal proving time:** no samples recorded (no shielded \
+                 withdrawals observed, or the metric was not emitted).\n",
+            ),
+        }
+
+        if h.process_peaks.is_empty() {
+            md.push_str("- **Resource usage:** no per-process CPU/memory samples recorded.\n\n");
+        } else {
+            md.push_str("- **Peak resource usage by process:**\n\n");
+            let headers = ["Process", "Peak CPU %", "Peak memory (MB)"];
+            let rows: Vec<Vec<String>> = h
+                .process_peaks
+                .iter()
+                .map(|p| {
+                    vec![
+                        p.process.clone(),
+                        p.peak_cpu_percent.map(|v| format!("{v:.1}")).unwrap_or_else(|| "—".into()),
+                        p.peak_memory_mb.map(|v| format!("{v:.0}")).unwrap_or_else(|| "—".into()),
+                    ]
+                })
+                .collect();
+            render_table(&headers, &rows, md);
+        }
+    }
+    if !any {
+        md.push_str("No metrics recorded for the runs in this report.\n\n");
+    }
+}
+
 fn render_rpc_matrix(runs: &[RunData], md: &mut String) {
     md.push_str("## RPC compatibility matrix\n\n");
     md.push_str(
         "Derived mechanically from the `rpc_calls.jsonl` of every run listed above. \
-         `Not tested` means no observed call, not \"known to fail\" — see \
-         docs/rpc/rpc-coverage-matrix.md for zcashd-equivalence and parity notes, \
-         which this table does not attempt to reproduce.\n\n",
+         `Not tested` means no observed call, not \"known to fail\". `Parity`/`Notes` are \
+         pulled in from the hand-maintained docs/rpc/rpc-coverage-matrix.md — they reflect \
+         that doc's most recent update, not this report's own runs; `TBD` means \"not yet \
+         independently verified,\" not a claim of correctness.\n\n",
     );
     let matrix = build_matrix(runs);
+    let parity = load_parity_annotations();
+    let empty_parity = ParityInfo::default();
     let headers = [
         "Method", "Backend", "Status", "Calls", "Successes", "P50 ms", "P95 ms", "P99 ms",
-        "Error codes",
+        "Error codes", "Parity", "Notes",
     ];
     for category in [Category::Stress, Category::RegtestControl, Category::Smoke] {
         let cat_rows: Vec<_> = matrix.iter().filter(|r| r.category == category).collect();
@@ -287,6 +475,7 @@ fn render_rpc_matrix(runs: &[RunData], md: &mut String) {
                 } else {
                     format!("{:?}", row.error_codes)
                 };
+                let info = parity.get(row.method).unwrap_or(&empty_parity);
                 vec![
                     breakable(row.method, 8),
                     row.backend_label.to_string(),
@@ -297,11 +486,61 @@ fn render_rpc_matrix(runs: &[RunData], md: &mut String) {
                     fmt_ms(row.p95_ms),
                     fmt_ms(row.p99_ms),
                     codes,
+                    if info.parity.is_empty() { "—".to_string() } else { info.parity.clone() },
+                    if info.notes.is_empty() { "—".to_string() } else { info.notes.clone() },
                 ]
             })
             .collect();
         render_table(&headers, &rows, md);
     }
+
+    render_unlisted_rpc_calls(runs, md);
+}
+
+/// RPC calls observed during these runs whose method is not part of the
+/// tracked roster — see [`build_unlisted`]'s doc comment for why this
+/// exists as a separate section instead of silently dropping them, as
+/// `build_matrix` does.
+fn render_unlisted_rpc_calls(runs: &[RunData], md: &mut String) {
+    let rows = build_unlisted(runs);
+    if rows.is_empty() {
+        return;
+    }
+    md.push_str("### Observed outside the tracked roster\n\n");
+    md.push_str(&format!(
+        "{} method(s) were called during these runs but are not part of the \
+         {}-method roster tracked above (see docs/rpc/rpc-coverage-matrix.md) — informational \
+         only, not a coverage gap or a defect.\n\n",
+        rows.len(),
+        super::rpc_matrix::IN_SCOPE_METHODS.len(),
+    ));
+    let headers = [
+        "Method", "Backend(s)", "Status", "Calls", "Successes", "P50 ms", "P95 ms", "P99 ms",
+        "Error codes",
+    ];
+    let fmt_ms = |v: Option<f64>| v.map(|v| format!("{v:.0}")).unwrap_or_else(|| "—".into());
+    let table_rows: Vec<Vec<String>> = rows
+        .iter()
+        .map(|row| {
+            let codes = if row.error_codes.is_empty() {
+                "—".to_string()
+            } else {
+                format!("{:?}", row.error_codes)
+            };
+            vec![
+                breakable(&row.method, 8),
+                row.observed_backends.join(", "),
+                row.status.to_string(),
+                row.calls.to_string(),
+                row.successes.to_string(),
+                fmt_ms(row.p50_ms),
+                fmt_ms(row.p95_ms),
+                fmt_ms(row.p99_ms),
+                codes,
+            ]
+        })
+        .collect();
+    render_table(&headers, &table_rows, md);
 }
 
 fn render_findings(findings: &[Finding], md: &mut String) {
@@ -424,12 +663,15 @@ fn render_severity_appendix(md: &mut String) {
 
 fn render_report_impl(runs: &[RunData], assets_dir: Option<&Path>) -> String {
     let findings = flag_candidates(runs);
+    let health: Vec<SystemHealth> = runs.iter().map(compute_system_health).collect();
     let mut md = String::new();
     md.push_str("# Z3 Exchange Simulator — Findings Report\n\n");
     render_executive_summary(runs, &findings, &mut md);
     render_run_metadata(runs, &mut md);
     render_load_results(runs, &mut md);
-    render_load_curve(runs, assets_dir, &mut md);
+    render_flow_type_breakdown(runs, &mut md);
+    render_load_curve(runs, &health, assets_dir, &mut md);
+    render_system_health(runs, &health, &mut md);
     render_rpc_matrix(runs, &mut md);
     render_findings(&findings, &mut md);
     render_limitations(runs, &mut md);

@@ -12,7 +12,7 @@
 //! deviations — stay hand-maintained in that doc; this module only produces
 //! `Tested?` / success-failure counts / latency.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use super::loader::RunData;
 
@@ -327,6 +327,86 @@ pub const IN_SCOPE_METHODS: &[RosterEntry] = &[
     },
 ];
 
+/// Absolute path to the hand-maintained coverage-matrix doc, anchored at
+/// compile time to this crate checkout — the same pattern already used by
+/// this module's own `roster_matches_documented_coverage_matrix_exactly`
+/// test, extended here to production code so the rendered report can pull
+/// in the doc's zcashd-parity/deviation notes rather than requiring a
+/// reader to cross-reference a separate file.
+const COVERAGE_MATRIX_DOC: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/docs/rpc/rpc-coverage-matrix.md");
+
+/// Extracts the `## Matrix` ... `## Removed or replaced from zcashd` slice
+/// of the coverage-matrix doc — the region whose backtick-quoted first
+/// column names are Z3 roster methods, not zcashd-only ones.
+fn matrix_section(content: &str) -> Option<&str> {
+    let start = content.find("## Matrix")?;
+    let end = content.find("## Removed or replaced from zcashd")?;
+    Some(&content[start..end])
+}
+
+/// Hand-maintained context for one method from `rpc-coverage-matrix.md`:
+/// whether a zcashd equivalent exists, its behavioral parity, and any
+/// caveats — columns this module cannot derive from run evidence alone (see
+/// the module doc comment).
+#[derive(Debug, Clone, Default)]
+pub struct ParityInfo {
+    pub zcashd_equiv: String,
+    pub parity: String,
+    pub notes: String,
+}
+
+fn parse_parity_row(line: &str) -> Option<(String, ParityInfo)> {
+    let trimmed = line.trim();
+    if !trimmed.starts_with("| `") {
+        return None;
+    }
+    let cells: Vec<&str> = trimmed
+        .trim_matches('|')
+        .split('|')
+        .map(|c| c.trim())
+        .collect();
+    // | Method | Backend | Test category | zcashd equiv? | T/Z | Implemented? | Tested? | Parity | Notes |
+    if cells.len() < 9 {
+        return None;
+    }
+    let method = cells[0].trim_matches('`').to_string();
+    Some((
+        method,
+        ParityInfo {
+            zcashd_equiv: cells[3].to_string(),
+            parity: cells[7].to_string(),
+            notes: cells[8].to_string(),
+        },
+    ))
+}
+
+/// Loads every method's hand-maintained parity/notes context, keyed by
+/// method name. Best-effort: the doc is edited by hand and may be missing,
+/// moved, or reshaped — callers get an empty map rather than a hard
+/// failure, since this is supplementary context, not something the report
+/// can verify mechanically (never treat its absence as a correctness
+/// problem with the run evidence itself).
+pub fn load_parity_annotations() -> HashMap<String, ParityInfo> {
+    let content = match std::fs::read_to_string(COVERAGE_MATRIX_DOC) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!(
+                "[report] warning: could not read {COVERAGE_MATRIX_DOC}: {e} — \
+                 Parity/Notes columns will be omitted from the RPC compatibility matrix"
+            );
+            return HashMap::new();
+        }
+    };
+    let Some(section) = matrix_section(&content) else {
+        eprintln!(
+            "[report] warning: {COVERAGE_MATRIX_DOC} is missing its ## Matrix / \
+             ## Removed or replaced from zcashd sections — Parity/Notes columns will be omitted"
+        );
+        return HashMap::new();
+    };
+    section.lines().filter_map(parse_parity_row).collect()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MatrixStatus {
     /// No run in the provided evidence recorded any call to this method.
@@ -447,13 +527,111 @@ pub fn build_matrix(runs: &[RunData]) -> Vec<MatrixRow> {
         .collect()
 }
 
+/// One method observed in the provided runs whose name is not part of
+/// [`IN_SCOPE_METHODS`] — same shape as [`MatrixRow`] minus the roster-only
+/// `backend_label`/`category` fields, since there is no roster entry to
+/// pull them from.
+pub struct UnlistedRow {
+    pub method: String,
+    pub status: MatrixStatus,
+    pub calls: u64,
+    pub successes: u64,
+    pub observed_backends: Vec<String>,
+    pub error_codes: Vec<i64>,
+    pub p50_ms: Option<f64>,
+    pub p95_ms: Option<f64>,
+    pub p99_ms: Option<f64>,
+}
+
+/// Aggregates RPC calls whose method is *not* in [`IN_SCOPE_METHODS`].
+/// `build_matrix` silently excludes these (see its own
+/// `build_matrix_ignores_calls_to_methods_outside_the_roster` test) — a real
+/// method actually exercised against Zebra or Zallet but missing from the
+/// Foundation's confirmed roster would otherwise be invisible in this
+/// report, not even shown as "Not tested."
+pub fn build_unlisted(runs: &[RunData]) -> Vec<UnlistedRow> {
+    let roster: HashSet<&str> = IN_SCOPE_METHODS.iter().map(|e| e.method).collect();
+
+    #[derive(Default)]
+    struct Agg {
+        calls: u64,
+        successes: u64,
+        backends: HashSet<String>,
+        error_codes: HashSet<i64>,
+        latencies: Vec<u64>,
+    }
+    let mut by_method: HashMap<String, Agg> = HashMap::new();
+
+    for run in runs {
+        for call in &run.rpc_calls {
+            if roster.contains(call.method.as_str()) {
+                continue;
+            }
+            let entry = by_method.entry(call.method.clone()).or_default();
+            entry.calls += 1;
+            if call.success {
+                entry.successes += 1;
+            }
+            entry.backends.insert(format!("{:?}", call.backend));
+            if let Some(code) = call.error_code {
+                entry.error_codes.insert(code);
+            }
+            if let Some(ms) = call.latency_ms {
+                entry.latencies.push(ms);
+            }
+        }
+    }
+
+    let mut out: Vec<UnlistedRow> = by_method
+        .into_iter()
+        .map(|(method, agg)| {
+            let status = if agg.calls == 0 {
+                MatrixStatus::NotTested
+            } else if agg.successes == agg.calls {
+                MatrixStatus::ExercisedAllSuccess
+            } else if agg.successes == 0 {
+                MatrixStatus::ExercisedAllFailed
+            } else {
+                MatrixStatus::ExercisedPartialFailure
+            };
+            let mut latencies = agg.latencies;
+            let (p50, p95, p99) = if latencies.is_empty() {
+                (None, None, None)
+            } else {
+                latencies.sort_unstable();
+                (
+                    Some(percentile_value(&latencies, 0.50)),
+                    Some(percentile_value(&latencies, 0.95)),
+                    Some(percentile_value(&latencies, 0.99)),
+                )
+            };
+            let mut observed_backends: Vec<String> = agg.backends.into_iter().collect();
+            observed_backends.sort();
+            let mut error_codes: Vec<i64> = agg.error_codes.into_iter().collect();
+            error_codes.sort_unstable();
+            UnlistedRow {
+                method,
+                status,
+                calls: agg.calls,
+                successes: agg.successes,
+                observed_backends,
+                error_codes,
+                p50_ms: p50,
+                p95_ms: p95,
+                p99_ms: p99,
+            }
+        })
+        .collect();
+    out.sort_by(|a, b| a.method.cmp(&b.method));
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::data_model::{Backend, IntentRecord, RpcCall};
     use crate::metrics::{RunManifest, RunTimeouts};
     use chrono::Utc;
-    use std::path::Path;
 
     fn run_with_calls(calls: Vec<RpcCall>) -> RunData {
         RunData {
@@ -580,19 +758,10 @@ mod tests {
     /// zcashd methods, not Z3 ones) so those rows can't spuriously count as
     /// roster methods.
     fn methods_documented_in_coverage_matrix() -> HashSet<String> {
-        let path = Path::new(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/docs/rpc/rpc-coverage-matrix.md"
-        ));
-        let content = std::fs::read_to_string(path)
+        let content = std::fs::read_to_string(COVERAGE_MATRIX_DOC)
             .expect("docs/rpc/rpc-coverage-matrix.md must be readable");
-        let matrix_start = content
-            .find("## Matrix")
-            .expect("rpc-coverage-matrix.md must have a ## Matrix section");
-        let matrix_end = content
-            .find("## Removed or replaced from zcashd")
-            .expect("rpc-coverage-matrix.md must have a ## Removed or replaced section");
-        let section = &content[matrix_start..matrix_end];
+        let section = matrix_section(&content)
+            .expect("rpc-coverage-matrix.md must have ## Matrix and ## Removed sections");
 
         // Explicitly excluded per the module doc comment: gRPC-only mempool
         // notification mechanisms (not JSON-RPC methods at all) and
@@ -632,5 +801,64 @@ mod tests {
              documented but missing from roster: {missing_from_roster:?}; \
              in roster but not documented: {extra_in_roster:?}"
         );
+    }
+
+    #[test]
+    fn build_unlisted_finds_methods_outside_the_roster() {
+        let run = run_with_calls(vec![
+            call("z_getbalanceforaccount", true, Some(5), None),
+            call("z_getbalanceforaccount", true, Some(7), None),
+            call("getblockcount", true, Some(2), None), // in-roster, must not appear
+        ]);
+        let unlisted = build_unlisted(&[run]);
+        assert_eq!(unlisted.len(), 1);
+        let row = &unlisted[0];
+        assert_eq!(row.method, "z_getbalanceforaccount");
+        assert_eq!(row.calls, 2);
+        assert_eq!(row.successes, 2);
+        assert_eq!(row.status, MatrixStatus::ExercisedAllSuccess);
+    }
+
+    #[test]
+    fn build_unlisted_empty_when_every_call_is_in_roster() {
+        let run = run_with_calls(vec![call("getblockcount", true, Some(2), None)]);
+        assert!(build_unlisted(&[run]).is_empty());
+    }
+
+    #[test]
+    fn build_unlisted_tracks_partial_failure_and_error_codes() {
+        let run = run_with_calls(vec![
+            call("z_getbalanceforaccount", true, Some(5), None),
+            call("z_getbalanceforaccount", false, None, Some(-1)),
+        ]);
+        let unlisted = build_unlisted(&[run]);
+        let row = unlisted.iter().find(|r| r.method == "z_getbalanceforaccount").unwrap();
+        assert_eq!(row.status, MatrixStatus::ExercisedPartialFailure);
+        assert_eq!(row.error_codes, vec![-1]);
+    }
+
+    #[test]
+    fn load_parity_annotations_finds_a_known_method() {
+        let annotations = load_parity_annotations();
+        let entry = annotations
+            .get("getblockchaininfo")
+            .expect("getblockchaininfo should be documented in rpc-coverage-matrix.md");
+        assert!(!entry.parity.is_empty());
+    }
+
+    #[test]
+    fn parse_parity_row_extracts_expected_columns() {
+        let line = "| `getblockchaininfo` | Zebra | Stress | Yes | N/A | Yes | Yes | TBD | Some note. |";
+        let (method, info) = parse_parity_row(line).expect("should parse a matrix row");
+        assert_eq!(method, "getblockchaininfo");
+        assert_eq!(info.zcashd_equiv, "Yes");
+        assert_eq!(info.parity, "TBD");
+        assert_eq!(info.notes, "Some note.");
+    }
+
+    #[test]
+    fn parse_parity_row_ignores_header_and_separator_lines() {
+        assert!(parse_parity_row("| Method | Backend | Test category |").is_none());
+        assert!(parse_parity_row("|---|---|---|").is_none());
     }
 }

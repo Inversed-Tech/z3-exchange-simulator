@@ -15,6 +15,30 @@ use super::load_curve::LoadCurvePoint;
 const CHART_WIDTH: u32 = 900;
 const CHART_HEIGHT: u32 = 380;
 
+// Palette: the validated reference instance from the `dataviz` skill
+// (references/palette.md), light-mode slots only — these charts render to
+// a static PNG for a Markdown/PDF report, not a themeable page. The three
+// categorical slots used here (blue/orange/aqua) are the ones the skill's
+// palette validator confirms clear the CVD/normal-vision floors on every
+// pairwise comparison, which three simultaneously-plotted line series need.
+const SURFACE: RGBColor = RGBColor(0xfc, 0xfc, 0xfb);
+const INK_PRIMARY: RGBColor = RGBColor(0x0b, 0x0b, 0x0b);
+const INK_SECONDARY: RGBColor = RGBColor(0x52, 0x51, 0x4e);
+const GRIDLINE: RGBColor = RGBColor(0xe1, 0xe0, 0xd9);
+const AXIS: RGBColor = RGBColor(0xc3, 0xc2, 0xb7);
+/// Categorical slot 1 — used alone for the single-series TPS chart, and for
+/// P50 in the latency chart.
+const SERIES_BLUE: RGBColor = RGBColor(0x2a, 0x78, 0xd6);
+/// Categorical slot 2 — P95 in the latency chart.
+const SERIES_ORANGE: RGBColor = RGBColor(0xeb, 0x68, 0x34);
+/// Categorical slot 3 — P99 in the latency chart. Sub-3:1 contrast against
+/// `SURFACE` on its own (the palette's documented relief case); the legend
+/// plus this report's load-curve table right below each chart are the
+/// required relief, so hue is never the only way to identify this series.
+const SERIES_AQUA: RGBColor = RGBColor(0x1b, 0xaf, 0x7a);
+const LINE_WIDTH: u32 = 2;
+const MARKER_RADIUS: i32 = 4; // 8px diameter, the mark spec's marker floor
+
 #[derive(Debug)]
 pub struct ChartError(pub String);
 
@@ -53,9 +77,12 @@ pub fn render_tps_chart(
 
     let backend_path = path.clone();
     let root = BitMapBackend::new(&backend_path, (CHART_WIDTH, CHART_HEIGHT)).into_drawing_area();
-    root.fill(&WHITE).map_err(|e| ChartError(e.to_string()))?;
+    root.fill(&SURFACE).map_err(|e| ChartError(e.to_string()))?;
     let mut chart = ChartBuilder::on(&root)
-        .caption(format!("{run_id}: achieved TPS over time"), ("sans-serif", 18))
+        .caption(
+            format!("{run_id}: achieved TPS over time"),
+            ("sans-serif", 18).into_font().color(&INK_PRIMARY),
+        )
         .margin(15)
         .x_label_area_size(35)
         .y_label_area_size(50)
@@ -63,15 +90,30 @@ pub fn render_tps_chart(
         .map_err(|e| ChartError(e.to_string()))?;
     chart
         .configure_mesh()
+        .light_line_style(GRIDLINE)
+        .bold_line_style(GRIDLINE)
+        .axis_style(AXIS)
+        .label_style(("sans-serif", 12).into_font().color(&INK_SECONDARY))
         .x_desc("seconds since run start")
         .y_desc("TPS")
         .draw()
         .map_err(|e| ChartError(e.to_string()))?;
     chart
-        .draw_series(LineSeries::new(series.iter().copied(), &BLUE))
+        .draw_series(LineSeries::new(
+            series.iter().copied(),
+            ShapeStyle {
+                color: SERIES_BLUE.to_rgba(),
+                filled: false,
+                stroke_width: LINE_WIDTH,
+            },
+        ))
         .map_err(|e| ChartError(e.to_string()))?;
     chart
-        .draw_series(series.iter().map(|(x, y)| Circle::new((*x, *y), 2, BLUE.filled())))
+        .draw_series(
+            series
+                .iter()
+                .map(|(x, y)| Circle::new((*x, *y), MARKER_RADIUS, SERIES_BLUE.filled())),
+        )
         .map_err(|e| ChartError(e.to_string()))?;
     root.present().map_err(|e| ChartError(e.to_string()))?;
     drop(root);
@@ -108,9 +150,12 @@ pub fn render_latency_chart(
 
     let backend_path = path.clone();
     let root = BitMapBackend::new(&backend_path, (CHART_WIDTH, CHART_HEIGHT)).into_drawing_area();
-    root.fill(&WHITE).map_err(|e| ChartError(e.to_string()))?;
+    root.fill(&SURFACE).map_err(|e| ChartError(e.to_string()))?;
     let mut chart = ChartBuilder::on(&root)
-        .caption(format!("{run_id}: latency over time"), ("sans-serif", 18))
+        .caption(
+            format!("{run_id}: latency over time"),
+            ("sans-serif", 18).into_font().color(&INK_PRIMARY),
+        )
         .margin(15)
         .x_label_area_size(35)
         .y_label_area_size(60)
@@ -118,26 +163,39 @@ pub fn render_latency_chart(
         .map_err(|e| ChartError(e.to_string()))?;
     chart
         .configure_mesh()
+        .light_line_style(GRIDLINE)
+        .bold_line_style(GRIDLINE)
+        .axis_style(AXIS)
+        .label_style(("sans-serif", 12).into_font().color(&INK_SECONDARY))
         .x_desc("seconds since run start")
         .y_desc("latency (ms)")
         .draw()
         .map_err(|e| ChartError(e.to_string()))?;
 
+    // Fixed categorical order (slot 1/2/3), never cycled — P50/P95/P99 are
+    // three distinct series a reader tracks via the legend below, not a
+    // magnitude gradient of one series.
     for (series, color, label) in [
-        (&p50, RGBColor(34, 139, 34), "P50"),
-        (&p95, RGBColor(255, 140, 0), "P95"),
-        (&p99, RGBColor(220, 20, 60), "P99"),
+        (&p50, SERIES_BLUE, "P50"),
+        (&p95, SERIES_ORANGE, "P95"),
+        (&p99, SERIES_AQUA, "P99"),
     ] {
+        let style = ShapeStyle {
+            color: color.to_rgba(),
+            filled: false,
+            stroke_width: LINE_WIDTH,
+        };
         chart
-            .draw_series(LineSeries::new(series.iter().copied(), color))
+            .draw_series(LineSeries::new(series.iter().copied(), style))
             .map_err(|e| ChartError(e.to_string()))?
             .label(label)
             .legend(move |(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], color));
     }
     chart
         .configure_series_labels()
-        .background_style(WHITE.mix(0.8))
-        .border_style(BLACK)
+        .background_style(SURFACE.mix(0.9))
+        .border_style(AXIS)
+        .label_font(("sans-serif", 13).into_font().color(&INK_SECONDARY))
         .draw()
         .map_err(|e| ChartError(e.to_string()))?;
     root.present().map_err(|e| ChartError(e.to_string()))?;

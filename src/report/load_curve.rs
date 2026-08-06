@@ -127,77 +127,129 @@ pub fn windowed_load_curve(calls: &[RpcCall], window_secs: i64) -> Vec<LoadCurve
     out
 }
 
-/// Flags at most one candidate degradation point per run: the first window
-/// (past the noise floor) whose P99 has grown disproportionately relative
-/// to the run's own baseline window, or whose error rate alone is high
-/// enough to be worth a look. Stopping at the first hit is a deliberate
-/// simplification — this flags *that* degradation was observed in the run,
-/// not a catalogue of every window past it.
+/// One run's candidate degradation window, structured rather than a
+/// pre-formatted `Finding` — shared by [`load_degradation_candidates`] and
+/// the per-run load-curve digest in `markdown.rs`, so the two can never
+/// drift apart on what counts as "the" inflection point.
+#[derive(Debug, Clone)]
+pub struct DegradationPoint {
+    pub window_start: DateTime<Utc>,
+    pub window_end: DateTime<Utc>,
+    pub offset_secs: i64,
+    pub tps: f64,
+    pub calls: u64,
+    pub errors: u64,
+    pub error_rate: f64,
+    pub p50_ms: Option<f64>,
+    pub p95_ms: Option<f64>,
+    pub p99_ms: Option<f64>,
+    pub baseline_p99_ms: Option<f64>,
+    pub severity: Severity,
+}
+
+/// Finds the first candidate degradation window (past the noise floor)
+/// whose P99 has grown disproportionately relative to the run's own
+/// baseline window, or whose error rate alone is high enough to be worth a
+/// look. Stopping at the first hit is a deliberate simplification — this
+/// flags *that* degradation was observed in the run, not a catalogue of
+/// every window past it.
+pub fn find_degradation_point(points: &[LoadCurvePoint]) -> Option<DegradationPoint> {
+    if points.is_empty() {
+        return None;
+    }
+    let baseline_p99 = points
+        .iter()
+        .find(|p| p.calls >= MIN_WINDOW_CALLS)
+        .and_then(|p| p.p99_ms);
+    let run_start = points[0].window_start;
+
+    for point in points {
+        if point.calls < MIN_WINDOW_CALLS {
+            continue;
+        }
+        let error_rate = point.errors as f64 / point.calls as f64;
+        let latency_ratio = match (baseline_p99, point.p99_ms) {
+            (Some(base), Some(p99)) if base > 0.0 => Some(p99 / base),
+            _ => None,
+        };
+
+        let is_latency_degradation = latency_ratio
+            .map(|r| r >= DEGRADATION_LATENCY_MULTIPLE)
+            .unwrap_or(false);
+        let is_error_degradation = error_rate >= DEGRADATION_ERROR_RATE;
+        if !is_latency_degradation && !is_error_degradation {
+            continue;
+        }
+
+        let severity = if latency_ratio.unwrap_or(0.0) >= DEGRADATION_HIGH_LATENCY_MULTIPLE
+            || error_rate >= 2.0 * DEGRADATION_ERROR_RATE
+        {
+            Severity::High
+        } else {
+            Severity::Medium
+        };
+
+        return Some(DegradationPoint {
+            window_start: point.window_start,
+            window_end: point.window_end,
+            offset_secs: (point.window_start - run_start).num_seconds(),
+            tps: point.tps,
+            calls: point.calls,
+            errors: point.errors,
+            error_rate,
+            p50_ms: point.p50_ms,
+            p95_ms: point.p95_ms,
+            p99_ms: point.p99_ms,
+            baseline_p99_ms: baseline_p99,
+            severity,
+        });
+    }
+    None
+}
+
+/// The window with the highest achieved TPS in a run's load curve — used
+/// for the per-run "peak throughput" digest line, distinct from the
+/// candidate degradation point (a run can peak well before or after it
+/// degrades).
+pub fn peak_tps_point(points: &[LoadCurvePoint]) -> Option<&LoadCurvePoint> {
+    points
+        .iter()
+        .max_by(|a, b| a.tps.partial_cmp(&b.tps).unwrap())
+}
+
+/// Flags at most one candidate degradation point per run — see
+/// [`find_degradation_point`] for the exact rule.
 pub fn load_degradation_candidates(runs: &[RunData]) -> Vec<Finding> {
+    let fmt_ms = |v: Option<f64>| v.map(|v| format!("{v:.0}ms")).unwrap_or_else(|| "N/A".into());
     let mut out = Vec::new();
     for run in runs {
         let points = windowed_load_curve(&run.rpc_calls, DEFAULT_WINDOW_SECS);
-        if points.is_empty() {
+        let Some(d) = find_degradation_point(&points) else {
             continue;
-        }
-        let baseline_p99 = points
-            .iter()
-            .find(|p| p.calls >= MIN_WINDOW_CALLS)
-            .and_then(|p| p.p99_ms);
-        let run_start = points[0].window_start;
-
-        for point in &points {
-            if point.calls < MIN_WINDOW_CALLS {
-                continue;
-            }
-            let error_rate = point.errors as f64 / point.calls as f64;
-            let latency_ratio = match (baseline_p99, point.p99_ms) {
-                (Some(base), Some(p99)) if base > 0.0 => Some(p99 / base),
-                _ => None,
-            };
-
-            let is_latency_degradation = latency_ratio
-                .map(|r| r >= DEGRADATION_LATENCY_MULTIPLE)
-                .unwrap_or(false);
-            let is_error_degradation = error_rate >= DEGRADATION_ERROR_RATE;
-            if !is_latency_degradation && !is_error_degradation {
-                continue;
-            }
-
-            let severity = if latency_ratio.unwrap_or(0.0) >= DEGRADATION_HIGH_LATENCY_MULTIPLE
-                || error_rate >= 2.0 * DEGRADATION_ERROR_RATE
-            {
-                Severity::High
-            } else {
-                Severity::Medium
-            };
-
-            let fmt_ms = |v: Option<f64>| v.map(|v| format!("{v:.0}ms")).unwrap_or_else(|| "N/A".into());
-            let offset_secs = (point.window_start - run_start).num_seconds();
-            out.push(Finding {
-                category: FindingCategory::LoadDegradation,
-                severity,
-                summary: format!(
-                    "{}: candidate inflection point at +{offset_secs}s — {:.1} TPS, P99 {}, error rate {:.0}%",
-                    run.manifest.run_id,
-                    point.tps,
-                    fmt_ms(point.p99_ms),
-                    error_rate * 100.0,
-                ),
-                evidence: vec![format!(
-                    "window={}..{} calls={} errors={} p50={} p95={} p99={} baseline_p99={}",
-                    point.window_start.format("%H:%M:%S"),
-                    point.window_end.format("%H:%M:%S"),
-                    point.calls,
-                    point.errors,
-                    fmt_ms(point.p50_ms),
-                    fmt_ms(point.p95_ms),
-                    fmt_ms(point.p99_ms),
-                    fmt_ms(baseline_p99),
-                )],
-            });
-            break;
-        }
+        };
+        out.push(Finding {
+            category: FindingCategory::LoadDegradation,
+            severity: d.severity,
+            summary: format!(
+                "{}: candidate inflection point at +{}s — {:.1} TPS, P99 {}, error rate {:.0}%",
+                run.manifest.run_id,
+                d.offset_secs,
+                d.tps,
+                fmt_ms(d.p99_ms),
+                d.error_rate * 100.0,
+            ),
+            evidence: vec![format!(
+                "window={}..{} calls={} errors={} p50={} p95={} p99={} baseline_p99={}",
+                d.window_start.format("%H:%M:%S"),
+                d.window_end.format("%H:%M:%S"),
+                d.calls,
+                d.errors,
+                fmt_ms(d.p50_ms),
+                fmt_ms(d.p95_ms),
+                fmt_ms(d.p99_ms),
+                fmt_ms(d.baseline_p99_ms),
+            )],
+        });
     }
     out
 }
@@ -339,5 +391,42 @@ mod tests {
         let r = run_with_calls("r1", calls);
         let findings = load_degradation_candidates(&[r]);
         assert_eq!(findings.len(), 1);
+    }
+
+    #[test]
+    fn peak_tps_point_finds_the_highest_tps_window() {
+        let calls = vec![
+            call_at(0, Some(10), true),
+            call_at(1, Some(10), true),
+            call_at(11, Some(10), true),
+            call_at(12, Some(10), true),
+            call_at(13, Some(10), true),
+        ];
+        let points = windowed_load_curve(&calls, 10);
+        let peak = peak_tps_point(&points).expect("expected a peak point");
+        assert_eq!(peak.calls, 3);
+    }
+
+    #[test]
+    fn peak_tps_point_empty_input_returns_none() {
+        assert!(peak_tps_point(&[]).is_none());
+    }
+
+    #[test]
+    fn find_degradation_point_matches_load_degradation_candidates() {
+        let mut calls: Vec<RpcCall> = Vec::new();
+        for i in 0..6 {
+            calls.push(call_at(i, Some(20), true));
+        }
+        for i in 10..16 {
+            calls.push(call_at(i, Some(400), true));
+        }
+        let points = windowed_load_curve(&calls, 10);
+        let direct = find_degradation_point(&points).expect("expected a degradation point");
+
+        let r = run_with_calls("r1", calls);
+        let findings = load_degradation_candidates(&[r]);
+        assert_eq!(findings.len(), 1);
+        assert!(findings[0].summary.contains(&format!("+{}s", direct.offset_secs)));
     }
 }
