@@ -46,9 +46,11 @@ Rough cost: c3d-standard-16 ≈ $0.7/h on-demand (us-central1); c3d-standard-8 �
 ```sh
 # Docker Engine + compose plugin (get.docker.com or apt docker-ce), run user in `docker` group
 # Base tooling
-apt-get install -y git curl build-essential pkg-config jq
-# rage (str4d/rage release .deb, amd64) — the stack's setup-network.sh needs
-# rage-keygen to generate the Zallet identity file
+apt-get install -y git curl build-essential pkg-config jq libfontconfig1-dev
+# libfontconfig1-dev: required by the simulator's metrics-chart dependency
+# (yeslogic-fontconfig-sys) at build time
+# rage (str4d/rage release .deb, amd64; needs libfuse2) — the stack's
+# setup-network.sh needs rage-keygen to generate the Zallet identity file
 # Rust (as the run user, not root): stable via rustup — repo builds on stable, edition 2021
 # gh CLI (https://cli.github.com) — used by scripts/dev/zallet-release-image/build.sh
 #   to fetch the Zallet release tarball, and for repo access
