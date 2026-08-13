@@ -107,6 +107,32 @@ else
     log "==> zallet.toml: as_of_version set to ${ZALLET_SEMVER}."
 fi
 
+# 3b. The Zallet container reads its config and identity as uid 1000, but two
+# generators leave them 0600 owned by the host user (which is not uid 1000 on
+# hosts where another account claimed it, e.g. GCP's default `ubuntu`):
+# rage-keygen for the identity file, and regtest-init.sh's mktemp-based pwhash
+# step for zallet.toml. Generate the pwhash here with the same derivation —
+# init then sees a non-placeholder value and skips its step — and make both
+# files world-readable. Regtest-only credentials; the RPC password defaults to
+# "zebra" in the stack itself.
+PLACEHOLDER="__GENERATED_BY_INIT_SH__"
+if grep -q "pwhash = \"${PLACEHOLDER}\"" "$ZALLET_TOML"; then
+    command -v openssl > /dev/null 2>&1 || die "openssl is required to generate the zallet RPC pwhash"
+    RPC_PASSWORD="$(grep -E '^Z3_REGTEST_RPC_ROUTER_PASSWORD=' "$ENV_FILE" | cut -d= -f2)"
+    RPC_PASSWORD="${RPC_PASSWORD:-zebra}"
+    SALT="$(openssl rand -hex 16)"
+    HASH="$(printf '%s' "$RPC_PASSWORD" | openssl dgst -sha256 -mac HMAC -macopt "key:$SALT" | awk '{print $NF}')"
+    [ -n "$HASH" ] || die "failed to generate the zallet RPC pwhash"
+    sed -i "s|^pwhash = \".*\"$|pwhash = \"${SALT}\$${HASH}\"|" "$ZALLET_TOML"
+    log "==> zallet.toml: generated RPC pwhash."
+else
+    log "==> zallet.toml: RPC pwhash already generated."
+fi
+chmod 644 "$ZALLET_TOML"
+IDENTITY_FILE="$CONFIG_DIR/zallet_identity.txt"
+[ -f "$IDENTITY_FILE" ] && chmod 644 "$IDENTITY_FILE"
+log "==> zallet.toml + zallet_identity.txt: readable by the container uid."
+
 # 4. .env.regtest: override images + third compose layer. Existing values are
 # updated in place so a lock-file bump propagates on re-run.
 ensure_env_var() {  # name value

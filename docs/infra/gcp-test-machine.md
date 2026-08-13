@@ -69,13 +69,9 @@ image via `scripts/dev/zallet-release-image/build.sh`, apply the
 - **Outbound: unrestricted egress** — pulls from Docker Hub (`zfnd/zebra`,
   `zingodevops/zainod`), GitHub (repo, ZcashFoundation/z3, Zallet release
   tarball), crates.io.
-- **SSH key for the driving Claude session** — add to instance metadata (or
-  OS Login) for the run user:
-
-  ```
-  ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINysifM8gSWnGLW47Vo+CN7ut4zwWhuY67pC0/KhsHfs claude-z3sim-runner
-  ```
-
+- **SSH key for the driving Claude session** — the driving session generates an
+  ed25519 keypair and hands over the public key out-of-band; add it to instance
+  metadata (or OS Login) for the run user. Don't commit the key here.
 - **Repo access from the VM**: `Inversed-Tech/z3-exchange-simulator` — either a
   read-only deploy key, a fine-grained PAT for `gh auth login`, or the user
   authenticates `gh` once interactively. (Everything else the setup fetches is
