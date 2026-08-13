@@ -1,0 +1,31 @@
+# Zaino 0.6.0 JSON-RPC bind fix — third compose layer for the override stack.
+#
+# Copied into external/z3/ by scripts/dev/regtest-overrides/apply.sh, which
+# also appends it to COMPOSE_FILE in .env.regtest. Required whenever
+# Z3_ZAINO_IMAGE is 0.6.0 (the z3-commits.lock `overrides:` set).
+#
+# Zaino 0.6.0 refuses to bind its (unencrypted) JSON-RPC server to a public
+# address unless built with `allow_unencrypted_public_json_rpc_bind`; the
+# published -no-tls image is not, and 0.0.0.0 counts as public, so the
+# 0.4.0-era `0.0.0.0:8237` bind in docker-compose.regtest.yml crash-loops the
+# container. Pin the compose network to a known RFC1918 subnet, give zaino a
+# static address, and bind the JSON-RPC server to it — a private bind that the
+# host port mapping still reaches.
+#
+# The single environment key below merges on top of the `environment: !override`
+# map in docker-compose.regtest.yml (compose merges later files key-by-key), so
+# every other ZAINO_* variable from that layer is preserved.
+
+services:
+  zaino:
+    networks:
+      default:
+        ipv4_address: 172.28.0.10
+    environment:
+      ZAINO_JSON_SERVER_SETTINGS__JSON_RPC_LISTEN_ADDRESS: 172.28.0.10:8237
+
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16
