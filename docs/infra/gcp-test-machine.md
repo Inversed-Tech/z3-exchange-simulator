@@ -46,9 +46,9 @@ Rough cost: c3d-standard-16 ≈ $0.7/h on-demand (us-central1); c3d-standard-8 �
 ```sh
 # Docker Engine + compose plugin (get.docker.com or apt docker-ce), run user in `docker` group
 # Base tooling
-apt-get install -y git curl build-essential pkg-config jq libfontconfig1-dev
-# libfontconfig1-dev: required by the simulator's metrics-chart dependency
-# (yeslogic-fontconfig-sys) at build time
+apt-get install -y git curl build-essential pkg-config jq libfontconfig1-dev libssl-dev
+# libfontconfig1-dev + libssl-dev: required at build time by the simulator's
+# metrics-chart dependency (yeslogic-fontconfig-sys) and openssl-sys
 # rage (str4d/rage release .deb, amd64; needs libfuse2) — the stack's
 # setup-network.sh needs rage-keygen to generate the Zallet identity file
 # Rust (as the run user, not root): stable via rustup — repo builds on stable, edition 2021
@@ -72,10 +72,9 @@ image via `scripts/dev/zallet-release-image/build.sh`, apply the
 - **SSH key for the driving Claude session** — the driving session generates an
   ed25519 keypair and hands over the public key out-of-band; add it to instance
   metadata (or OS Login) for the run user. Don't commit the key here.
-- **Repo access from the VM**: `Inversed-Tech/z3-exchange-simulator` — either a
-  read-only deploy key, a fine-grained PAT for `gh auth login`, or the user
-  authenticates `gh` once interactively. (Everything else the setup fetches is
-  public.)
+- **Repo access from the VM**: none to provision —
+  `Inversed-Tech/z3-exchange-simulator` is public, as is everything else the
+  setup fetches; plain `https://` clones work unauthenticated.
 
 ## What to hand back to the driving session
 
@@ -83,7 +82,7 @@ image via `scripts/dev/zallet-release-image/build.sh`, apply the
    via IAP: `gcloud compute ssh` invocation instead).
 2. The machine type + region actually provisioned (recorded alongside run
    artifacts for attribution).
-3. How the repo credential was provided (deploy key path / `gh` pre-authed).
+3. Any deviation from this spec (machine type, OS image, package set).
 
 ## Reproducibility notes for run attribution
 
