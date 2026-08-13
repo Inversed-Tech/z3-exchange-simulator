@@ -24,6 +24,26 @@ services:
     environment:
       ZAINO_JSON_SERVER_SETTINGS__JSON_RPC_LISTEN_ADDRESS: 172.28.0.10:8237
 
+  # The Zallet image runs as uid 1000, but the named data volume is created
+  # root-owned (regtest-init.sh touches it with a root busybox container before
+  # Zallet's copy-up ownership can apply). Docker Desktop on macOS masks this;
+  # on a native Linux host Zallet dies with "I/O operation failed: Permission
+  # denied". Mirror the stack's own cookie-permissions pattern: a root alpine
+  # init container chowns the volume before Zallet starts (compose run/up both
+  # honor the depends_on).
+  zallet-permissions:
+    image: alpine:3
+    user: "0:0"
+    command: chown -R 1000:1000 /var/lib/zallet
+    volumes:
+      - ${Z3_ZALLET_DATA_PATH:-zallet}:/var/lib/zallet
+    restart: "no"
+
+  zallet:
+    depends_on:
+      zallet-permissions:
+        condition: service_completed_successfully
+
 networks:
   default:
     ipam:
