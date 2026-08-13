@@ -70,7 +70,9 @@ else
 fi
 
 # 3. zallet.toml: mirror the heights and bump as_of_version.
-if grep -q '5437f330' "$ZALLET_TOML"; then
+# Match only a real parameters entry — the template's comments also mention the
+# 5437f330 branch id, which must not satisfy this guard.
+if grep -Eq '^[[:space:]]*"5437f330:[0-9]+"' "$ZALLET_TOML"; then
     log "==> zallet.toml: NU6.2 branch already configured."
 else
     grep -q '"4dec4df0:' "$ZALLET_TOML" || die "no NU6.1 branch entry in $ZALLET_TOML to patch"
