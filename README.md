@@ -231,6 +231,40 @@ experiments/runs/<run-id>/
 
 Run directories are gitignored and are not tracked by version control.
 
+## Generating a report
+
+Once you have one or more run directories, turn them into a findings report with:
+
+```sh
+./target/debug/z3sim report --run experiments/runs/<run-id> --out report.md
+```
+
+Pass `--run` multiple times to combine several runs into one comparative report
+(e.g. a smoke run alongside a ramp run):
+
+```sh
+./target/debug/z3sim report \
+  --run experiments/runs/<run-id-1> \
+  --run experiments/runs/<run-id-2> \
+  --out report.md
+```
+
+This always writes the Markdown report to `--out` (default: `report.md`), along with a
+`<name>_assets/` directory of latency/TPS chart images referenced from it. Add `--pdf
+<path>` to also render a PDF version by shelling out to [`pandoc`](https://pandoc.org/),
+which must be on `PATH`; the Markdown report is written either way, so a missing pandoc
+only affects the PDF step:
+
+```sh
+./target/debug/z3sim report --run experiments/runs/<run-id> --out report.md --pdf report.pdf
+```
+
+The report opens with an executive summary (attempted/confirmed/failed/timed-out counts
+and any candidate findings — latency outliers, load-degradation inflection points, RPC
+failures — flagged mechanically from the run data), followed by per-run tables and
+charts. Treat the candidate findings as a starting point for engineering judgment, not a
+final verdict.
+
 ---
 
 ## Documentation index
