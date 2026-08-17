@@ -73,7 +73,9 @@ WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
 echo "==> Fetching $ASSET"
-if command -v gh > /dev/null 2>&1; then
+# gh handles release-asset redirects best, but an installed-yet-unauthenticated
+# gh refuses even public downloads — fall back to curl in that case.
+if command -v gh > /dev/null 2>&1 && gh auth status > /dev/null 2>&1; then
     gh release download "$VERSION" --repo zcash/zallet --pattern "$ASSET" --dir "$WORK"
 else
     curl -fsSL -o "$WORK/$ASSET" \
