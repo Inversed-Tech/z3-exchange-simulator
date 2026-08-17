@@ -25,8 +25,14 @@ experiments/runs/*/
 experiments/fixtures/*
 !experiments/fixtures/.gitkeep
 
-# Local environment overrides
-configs/local/local.yaml
+# Generated findings reports (output of the reporting pipeline, regenerable)
+experiments/reports/*
+!experiments/reports/.gitkeep
+
+# Local environment overrides — everything here is developer-specific
+# (see configs/local/README.md), except the README itself.
+configs/local/*
+!configs/local/README.md
 .env
 .env.local
 
