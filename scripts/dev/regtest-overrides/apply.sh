@@ -166,7 +166,18 @@ else
     log "==> .env.regtest: appended override layer to COMPOSE_FILE."
 fi
 
-# 5. Drop the Zaino bind-fix compose layer into the stack directory.
+# 5. Drop the Zaino bind-fix compose layer into the stack directory. Its
+# subnet/static-IP (${Z3_SIM_SUBNET}/${Z3_SIM_ZAINO_IP}) and the four
+# per-environment host ports below are NOT patched into .env.regtest here:
+# `z3sim run` derives them from its own resolved env_id (src/z3/env_id.rs)
+# and passes them as process environment variables directly to each
+# `docker compose` invocation it makes (src/z3/mod.rs::Z3Config::for_run),
+# which take precedence over this file's values — so two environments never
+# collide without this file ever needing a per-environment rewrite, and
+# without a second, independent copy of the derivation formula to keep in
+# sync with the Rust implementation. This file's checked-in defaults
+# (172.28.0.0/16 etc.) remain what a bare `docker compose` invocation outside
+# `z3sim` uses.
 cp "$SCRIPT_DIR/docker-compose.regtest.override.yml" "$Z3_DIR/docker-compose.regtest.override.yml"
 log "==> Copied docker-compose.regtest.override.yml into $Z3_DIR."
 

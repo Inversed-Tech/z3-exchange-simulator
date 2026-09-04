@@ -106,6 +106,28 @@ pub struct RunOptions {
     /// the confirmation-poll interval quantizes (and inflates) measured latency;
     /// tune it to the stack under test rather than measuring the miner's tick.
     pub block_interval: Duration,
+    /// Discard this checkout's cached environment id and mint a fresh,
+    /// disposable one instead of reusing it (see `z3::env_id`). Use to run a
+    /// second, independent environment concurrently with one already in
+    /// progress against the same checkout.
+    pub fresh_env: bool,
+    /// Path to this checkout's cached environment id (see
+    /// `z3::env_id::resolve_env_id`). Defaults to `configs/local/env-id`, the
+    /// existing convention for gitignored, per-checkout machine state.
+    /// Overridable (e.g. to a tempdir) so tests exercising `setup()` don't
+    /// mutate the real checkout.
+    pub env_id_cache_path: PathBuf,
+    /// Directory holding the per-`env_id` concurrency lock files (see
+    /// `z3::run_lock::acquire`). Defaults to `configs/local`.
+    pub run_lock_dir: PathBuf,
+    /// Path to the cloned Z3 Docker Compose repository. Defaults to
+    /// `external/z3`. Overridable so tests exercising `setup()`/the CLI
+    /// dispatch layer can point it at a path guaranteed not to exist and get
+    /// a fast, side-effect-free failure — see
+    /// `z3::Z3Config::check_preconditions` — instead of reaching real
+    /// bootstrap scripts and Docker state on a machine that happens to have
+    /// a real checkout already configured.
+    pub compose_dir: PathBuf,
 }
 
 impl Default for RunOptions {
@@ -120,6 +142,10 @@ impl Default for RunOptions {
             hot_wallet_uuid: None,
             cancel: None,
             block_interval: Duration::from_secs(2),
+            fresh_env: false,
+            env_id_cache_path: PathBuf::from("configs/local/env-id"),
+            run_lock_dir: PathBuf::from("configs/local"),
+            compose_dir: PathBuf::from("external/z3"),
         }
     }
 }
@@ -238,6 +264,10 @@ pub async fn run(scenario: ScenarioConfig, opts: RunOptions) -> Result<RunResult
         // flow spends from `hot_wallet_address`.
         hot_wallet_uuid: _,
         hot_wallet_address,
+        // Held for the remainder of this function — including through the
+        // load phase and teardown below — so the environment stays reserved
+        // for the entire run. Released when it drops at function exit.
+        run_lock: _run_lock,
     } = setup_state;
 
     let provisioned = Arc::new(provisioned);

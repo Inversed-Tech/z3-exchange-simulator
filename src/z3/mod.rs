@@ -13,8 +13,11 @@ use crate::data_model::MetricSample;
 use crate::metrics::MetricsRecorder;
 
 pub mod contract;
+pub mod env_id;
+pub mod run_lock;
 
 use contract::{ContractError, Z3Contract};
+use env_id::compose_project_for_env;
 
 const SERVICES: &[&str] = &["zebra", "zallet", "zaino"];
 const ENV_FILE: &str = ".env.regtest";
@@ -30,6 +33,60 @@ const DEFAULT_REGTEST_RPC_PASSWORD: &str = "zebra";
 /// `host.docker.internal`).
 fn rpc_host() -> String {
     std::env::var("Z3_RPC_HOST").unwrap_or_else(|_| "127.0.0.1".into())
+}
+
+/// The `docker compose` interpolation overrides (host ports + subnet/static
+/// IP) for a given, already-derived port set and subnet assignment, keyed by
+/// the exact variable names `docker-compose.regtest.yml`/
+/// `docker-compose.regtest.override.yml` reference. Passed as extra process
+/// environment variables on every `docker compose` invocation (see
+/// [`Z3Stack::run_compose`]) — Compose's own variable-interpolation
+/// precedence puts the invoking process's environment above `--env-file`, so
+/// this takes effect without ever rewriting the shared `.env.regtest` file.
+/// That matters because `.env.regtest` lives in the single, shared
+/// `external/z3` checkout: two environments (e.g. a stable run and a
+/// concurrent `--fresh-env` one) mutating the same file would race, but each
+/// has its own independent process environment.
+///
+/// Covers every host port `docker compose config` actually publishes for the
+/// regtest stack — confirmed against its resolved output, not just the ports
+/// referenced elsewhere in this codebase by name: two of the six
+/// (`Z3_ZAINO_HOST_GRPC_PORT`, `Z3_ZEBRA_HOST_HEALTH_PORT`) have no other
+/// caller and are easy to miss, and a missing entry here means two
+/// environments collide on that specific host port with no error until
+/// `docker compose up` fails to bind it.
+fn compose_env_overrides(
+    ports: &env_id::PortSet,
+    subnet: &env_id::SubnetAssignment,
+) -> Vec<(String, String)> {
+    vec![
+        (
+            "Z3_ZEBRA_HOST_RPC_PORT".to_string(),
+            ports.zebra_rpc.to_string(),
+        ),
+        (
+            "Z3_ZEBRA_HOST_HEALTH_PORT".to_string(),
+            ports.zebra_health.to_string(),
+        ),
+        (
+            "Z3_ZAINO_HOST_GRPC_PORT".to_string(),
+            ports.zaino_grpc.to_string(),
+        ),
+        (
+            "Z3_ZAINO_HOST_JSON_RPC_PORT".to_string(),
+            ports.zaino_json_rpc.to_string(),
+        ),
+        (
+            "Z3_ZALLET_HOST_RPC_PORT".to_string(),
+            ports.zallet_rpc.to_string(),
+        ),
+        (
+            "Z3_REGTEST_RPC_ROUTER_HOST_PORT".to_string(),
+            ports.rpc_router.to_string(),
+        ),
+        ("Z3_SIM_SUBNET".to_string(), subnet.subnet.clone()),
+        ("Z3_SIM_ZAINO_IP".to_string(), subnet.zaino_ip.clone()),
+    ]
 }
 
 // ── Config ────────────────────────────────────────────────────────────────────
@@ -52,26 +109,59 @@ pub struct Z3Config {
     pub health_check_timeout_secs: u64,
     /// How often to poll `docker stats` for CPU/memory samples.
     pub resource_sample_interval_secs: u64,
+    /// Extra process environment variables passed on every `docker compose`
+    /// invocation — the per-`env_id` derived host ports and subnet/static IP
+    /// (see [`compose_env_overrides`]). Empty for [`Z3Config::from_contract`]
+    /// configs (mainnet/testnet), which have no env-id-based isolation.
+    pub compose_env_overrides: Vec<(String, String)>,
 }
 
 impl Z3Config {
-    /// Regtest defaults. Ports/credentials match the values in `z3-contract.yaml`;
-    /// prefer [`Z3Config::from_contract`] to derive them from the checked-out Z3
-    /// contract rather than relying on these constants.
-    pub fn for_run(run_id: &str, log_dir: PathBuf) -> Self {
-        Self {
-            compose_dir: PathBuf::from("external/z3"),
-            rpc_url: format!("http://{}:8181", rpc_host()),
+    /// Regtest defaults for a given environment identity (see
+    /// [`env_id::resolve_env_id`]). Ports/credentials match the values in
+    /// `z3-contract.yaml`; prefer [`Z3Config::from_contract`] to derive them
+    /// from the checked-out Z3 contract rather than relying on these
+    /// constants.
+    ///
+    /// `compose_project` is derived from `env_id` so two environments never
+    /// collide on Compose project, network, or volume names. `rpc_url` and
+    /// `compose_env_overrides` are both derived from the SAME `env_id`-keyed
+    /// port/subnet formulas (see `env_id::derive_ports`/`derive_subnet`), so
+    /// the host ports Docker actually binds and the port the simulator's own
+    /// RPC client connects to can never independently drift — one formula,
+    /// not two hardcoded values.
+    ///
+    /// `compose_dir` is a parameter (not hardcoded) so callers — in
+    /// particular tests exercising the surrounding setup/CLI logic without a
+    /// real `external/z3` checkout — can point it at a path that is
+    /// guaranteed not to exist, which [`Z3Config::check_preconditions`]
+    /// turns into a fast, side-effect-free failure before anything in this
+    /// module touches the filesystem or Docker.
+    ///
+    /// Errors only if `env_id` is not the well-formed id
+    /// [`env_id::resolve_env_id`] always produces.
+    pub fn for_run(
+        run_id: &str,
+        log_dir: PathBuf,
+        env_id: &str,
+        compose_dir: PathBuf,
+    ) -> Result<Self, Z3Error> {
+        let ports = env_id::derive_ports(env_id)?;
+        let subnet = env_id::derive_subnet(env_id)?;
+        Ok(Self {
+            compose_dir,
+            rpc_url: format!("http://{}:{}", rpc_host(), ports.rpc_router),
             basic_auth: Some((
                 DEFAULT_REGTEST_RPC_USER.into(),
                 DEFAULT_REGTEST_RPC_PASSWORD.into(),
             )),
-            compose_project: "z3-regtest".into(),
+            compose_project: compose_project_for_env(env_id),
             log_dir,
             run_id: run_id.into(),
             health_check_timeout_secs: 180,
             resource_sample_interval_secs: 5,
-        }
+            compose_env_overrides: compose_env_overrides(&ports, &subnet),
+        })
     }
 
     /// Build a config by reading `z3-contract.yaml` from the Z3 compose directory,
@@ -116,8 +206,141 @@ impl Z3Config {
             run_id: run_id.into(),
             health_check_timeout_secs: 180,
             resource_sample_interval_secs: 5,
+            compose_env_overrides: Vec::new(),
         })
     }
+
+    /// Cheap, side-effect-free check that `compose_dir` and its `.env.regtest`
+    /// exist, before anything else in this module touches the filesystem or
+    /// shells out to Docker. Deliberately callable on a bare `Z3Config` (not
+    /// just via [`Z3Stack::start`]) so [`Z3Config::ensure_wallet_bootstrapped`]
+    /// can run it first — that function mutates `.env.regtest` and runs real
+    /// bootstrap scripts, so it must never be reached for a `compose_dir` that
+    /// was never cloned/configured (a fresh checkout, CI, or a test pointed at
+    /// a deliberately nonexistent path).
+    pub fn check_preconditions(&self) -> Result<(), Z3Error> {
+        if !self.compose_dir.exists() {
+            return Err(Z3Error::ComposeDirNotFound(self.compose_dir.clone()));
+        }
+        let env = self.compose_dir.join(ENV_FILE);
+        if !env.exists() {
+            return Err(Z3Error::EnvFileNotFound(env));
+        }
+        Ok(())
+    }
+
+    /// Write this run's Compose project name and host ports into
+    /// `.env.regtest`, in place. Necessary because `regtest-init.sh` (sources
+    /// the file directly) and `regtest-miner-setup.sh` (greps it) predate
+    /// per-environment identity and read the file's own values rather than
+    /// accepting the `-p`/process-env overrides `Z3Stack`'s own `docker
+    /// compose` invocations use — without this, they always operate on
+    /// whatever project/ports the file's checked-in defaults name, never
+    /// this run's resolved `env_id`. Idempotent: replaces an existing `KEY=`
+    /// line in place, appends if missing. Skips `Z3_SIM_SUBNET`/
+    /// `Z3_SIM_ZAINO_IP` — neither script reads them; the transient
+    /// containers `regtest-init.sh` itself may briefly start get the correct
+    /// subnet from `compose_env_overrides`, passed as process env alongside
+    /// it (see [`Z3Config::ensure_wallet_bootstrapped`]).
+    fn sync_bootstrap_env_file(&self) -> Result<(), Z3Error> {
+        let env_file = self.compose_dir.join(ENV_FILE);
+        let contents = std::fs::read_to_string(&env_file)
+            .map_err(|_| Z3Error::EnvFileNotFound(env_file.clone()))?;
+
+        let mut pairs = vec![(
+            "COMPOSE_PROJECT_NAME".to_string(),
+            self.compose_project.clone(),
+        )];
+        pairs.extend(
+            self.compose_env_overrides
+                .iter()
+                .filter(|(k, _)| k != "Z3_SIM_SUBNET" && k != "Z3_SIM_ZAINO_IP")
+                .cloned(),
+        );
+
+        let mut lines: Vec<String> = contents.lines().map(str::to_string).collect();
+        for (key, value) in &pairs {
+            let prefix = format!("{key}=");
+            match lines.iter_mut().find(|l| l.starts_with(&prefix)) {
+                Some(line) => *line = format!("{key}={value}"),
+                None => lines.push(format!("{key}={value}")),
+            }
+        }
+        let mut new_contents = lines.join("\n");
+        new_contents.push('\n');
+        std::fs::write(&env_file, new_contents).map_err(Z3Error::EnvFileSync)
+    }
+
+    /// Ensure this run's Compose project has an initialized wallet before
+    /// `Z3Stack::start()` brings it up. A freshly-derived `env_id` names a
+    /// brand-new, empty Compose project — nothing else in this module's
+    /// environment-identity wiring initializes its wallet, since that is
+    /// `regtest-init.sh`'s (mnemonic + `hot_wallet` account) and
+    /// `regtest-miner-setup.sh`'s (miner address) job, and neither script
+    /// can be pointed at a specific project via `-p`/process-env alone (see
+    /// [`Z3Config::sync_bootstrap_env_file`]). Both scripts are already
+    /// idempotent (`regtest-init.sh` checks the target volume for an
+    /// existing wallet before doing anything; `regtest-miner-setup.sh`
+    /// checks whether the miner address is still the shipped placeholder),
+    /// so this is cheap on every call after the first for a given `env_id`.
+    ///
+    /// This and the two scripts it runs all read/write the single
+    /// `.env.regtest` shared by every environment on this checkout, so the
+    /// write-then-run-scripts sequence below is serialized across
+    /// environments via [`run_lock::acquire_bootstrap_lock`] — otherwise a
+    /// `--fresh-env` run bootstrapping concurrently with another run's own
+    /// first-ever bootstrap could interleave writes to that file and end up
+    /// creating its Docker resources under the OTHER environment's project
+    /// name. The lock is held only for this function's duration, not the
+    /// whole run, so it costs at most a short wait once per environment.
+    pub async fn ensure_wallet_bootstrapped(&self) -> Result<(), Z3Error> {
+        self.check_preconditions()?;
+
+        // `File::lock` blocks the calling thread until acquired; run it on a
+        // blocking-pool thread so it never stalls the async runtime.
+        let compose_dir = self.compose_dir.clone();
+        let _bootstrap_lock =
+            tokio::task::spawn_blocking(move || run_lock::acquire_bootstrap_lock(&compose_dir))
+                .await
+                .map_err(|e| Z3Error::RunLockIo(std::io::Error::other(e.to_string())))??;
+
+        self.sync_bootstrap_env_file()?;
+
+        let init_script = self.compose_dir.join("scripts").join("regtest-init.sh");
+        run_bootstrap_script(&init_script, &self.compose_env_overrides).await?;
+
+        let miner_setup_script = PathBuf::from("scripts/dev/regtest-miner-setup.sh");
+        run_bootstrap_script(&miner_setup_script, &self.compose_env_overrides).await?;
+
+        Ok(())
+    }
+}
+
+/// Run a bootstrap shell script (`regtest-init.sh`/`regtest-miner-setup.sh`)
+/// with `env_overrides` set on its process environment (inherited by any
+/// `docker compose` it shells out to internally), surfacing a non-zero exit
+/// or spawn failure as a descriptive [`Z3Error::BootstrapScript`].
+async fn run_bootstrap_script(
+    script: &Path,
+    env_overrides: &[(String, String)],
+) -> Result<(), Z3Error> {
+    let output = Command::new("bash")
+        .arg(script)
+        .envs(env_overrides.iter().cloned())
+        .output()
+        .await
+        .map_err(|e| Z3Error::BootstrapScript {
+            script: script.to_path_buf(),
+            stderr: e.to_string(),
+        })?;
+
+    if !output.status.success() {
+        return Err(Z3Error::BootstrapScript {
+            script: script.to_path_buf(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        });
+    }
+    Ok(())
 }
 
 // ── Error ─────────────────────────────────────────────────────────────────────
@@ -127,8 +350,41 @@ pub enum Z3Error {
     ComposeDirNotFound(PathBuf),
     EnvFileNotFound(PathBuf),
     LogDirCreate(std::io::Error),
-    ComposeCommand { args: String, stderr: String },
-    HealthCheckTimeout { after_secs: u64 },
+    ComposeCommand {
+        args: String,
+        stderr: String,
+    },
+    HealthCheckTimeout {
+        after_secs: u64,
+    },
+    /// Failed to read or write the cached environment id at
+    /// `configs/local/env-id` (see `env_id::resolve_env_id`).
+    EnvIdCacheIo(std::io::Error),
+    /// An `env_id` string did not match the expected 8-character lowercase
+    /// hex format.
+    InvalidEnvId(String),
+    /// Failed to open or create the per-`env_id` lock file itself (distinct
+    /// from `EnvironmentBusy`, which means the file opened fine but another
+    /// process already holds the lock).
+    RunLockIo(std::io::Error),
+    /// Another `z3sim run` already holds the advisory lock for this
+    /// environment. Stable `env_id`s are per-checkout, so two concurrent
+    /// invocations against the same checkout resolve the same one; use
+    /// `--fresh-env` to run a second, independent environment concurrently.
+    EnvironmentBusy {
+        env_id: String,
+        lock_path: PathBuf,
+    },
+    /// Failed to write the derived project name/ports into `.env.regtest`
+    /// (see [`Z3Config::sync_bootstrap_env_file`]).
+    EnvFileSync(std::io::Error),
+    /// `regtest-init.sh` or `regtest-miner-setup.sh` (see
+    /// [`Z3Config::ensure_wallet_bootstrapped`]) failed to spawn or exited
+    /// non-zero.
+    BootstrapScript {
+        script: PathBuf,
+        stderr: String,
+    },
 }
 
 impl std::fmt::Display for Z3Error {
@@ -153,6 +409,23 @@ impl std::fmt::Display for Z3Error {
                 "Z3 stack did not respond to getblockchaininfo within {}s",
                 after_secs
             ),
+            Z3Error::EnvIdCacheIo(e) => {
+                write!(f, "failed to read/write the environment id cache: {e}")
+            }
+            Z3Error::InvalidEnvId(id) => {
+                write!(f, "invalid environment id {id:?}: expected 8-character lowercase hex")
+            }
+            Z3Error::RunLockIo(e) => write!(f, "failed to open the environment lock file: {e}"),
+            Z3Error::EnvironmentBusy { env_id, lock_path } => write!(
+                f,
+                "environment {env_id} is already in use by another run (lock held at {}) — \
+                 pass --fresh-env to start an independent, non-colliding environment",
+                lock_path.display()
+            ),
+            Z3Error::EnvFileSync(e) => write!(f, "failed to update .env.regtest: {e}"),
+            Z3Error::BootstrapScript { script, stderr } => {
+                write!(f, "`{}` failed: {stderr}", script.display())
+            }
         }
     }
 }
@@ -202,22 +475,14 @@ impl Z3Stack {
     }
 
     fn check_preconditions(&self) -> Result<(), Z3Error> {
-        if !self.config.compose_dir.exists() {
-            return Err(Z3Error::ComposeDirNotFound(self.config.compose_dir.clone()));
-        }
-        let env = self.config.compose_dir.join(ENV_FILE);
-        if !env.exists() {
-            return Err(Z3Error::EnvFileNotFound(env));
-        }
-        Ok(())
+        self.config.check_preconditions()
     }
 
     async fn run_compose(&self, args: &[&str]) -> Result<(), Z3Error> {
+        let full_args = compose_base_args(&self.config.compose_project, args);
         let output = Command::new("docker")
-            .arg("compose")
-            .arg("--env-file")
-            .arg(ENV_FILE)
-            .args(args)
+            .args(&full_args)
+            .envs(self.config.compose_env_overrides.iter().cloned())
             .current_dir(&self.config.compose_dir)
             .output()
             .await
@@ -272,9 +537,11 @@ impl Z3Stack {
         for &service in SERVICES {
             let log_path = self.config.log_dir.join(format!("{}.log", service));
             let compose_dir = self.config.compose_dir.clone();
+            let project = self.config.compose_project.clone();
+            let env_overrides = self.config.compose_env_overrides.clone();
             let svc = service.to_string();
             self.background_tasks.push(tokio::spawn(async move {
-                capture_logs(&compose_dir, &svc, &log_path).await;
+                capture_logs(&compose_dir, &project, &env_overrides, &svc, &log_path).await;
             }));
         }
     }
@@ -299,6 +566,26 @@ impl Drop for Z3Stack {
 }
 
 // ── Free functions ────────────────────────────────────────────────────────────
+
+/// The `docker compose` argument list shared by every invocation this crate
+/// makes: the env file plus the `-p` project flag (which takes precedence
+/// over any `COMPOSE_PROJECT_NAME` value baked into `.env.regtest`, so the
+/// derived per-environment project name is authoritative regardless of
+/// whether `.env.regtest` was ever rewritten for it — see
+/// `env_id::compose_project_for_env`), followed by the operation-specific
+/// arguments. Split out as a pure function so tests can assert on the
+/// constructed argument list without invoking Docker.
+fn compose_base_args(project: &str, args: &[&str]) -> Vec<String> {
+    let mut full = vec![
+        "compose".to_string(),
+        "--env-file".to_string(),
+        ENV_FILE.to_string(),
+        "-p".to_string(),
+        project.to_string(),
+    ];
+    full.extend(args.iter().map(|s| s.to_string()));
+    full
+}
 
 async fn health_check(
     client: &reqwest::Client,
@@ -335,20 +622,22 @@ async fn health_check(
         .unwrap_or(false)
 }
 
-async fn capture_logs(compose_dir: &Path, service: &str, log_path: &Path) {
+async fn capture_logs(
+    compose_dir: &Path,
+    project: &str,
+    env_overrides: &[(String, String)],
+    service: &str,
+    log_path: &Path,
+) {
     let Ok(file) = tokio::fs::File::create(log_path).await else {
         return;
     };
     let mut writer = tokio::io::BufWriter::new(file);
 
+    let full_args = compose_base_args(project, &["logs", "--follow", "--no-log-prefix", service]);
     let Ok(mut child) = Command::new("docker")
-        .arg("compose")
-        .arg("--env-file")
-        .arg(ENV_FILE)
-        .arg("logs")
-        .arg("--follow")
-        .arg("--no-log-prefix")
-        .arg(service)
+        .args(&full_args)
+        .envs(env_overrides.iter().cloned())
         .current_dir(compose_dir)
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -505,7 +794,13 @@ mod tests {
 
     #[test]
     fn check_preconditions_missing_compose_dir() {
-        let mut config = Z3Config::for_run("test-run", PathBuf::from("/tmp/z3-test-logs"));
+        let mut config = Z3Config::for_run(
+            "test-run",
+            PathBuf::from("/tmp/z3-test-logs"),
+            "a1b2c3d4",
+            PathBuf::from("external/z3"),
+        )
+        .unwrap();
         config.compose_dir = PathBuf::from("/tmp/z3-nonexistent-compose-dir-test");
         let stack = Z3Stack::new(config, None);
         assert!(matches!(
@@ -518,18 +813,198 @@ mod tests {
 
     #[test]
     fn z3config_for_run_sets_correct_defaults() {
-        let cfg = Z3Config::for_run("run-42", PathBuf::from("/tmp/logs"));
+        let cfg = Z3Config::for_run(
+            "run-42",
+            PathBuf::from("/tmp/logs"),
+            "a1b2c3d4",
+            PathBuf::from("external/z3"),
+        )
+        .unwrap();
         assert_eq!(cfg.compose_dir, PathBuf::from("external/z3"));
-        assert_eq!(cfg.rpc_url, "http://127.0.0.1:8181");
+        // rpc_url's port must be the SAME value derived for
+        // Z3_REGTEST_RPC_ROUTER_HOST_PORT in compose_env_overrides below —
+        // one formula, not two independently-hardcoded ports (see
+        // Z3Config::for_run's doc comment).
+        assert_eq!(cfg.rpc_url, "http://127.0.0.1:8340");
         assert_eq!(
             cfg.basic_auth,
             Some(("zebra".to_string(), "zebra".to_string()))
         );
-        assert_eq!(cfg.compose_project, "z3-regtest");
+        assert_eq!(cfg.compose_project, "z3-sim-a1b2c3d4");
         assert_eq!(cfg.health_check_timeout_secs, 180);
         assert_eq!(cfg.resource_sample_interval_secs, 5);
         assert_eq!(cfg.run_id, "run-42");
         assert_eq!(cfg.log_dir, PathBuf::from("/tmp/logs"));
+        assert_eq!(
+            cfg.compose_env_overrides,
+            vec![
+                ("Z3_ZEBRA_HOST_RPC_PORT".to_string(), "38340".to_string()),
+                ("Z3_ZEBRA_HOST_HEALTH_PORT".to_string(), "48340".to_string()),
+                ("Z3_ZAINO_HOST_GRPC_PORT".to_string(), "18340".to_string()),
+                (
+                    "Z3_ZAINO_HOST_JSON_RPC_PORT".to_string(),
+                    "28340".to_string()
+                ),
+                ("Z3_ZALLET_HOST_RPC_PORT".to_string(), "58340".to_string()),
+                (
+                    "Z3_REGTEST_RPC_ROUTER_HOST_PORT".to_string(),
+                    "8340".to_string()
+                ),
+                ("Z3_SIM_SUBNET".to_string(), "10.195.0.0/24".to_string()),
+                ("Z3_SIM_ZAINO_IP".to_string(), "10.195.0.10".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn z3config_for_run_rejects_invalid_env_id() {
+        assert!(matches!(
+            Z3Config::for_run(
+                "run-1",
+                PathBuf::from("/tmp/logs"),
+                "not-hex!",
+                PathBuf::from("external/z3"),
+            ),
+            Err(Z3Error::InvalidEnvId(_))
+        ));
+    }
+
+    #[test]
+    fn z3config_for_run_differs_by_env_id() {
+        // Two distinct env_ids must never resolve to the same host ports,
+        // subnet, or Compose project — the actual isolation guarantee this
+        // track exists to provide, not merely distinct in-memory labels.
+        let a = Z3Config::for_run(
+            "run-1",
+            PathBuf::from("/tmp/logs"),
+            "a1b2c3d4",
+            PathBuf::from("external/z3"),
+        )
+        .unwrap();
+        let b = Z3Config::for_run(
+            "run-1",
+            PathBuf::from("/tmp/logs"),
+            "00000001",
+            PathBuf::from("external/z3"),
+        )
+        .unwrap();
+        assert_ne!(a.compose_project, b.compose_project);
+        assert_ne!(a.rpc_url, b.rpc_url);
+        assert_ne!(a.compose_env_overrides, b.compose_env_overrides);
+    }
+
+    #[test]
+    fn sync_bootstrap_env_file_replaces_existing_and_appends_missing_keys() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join(".env.regtest"),
+            "COMPOSE_PROJECT_NAME=z3-regtest\nZ3_ZEBRA_IMAGE=foo\n",
+        )
+        .unwrap();
+
+        let config = Z3Config::for_run(
+            "run-1",
+            PathBuf::from("/tmp/logs"),
+            "a1b2c3d4",
+            dir.path().to_path_buf(),
+        )
+        .unwrap();
+        config.sync_bootstrap_env_file().unwrap();
+
+        let contents = std::fs::read_to_string(dir.path().join(".env.regtest")).unwrap();
+        // Existing key replaced in place, not duplicated.
+        assert_eq!(
+            contents.matches("COMPOSE_PROJECT_NAME=").count(),
+            1,
+            "{contents}"
+        );
+        assert!(contents.contains("COMPOSE_PROJECT_NAME=z3-sim-a1b2c3d4"));
+        // Matches the same derivation z3config_for_run_sets_correct_defaults
+        // asserts for this env_id.
+        assert!(contents.contains("Z3_ZEBRA_HOST_RPC_PORT=38340"));
+        assert!(contents.contains("Z3_ZEBRA_HOST_HEALTH_PORT=48340"));
+        assert!(contents.contains("Z3_ZAINO_HOST_GRPC_PORT=18340"));
+        assert!(contents.contains("Z3_ZAINO_HOST_JSON_RPC_PORT=28340"));
+        assert!(contents.contains("Z3_ZALLET_HOST_RPC_PORT=58340"));
+        assert!(contents.contains("Z3_REGTEST_RPC_ROUTER_HOST_PORT=8340"));
+        // Untouched line preserved.
+        assert!(contents.contains("Z3_ZEBRA_IMAGE=foo"));
+        // Not written — neither regtest-init.sh nor regtest-miner-setup.sh
+        // reads these; only docker compose interpolation needs them, and
+        // that's already covered by compose_env_overrides / process env.
+        assert!(!contents.contains("Z3_SIM_SUBNET"));
+        assert!(!contents.contains("Z3_SIM_ZAINO_IP"));
+    }
+
+    #[test]
+    fn sync_bootstrap_env_file_errors_when_env_file_missing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let config = Z3Config::for_run(
+            "run-1",
+            PathBuf::from("/tmp/logs"),
+            "a1b2c3d4",
+            dir.path().to_path_buf(),
+        )
+        .unwrap();
+        assert!(matches!(
+            config.sync_bootstrap_env_file(),
+            Err(Z3Error::EnvFileNotFound(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn run_bootstrap_script_surfaces_nonzero_exit_and_stderr() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let script = dir.path().join("fail.sh");
+        std::fs::write(&script, "#!/usr/bin/env bash\necho boom >&2\nexit 1\n").unwrap();
+
+        let err = run_bootstrap_script(&script, &[]).await.unwrap_err();
+        match err {
+            Z3Error::BootstrapScript { script: s, stderr } => {
+                assert_eq!(s, script);
+                assert!(stderr.contains("boom"), "{stderr}");
+            }
+            other => panic!("expected BootstrapScript, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn run_bootstrap_script_passes_env_overrides_through() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let script = dir.path().join("echo_env.sh");
+        let out_file = dir.path().join("out.txt");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/usr/bin/env bash\necho \"$MY_TEST_VAR\" > {}\n",
+                out_file.display()
+            ),
+        )
+        .unwrap();
+
+        run_bootstrap_script(&script, &[("MY_TEST_VAR".to_string(), "hello".to_string())])
+            .await
+            .unwrap();
+
+        assert_eq!(std::fs::read_to_string(&out_file).unwrap().trim(), "hello");
+    }
+
+    #[test]
+    fn compose_base_args_passes_project_name_flag_for_every_call() {
+        // Covers run_compose (up/down/etc.) and capture_logs (logs
+        // --follow), which both build their Command from this helper — a
+        // regression guard on the project-name wiring without invoking Docker.
+        for args in [
+            &["up", "-d"][..],
+            &["down"][..],
+            &["logs", "--follow", "--no-log-prefix", "zebra"][..],
+        ] {
+            let full = compose_base_args("z3-sim-deadbeef", args);
+            let p_pos = full.iter().position(|a| a == "-p").expect("-p missing");
+            assert_eq!(full[p_pos + 1], "z3-sim-deadbeef");
+            let expected_tail: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+            assert!(full.ends_with(&expected_tail));
+        }
     }
 
     #[test]
@@ -572,6 +1047,8 @@ networks:
             cfg.basic_auth,
             Some(("zebra".to_string(), "zebra".to_string()))
         );
+        // Contract-driven configs have no env_id-based isolation.
+        assert!(cfg.compose_env_overrides.is_empty());
     }
 
     // ── Z3Error Display ───────────────────────────────────────────────────────
@@ -653,6 +1130,7 @@ networks:
             run_id: "t".into(),
             health_check_timeout_secs: 180,
             resource_sample_interval_secs: 5,
+            compose_env_overrides: Vec::new(),
         };
         let stack = Z3Stack::new(config, None);
         assert!(matches!(
@@ -674,6 +1152,7 @@ networks:
             run_id: "t".into(),
             health_check_timeout_secs: 180,
             resource_sample_interval_secs: 5,
+            compose_env_overrides: Vec::new(),
         };
         let stack = Z3Stack::new(config, None);
         assert!(stack.check_preconditions().is_ok());
@@ -692,6 +1171,19 @@ networks:
             "z3-regtest-rpc-router-1",
             "z3-regtest"
         ));
+    }
+
+    #[test]
+    fn container_in_project_matches_derived_env_id_project_names() {
+        // The docker-stats sampler is scoped by `self.config.compose_project`
+        // (see `spawn_resource_sampling`), which for a regtest run is now
+        // `compose_project_for_env(env_id)` (`z3-sim-<env_id>`), not the old
+        // literal `z3-regtest` — this function's prefix-match logic must work
+        // identically for that generated name.
+        let project = compose_project_for_env("a1b2c3d4");
+        assert!(container_in_project("z3-sim-a1b2c3d4-zebra-1", &project));
+        assert!(container_in_project("z3-sim-a1b2c3d4-zallet-1", &project));
+        assert!(!container_in_project("z3-sim-00000000-zebra-1", &project));
     }
 
     #[test]

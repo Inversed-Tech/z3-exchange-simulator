@@ -15,7 +15,8 @@ use crate::scenarios::runner::funding::{self, FundedAccount, ANCHOR_CONFIRMATION
 use crate::scenarios::runner::provisioner::{provision, ProvisionedPopulation};
 use crate::scenarios::runner::RunOptions;
 use crate::scenarios::runner::RunnerError;
-use crate::z3::{Z3Config, Z3Stack};
+use crate::z3::run_lock::{self, RunLock};
+use crate::z3::{env_id, Z3Config, Z3Stack};
 
 /// Confirmations a coinbase output needs before it may be spent. Consensus, and
 /// identical on regtest — regtest waives the rule that transparent coinbase must
@@ -42,6 +43,9 @@ pub struct SetupState {
     pub provisioned: ProvisionedPopulation,
     pub hot_wallet_uuid: String,
     pub hot_wallet_address: String,
+    /// Held for the lifetime of the run (see `run_lock::acquire`) — the
+    /// field is never read directly, only kept alive by the caller.
+    pub run_lock: RunLock,
 }
 
 // ── setup ─────────────────────────────────────────────────────────────────────
@@ -54,13 +58,46 @@ pub async fn setup(
     run_dir: &RunDir,
     metrics: Arc<dyn MetricsRecorder>,
 ) -> Result<SetupState, RunnerError> {
-    // 1. Build Z3 config using the run_dir-managed component log directory.
-    //    RunDir::create() already created this directory.
-    let z3_config = Z3Config::for_run(run_id, run_dir.component_logs_dir());
+    // 1. Resolve this checkout's environment identity and acquire the
+    //    per-env_id concurrency lock BEFORE touching Docker: a stable env_id
+    //    (the default) means two concurrent invocations against the same
+    //    checkout would otherwise resolve the identical Compose project,
+    //    ports, and subnet and collide with each other. Then build the Z3
+    //    config from that identity, using the run_dir-managed component log
+    //    directory (RunDir::create() already created this directory).
+    let resolved_env_id = env_id::resolve_env_id(&opts.env_id_cache_path, opts.fresh_env)
+        .map_err(|e| RunnerError::Setup(format!("failed to resolve environment id: {e}")))?;
+    let run_lock = run_lock::acquire(&resolved_env_id, &opts.run_lock_dir)
+        .map_err(|e| RunnerError::Setup(e.to_string()))?;
+    let z3_config = Z3Config::for_run(
+        run_id,
+        run_dir.component_logs_dir(),
+        &resolved_env_id,
+        opts.compose_dir.clone(),
+    )
+    .map_err(|e| RunnerError::Setup(format!("failed to derive environment config: {e}")))?;
     let rpc_url = z3_config.rpc_url.clone();
     let basic_auth = z3_config.basic_auth.clone();
 
-    // 2. Start the Z3 stack. On failure, stop it before returning: `start()` may
+    // 2. Ensure THIS run's env_id-derived Compose project has an initialized
+    //    wallet before starting it: a freshly-resolved env_id names a
+    //    brand-new, empty project that regtest-init.sh/regtest-miner-setup.sh
+    //    (the scripts that actually create the wallet mnemonic and hot_wallet
+    //    account, and point Zebra's coinbase at it) have never touched, since
+    //    neither script is otherwise aware of env_id. Idempotent — cheap on
+    //    every call after the first for a given env_id. Checks
+    //    compose_dir/.env.regtest exist FIRST (before touching anything) and
+    //    fails fast if not — critical on a machine that happens to already
+    //    have a real external/z3 checkout configured for something else:
+    //    this must never silently mutate it or run real bootstrap scripts
+    //    against it just because a caller (e.g. a CLI-dispatch unit test)
+    //    didn't intend to reach a real stack at all.
+    z3_config
+        .ensure_wallet_bootstrapped()
+        .await
+        .map_err(|e| RunnerError::Setup(format!("failed to bootstrap the wallet: {e}")))?;
+
+    // 3. Start the Z3 stack. On failure, stop it before returning: `start()` may
     //    have brought some containers up before erroring, and dropping the stack
     //    does not tear them down — leaving them running would leak the stack.
     let mut stack = Z3Stack::new(z3_config, Some(metrics.clone()));
@@ -69,7 +106,7 @@ pub async fn setup(
         return Err(RunnerError::Setup(e.to_string()));
     }
 
-    // 3. Build the RPC client.
+    // 4. Build the RPC client.
     let rpc = {
         let client = RpcClient::new(&rpc_url, run_id, Some(metrics.clone()), None);
         if let Some((user, pass)) = basic_auth {
@@ -80,7 +117,7 @@ pub async fn setup(
     };
     let rpc = Arc::new(rpc);
 
-    // 4. Resolve the hot wallet account BEFORE mining warmup blocks. Zallet
+    // 5. Resolve the hot wallet account BEFORE mining warmup blocks. Zallet
     //    tracks coinbase payments by scanning blocks for known account
     //    addresses; if the account were only created after mining, Zallet would
     //    set its birthday at the current tip and miss all prior coinbase.
@@ -122,14 +159,14 @@ pub async fn setup(
     };
     let hot_wallet_uuid = hot_wallet.uuid.clone();
 
-    // 5. Warmup: mine blocks before provisioning. The hot wallet account was
+    // 6. Warmup: mine blocks before provisioning. The hot wallet account was
     //    created above so Zallet will credit coinbase outputs as blocks arrive.
     if let Err(e) = warmup(&rpc, scenario, run_id, metrics.clone(), &hot_wallet_uuid).await {
         let _ = stack.stop().await;
         return Err(e);
     }
 
-    // 6. Provision the synthetic population (pass the already-resolved hot
+    // 7. Provision the synthetic population (pass the already-resolved hot
     //    wallet UUID so provisioner skips its own z_list_accounts call).
     let provisioned = match provision(
         rpc.clone(),
@@ -148,7 +185,7 @@ pub async fn setup(
         }
     };
 
-    // 7. Fund the active accounts from the hot wallet, in both pools, with one
+    // 8. Fund the active accounts from the hot wallet, in both pools, with one
     //    fan-out transaction. Without this, every intent whose SOURCE is a
     //    synthetic account (all four flow types after the per-flow rework in
     //    dispatch.rs) fails with "Insufficient balance" — the exact 0%-confirmed
@@ -163,8 +200,8 @@ pub async fn setup(
         )));
     }
 
-    // 8. The `from` for hot-wallet-sourced z_sendmany calls is the account's
-    //    creation-time UA, resolved (not derived) in step 4. A UA source draws
+    // 9. The `from` for hot-wallet-sourced z_sendmany calls is the account's
+    //    creation-time UA, resolved (not derived) in step 5. A UA source draws
     //    the account's shielded funds, which is what the hot wallet holds after
     //    warmup (orchard coinbase) or shielding (transparent coinbase).
     let hot_wallet_address = hot_wallet.address.clone();
@@ -175,6 +212,7 @@ pub async fn setup(
         provisioned,
         hot_wallet_uuid,
         hot_wallet_address,
+        run_lock,
     })
 }
 

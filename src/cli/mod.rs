@@ -98,6 +98,28 @@ pub struct RunArgs {
     /// Reuse an existing Zallet hot wallet from a prior run
     #[arg(long)]
     pub hot_wallet_uuid: Option<String>,
+    /// Discard this checkout's cached environment id and start a fresh,
+    /// disposable environment (distinct Compose project, ports, and subnet)
+    /// instead of reusing the stable, per-checkout one
+    #[arg(long)]
+    pub fresh_env: bool,
+    /// Test-only overrides for `RunOptions::{compose_dir, env_id_cache_path,
+    /// run_lock_dir}` — never real CLI flags (`#[arg(skip)]`, so no such
+    /// flags exist and these are always `None` for anything parsed from the
+    /// actual command line). Let a unit test exercising this dispatch path
+    /// fully sandbox where `setup()` reads/writes: `compose_dir` pointed at
+    /// a path guaranteed not to exist fails fast (see
+    /// `z3::Z3Config::check_preconditions`) instead of reaching a real
+    /// `external/z3` checkout and real Docker/bootstrap-script state that
+    /// might happen to already be configured on the machine running tests;
+    /// `env_id_cache_path`/`run_lock_dir` pointed at a tempdir keep the same
+    /// test from writing into the real checkout's `configs/local/`.
+    #[arg(skip)]
+    pub compose_dir: Option<PathBuf>,
+    #[arg(skip)]
+    pub env_id_cache_path: Option<PathBuf>,
+    #[arg(skip)]
+    pub run_lock_dir: Option<PathBuf>,
 }
 
 #[derive(clap::Args)]
@@ -251,7 +273,12 @@ fn report_command(args: &ReportArgs) -> Result<(), CliError> {
     let runs = load_runs(&args.runs).map_err(CliError::Report)?;
 
     let assets_dir = {
-        let stem = args.out.file_stem().unwrap_or_default().to_string_lossy().into_owned();
+        let stem = args
+            .out
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
         let dir_name = format!("{stem}_assets");
         match args.out.parent() {
             Some(parent) if !parent.as_os_str().is_empty() => parent.join(dir_name),
@@ -329,6 +356,21 @@ fn generate_fixtures_command(args: &GenerateFixturesArgs) -> Result<(), CliError
 
 // ── run_command ───────────────────────────────────────────────────────────────
 
+/// Apply `RunArgs`'s test-only path overrides (see their doc comments) onto
+/// `opts`, if set. A no-op for anything parsed from the real command line,
+/// since clap's `#[arg(skip)]` never populates these from `--flag` input.
+fn apply_test_path_overrides(opts: &mut RunOptions, args: &RunArgs) {
+    if let Some(dir) = &args.compose_dir {
+        opts.compose_dir = dir.clone();
+    }
+    if let Some(path) = &args.env_id_cache_path {
+        opts.env_id_cache_path = path.clone();
+    }
+    if let Some(dir) = &args.run_lock_dir {
+        opts.run_lock_dir = dir.clone();
+    }
+}
+
 async fn run_command(
     args: RunArgs,
     cancel_override: Option<CancellationToken>,
@@ -340,7 +382,7 @@ async fn run_command(
     let load_shape = build_load_shape(&args)?;
 
     if args.dry_run {
-        let opts = RunOptions {
+        let mut opts = RunOptions {
             output_base: args.output_base.clone(),
             load_shape,
             max_in_flight: args.max_in_flight,
@@ -348,8 +390,10 @@ async fn run_command(
             dry_run: true,
             hot_wallet_uuid: args.hot_wallet_uuid.clone(),
             cancel: None,
+            fresh_env: args.fresh_env,
             ..RunOptions::default() // covers polling: None only
         };
+        apply_test_path_overrides(&mut opts, &args);
         runner_run(config, opts).await.map_err(CliError::Run)?;
         return Ok(());
     }
@@ -368,7 +412,7 @@ async fn run_command(
 
     eprintln!("Starting run — press Ctrl-C to interrupt");
 
-    let opts = RunOptions {
+    let mut opts = RunOptions {
         output_base: args.output_base.clone(),
         load_shape,
         max_in_flight: args.max_in_flight,
@@ -376,8 +420,10 @@ async fn run_command(
         dry_run: false,
         hot_wallet_uuid: args.hot_wallet_uuid.clone(),
         cancel: Some(token.clone()),
+        fresh_env: args.fresh_env,
         ..RunOptions::default() // covers polling: None only
     };
+    apply_test_path_overrides(&mut opts, &args);
     let result = runner_run(config, opts).await;
     ctrl_c_handle.abort();
 
@@ -467,10 +513,25 @@ observability:
             provision_concurrency: 8,
             output_base,
             hot_wallet_uuid: None,
+            fresh_env: false,
+            compose_dir: None,
+            env_id_cache_path: None,
+            run_lock_dir: None,
         }
     }
 
+    /// `RunArgs` for tests that exercise the live (non-dry-run) `run_command`
+    /// path. Fully sandboxed against the real checkout: `compose_dir` is
+    /// pinned to a path guaranteed not to exist (must never reach a real
+    /// `external/z3` checkout or touch real Docker/bootstrap-script state,
+    /// regardless of what happens to be configured on the machine running
+    /// the tests — see `z3::Z3Config::check_preconditions`), and
+    /// `env_id_cache_path`/`run_lock_dir` are pinned inside `output_base`
+    /// (the caller's own tempdir) so this never reads or writes the real
+    /// checkout's `configs/local/` either.
     fn live_run_args(scenario: PathBuf, output_base: PathBuf) -> RunArgs {
+        let env_id_cache_path = Some(output_base.join("env-id"));
+        let run_lock_dir = Some(output_base.clone());
         RunArgs {
             scenario,
             dry_run: false,
@@ -483,6 +544,12 @@ observability:
             provision_concurrency: 8,
             output_base,
             hot_wallet_uuid: None,
+            fresh_env: false,
+            compose_dir: Some(PathBuf::from(
+                "target/nonexistent-external-z3-for-tests-do-not-create",
+            )),
+            env_id_cache_path,
+            run_lock_dir,
         }
     }
 
@@ -673,6 +740,10 @@ observability:
             provision_concurrency: 8,
             output_base: PathBuf::from("experiments/runs"),
             hot_wallet_uuid: None,
+            fresh_env: false,
+            compose_dir: None,
+            env_id_cache_path: None,
+            run_lock_dir: None,
         };
         let err = build_load_shape(&args).unwrap_err();
         assert!(
