@@ -127,6 +127,8 @@ mod tests {
             scenario_config_hash: "sha256:x".into(),
             target_tps: 1.0,
             timeouts: RunTimeouts::default(),
+            phase_boundaries: Vec::new(),
+            load_and_drain_completed_at: None,
         };
         std::fs::write(
             dir.join("manifest.json"),
@@ -146,6 +148,7 @@ mod tests {
             success: true,
             error_code: None,
             error_message: None,
+            phase: crate::data_model::Phase::Unknown,
         };
         std::fs::write(
             dir.join("rpc_calls.jsonl"),

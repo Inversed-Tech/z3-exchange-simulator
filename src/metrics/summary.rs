@@ -21,7 +21,8 @@ struct MetricAgg {
     failed_total: f64,
     saturation_events: u64,
     proving_ms: Vec<u64>,
-    tps_achieved: Option<f64>,
+    scheduled_dispatch_rate: Option<f64>,
+    confirmed_tx_throughput: Option<f64>,
 }
 
 #[derive(Default)]
@@ -47,8 +48,72 @@ fn timeout_stage(context: &str) -> &'static str {
     }
 }
 
+/// Accumulates one `RpcCall` into `aggs`, keyed by `(method, backend)`. Shared
+/// by the workload-scoped and setup-scoped accumulation passes in
+/// `generate_summary` so the two can never drift on how a row is built.
+fn accumulate_rpc_call(aggs: &mut HashMap<(String, String), RpcCallAgg>, call: &RpcCall) {
+    let backend_str = format!("{:?}", call.backend);
+    let agg = aggs
+        .entry((call.method.clone(), backend_str))
+        .or_insert_with(|| RpcCallAgg {
+            count: 0,
+            success_count: 0,
+            latencies: vec![],
+            error_counts: HashMap::new(),
+        });
+    agg.count += 1;
+    if call.success {
+        agg.success_count += 1;
+    }
+    if let Some(ms) = call.latency_ms {
+        agg.latencies.push(ms);
+    }
+    if let Some(code) = call.error_code {
+        *agg.error_counts.entry(code).or_default() += 1;
+    }
+}
+
+/// Renders one `| Method | Backend | P50 ms | P95 ms | P99 ms | Calls | Errors |`
+/// table from `aggs`, sorted by `(method, backend)`. Shared by the
+/// workload-scoped and setup-scoped sections in `generate_summary`.
+fn render_rpc_agg_table(aggs: &HashMap<(String, String), RpcCallAgg>, md: &mut String) {
+    md.push_str("| Method | Backend | P50 ms | P95 ms | P99 ms | Calls | Errors |\n");
+    md.push_str("|---|---|---|---|---|---|---|\n");
+
+    let mut agg_entries: Vec<_> = aggs.iter().collect();
+    agg_entries.sort_by(|a, b| a.0.cmp(b.0));
+
+    for ((method, backend), agg) in &agg_entries {
+        let error_count = agg.count - agg.success_count;
+        let mut latencies = agg.latencies.clone();
+        let (p50_str, p95_str, p99_str) = if latencies.is_empty() {
+            ("N/A".to_string(), "N/A".to_string(), "N/A".to_string())
+        } else {
+            latencies.sort_unstable();
+            (
+                format!("{:.0}", percentile_value(&latencies, 0.50)),
+                format!("{:.0}", percentile_value(&latencies, 0.95)),
+                format!("{:.0}", percentile_value(&latencies, 0.99)),
+            )
+        };
+        md.push_str(&format!(
+            "| {method} | {backend} | {p50_str} | {p95_str} | {p99_str} | {} | {error_count} |\n",
+            agg.count
+        ));
+    }
+    md.push('\n');
+}
+
 pub fn generate_summary(run_dir: &RunDir, manifest: &RunManifest) -> Result<String, MetricsError> {
-    let mut rpc_aggs: HashMap<(String, String), RpcCallAgg> = HashMap::new();
+    // Scoped the same way `report::rpc_matrix::build_matrix` scopes the
+    // aggregate findings report: the headline table reflects the measured
+    // workload (Load/Drain) only, so a setup-phase retry (funding fan-out,
+    // warmup mining) can never inflate a per-method failure count here the
+    // way it did before phase tagging existed. Setup-phase activity is kept,
+    // not discarded — shown in its own table below instead.
+    let mut workload_aggs: HashMap<(String, String), RpcCallAgg> = HashMap::new();
+    let mut setup_aggs: HashMap<(String, String), RpcCallAgg> = HashMap::new();
+    let mut unknown_phase_calls: u64 = 0;
 
     let rpc_path = run_dir.rpc_calls_path();
     if rpc_path.exists() {
@@ -60,24 +125,15 @@ pub fn generate_summary(run_dir: &RunDir, manifest: &RunManifest) -> Result<Stri
             }
             match serde_json::from_str::<RpcCall>(&line) {
                 Ok(call) => {
-                    let backend_str = format!("{:?}", call.backend);
-                    let agg = rpc_aggs
-                        .entry((call.method.clone(), backend_str))
-                        .or_insert_with(|| RpcCallAgg {
-                            count: 0,
-                            success_count: 0,
-                            latencies: vec![],
-                            error_counts: HashMap::new(),
-                        });
-                    agg.count += 1;
-                    if call.success {
-                        agg.success_count += 1;
-                    }
-                    if let Some(ms) = call.latency_ms {
-                        agg.latencies.push(ms);
-                    }
-                    if let Some(code) = call.error_code {
-                        *agg.error_counts.entry(code).or_default() += 1;
+                    if call.phase.is_workload() {
+                        accumulate_rpc_call(&mut workload_aggs, &call);
+                    } else if call.phase.is_setup() {
+                        accumulate_rpc_call(&mut setup_aggs, &call);
+                    } else {
+                        // Phase::Unknown — a run predating phase tagging.
+                        // Excluded from both tables rather than assumed to
+                        // be either, same as the aggregate findings report.
+                        unknown_phase_calls += 1;
                     }
                 }
                 Err(e) => eprintln!("[metrics] summary: malformed rpc_calls line: {e}"),
@@ -91,7 +147,8 @@ pub fn generate_summary(run_dir: &RunDir, manifest: &RunManifest) -> Result<Stri
         failed_total: 0.0,
         saturation_events: 0,
         proving_ms: vec![],
-        tps_achieved: None,
+        scheduled_dispatch_rate: None,
+        confirmed_tx_throughput: None,
     };
 
     let metrics_path = run_dir.metrics_path();
@@ -119,7 +176,8 @@ pub fn generate_summary(run_dir: &RunDir, manifest: &RunManifest) -> Result<Stri
                     "withdrawal_proving_time_ms" => {
                         magg.proving_ms.push(sample.value as u64);
                     }
-                    "tps_achieved" => magg.tps_achieved = Some(sample.value),
+                    "scheduled_dispatch_rate" => magg.scheduled_dispatch_rate = Some(sample.value),
+                    "confirmed_tx_throughput" => magg.confirmed_tx_throughput = Some(sample.value),
                     _ => {}
                 },
                 Err(e) => eprintln!("[metrics] summary: malformed metrics line: {e}"),
@@ -182,7 +240,11 @@ pub fn generate_summary(run_dir: &RunDir, manifest: &RunManifest) -> Result<Stri
         (0.0, 0.0)
     };
 
-    let achieved_tps_str = match magg.tps_achieved {
+    let dispatch_rate_str = match magg.scheduled_dispatch_rate {
+        Some(v) => format!("{v:.1}"),
+        None => "N/A".to_string(),
+    };
+    let confirmed_throughput_str = match magg.confirmed_tx_throughput {
         Some(v) => format!("{v:.1}"),
         None => "N/A".to_string(),
     };
@@ -208,8 +270,17 @@ pub fn generate_summary(run_dir: &RunDir, manifest: &RunManifest) -> Result<Stri
     ));
 
     md.push_str("## Load results\n");
-    md.push_str(&format!("- Target TPS: {}\n", manifest.target_tps));
-    md.push_str(&format!("- Achieved TPS: {achieved_tps_str}\n"));
+    md.push_str(&format!(
+        "- Target dispatch rate: {} intents/s\n",
+        manifest.target_tps
+    ));
+    md.push_str(&format!(
+        "- Scheduled dispatch rate: {dispatch_rate_str} intents/s (actual load-phase elapsed \
+         time, not the configured duration)\n"
+    ));
+    md.push_str(&format!(
+        "- Confirmed tx throughput (TPS): {confirmed_throughput_str}\n"
+    ));
     md.push_str(&format!(
         "- Total transactions attempted: {}\n",
         total_attempted as u64
@@ -224,31 +295,30 @@ pub fn generate_summary(run_dir: &RunDir, manifest: &RunManifest) -> Result<Stri
     ));
 
     md.push_str("## RPC latency (P50 / P95 / P99)\n");
-    md.push_str("| Method | Backend | P50 ms | P95 ms | P99 ms | Calls | Errors |\n");
-    md.push_str("|---|---|---|---|---|---|---|\n");
+    md.push_str(
+        "Scoped to the measured workload (Load/Drain phase calls) — setup-phase activity \
+         (bootstrap, warmup mining, funding fan-out, including its own retries) is shown \
+         separately below and never mixed into this table's Calls/Errors counts.\n",
+    );
+    render_rpc_agg_table(&workload_aggs, &mut md);
 
-    let mut agg_entries: Vec<_> = rpc_aggs.iter().collect();
-    agg_entries.sort_by(|a, b| a.0.cmp(b.0));
+    if !setup_aggs.is_empty() {
+        md.push_str("## Setup-phase RPC activity\n");
+        md.push_str(
+            "Informational — RPC activity before the measured workload began (stack bootstrap, \
+             hot-wallet readiness, warmup mining, the funding fan-out and its own \
+             anchor-confirmation retries). Not part of the workload table above.\n",
+        );
+        render_rpc_agg_table(&setup_aggs, &mut md);
+    }
 
-    for ((method, backend), agg) in &agg_entries {
-        let error_count = agg.count - agg.success_count;
-        let mut latencies = agg.latencies.clone();
-        let (p50_str, p95_str, p99_str) = if latencies.is_empty() {
-            ("N/A".to_string(), "N/A".to_string(), "N/A".to_string())
-        } else {
-            latencies.sort_unstable();
-            (
-                format!("{:.0}", percentile_value(&latencies, 0.50)),
-                format!("{:.0}", percentile_value(&latencies, 0.95)),
-                format!("{:.0}", percentile_value(&latencies, 0.99)),
-            )
-        };
+    if unknown_phase_calls > 0 {
         md.push_str(&format!(
-            "| {method} | {backend} | {p50_str} | {p95_str} | {p99_str} | {} | {error_count} |\n",
-            agg.count
+            "> **Note:** {unknown_phase_calls} RPC call(s) have unknown phase — this run \
+             predates phase instrumentation and they are excluded from both tables above \
+             rather than assumed to be workload or setup activity.\n\n"
         ));
     }
-    md.push('\n');
 
     md.push_str("## Mempool\n");
     md.push_str(&format!(
@@ -300,15 +370,22 @@ pub fn generate_summary(run_dir: &RunDir, manifest: &RunManifest) -> Result<Stri
     }
 
     md.push_str("## Notable errors and findings\n");
-    let has_errors = agg_entries
-        .iter()
-        .any(|(_, agg)| !agg.error_counts.is_empty());
+    let has_errors = workload_aggs
+        .values()
+        .chain(setup_aggs.values())
+        .any(|agg| !agg.error_counts.is_empty());
     if has_errors {
-        for ((method, _backend), agg) in &agg_entries {
-            let mut codes: Vec<_> = agg.error_counts.iter().collect();
-            codes.sort_by_key(|(code, _)| *code);
-            for (code, count) in codes {
-                md.push_str(&format!("- {method}: error {code} × {count}\n"));
+        for (scope_label, aggs) in [("workload", &workload_aggs), ("setup", &setup_aggs)] {
+            let mut entries: Vec<_> = aggs.iter().collect();
+            entries.sort_by(|a, b| a.0.cmp(b.0));
+            for ((method, _backend), agg) in &entries {
+                let mut codes: Vec<_> = agg.error_counts.iter().collect();
+                codes.sort_by_key(|(code, _)| *code);
+                for (code, count) in codes {
+                    md.push_str(&format!(
+                        "- [{scope_label}] {method}: error {code} × {count}\n"
+                    ));
+                }
             }
         }
     } else {
@@ -347,6 +424,7 @@ mod tests {
             success: true,
             error_code: None,
             error_message: None,
+            phase: crate::data_model::Phase::Load,
         });
         std::fs::write(rd.metrics_path(), "").unwrap();
 
@@ -362,6 +440,8 @@ mod tests {
             scenario_config_hash: "sha:0".into(),
             target_tps: 10.0,
             timeouts: RunTimeouts::default(),
+            phase_boundaries: Vec::new(),
+            load_and_drain_completed_at: None,
         };
 
         generate_summary(&rd, &manifest).unwrap();
@@ -374,7 +454,10 @@ mod tests {
             md.contains("## Load results"),
             "missing load results section"
         );
-        assert!(md.contains("Target TPS"), "missing target TPS line");
+        assert!(
+            md.contains("Target dispatch rate"),
+            "missing target dispatch rate line"
+        );
         assert!(md.contains("## RPC latency"), "missing latency section");
         assert!(
             md.contains("| getblockcount"),
@@ -389,7 +472,7 @@ mod tests {
     }
 
     #[test]
-    fn generate_summary_shows_tps_and_confirmed_from_metrics_jsonl() {
+    fn generate_summary_shows_dispatch_rate_and_confirmed_from_metrics_jsonl() {
         use chrono::Utc;
 
         let base = tempfile::tempdir().unwrap();
@@ -400,8 +483,15 @@ mod tests {
         mwriter.write_record(&MetricSample {
             run_id: rd.run_id.clone(),
             timestamp: Utc::now(),
-            metric_name: "tps_achieved".into(),
+            metric_name: "scheduled_dispatch_rate".into(),
             value: 42.5,
+            labels: HashMap::new(),
+        });
+        mwriter.write_record(&MetricSample {
+            run_id: rd.run_id.clone(),
+            timestamp: Utc::now(),
+            metric_name: "confirmed_tx_throughput".into(),
+            value: 7.5,
             labels: HashMap::new(),
         });
         mwriter.write_record(&MetricSample {
@@ -424,12 +514,18 @@ mod tests {
             scenario_config_hash: "".into(),
             target_tps: 50.0,
             timeouts: RunTimeouts::default(),
+            phase_boundaries: Vec::new(),
+            load_and_drain_completed_at: None,
         };
         generate_summary(&rd, &manifest).unwrap();
         let md = std::fs::read_to_string(rd.summary_path()).unwrap();
         assert!(
-            md.contains("42.5") || md.contains("42"),
-            "achieved TPS value must appear in summary"
+            md.contains("42.5"),
+            "scheduled dispatch rate value must appear in summary"
+        );
+        assert!(
+            md.contains("7.5"),
+            "confirmed tx throughput value must appear in summary"
         );
         assert!(
             md.contains("100"),
@@ -456,6 +552,8 @@ mod tests {
             scenario_config_hash: "".into(),
             target_tps: 0.0,
             timeouts: RunTimeouts::default(),
+            phase_boundaries: Vec::new(),
+            load_and_drain_completed_at: None,
         };
         generate_summary(&rd, &manifest).unwrap();
         assert!(rd.summary_path().exists());
@@ -484,6 +582,8 @@ mod tests {
             scenario_config_hash: "".into(),
             target_tps: 0.0,
             timeouts: RunTimeouts::default(),
+            phase_boundaries: Vec::new(),
+            load_and_drain_completed_at: None,
         };
         generate_summary(&rd, &manifest).unwrap();
         assert!(rd.summary_path().exists());
@@ -508,6 +608,8 @@ mod tests {
             scenario_config_hash: "".into(),
             target_tps: 0.0,
             timeouts: RunTimeouts::default(),
+            phase_boundaries: Vec::new(),
+            load_and_drain_completed_at: None,
         };
         let md = generate_summary(&rd, &manifest).unwrap();
         assert!(
@@ -547,6 +649,8 @@ mod tests {
             scenario_config_hash: "".into(),
             target_tps: 0.0,
             timeouts: RunTimeouts::default(),
+            phase_boundaries: Vec::new(),
+            load_and_drain_completed_at: None,
         };
         let md = generate_summary(&rd, &manifest).unwrap();
         assert!(
@@ -600,6 +704,8 @@ mod tests {
             scenario_config_hash: "".into(),
             target_tps: 0.0,
             timeouts: RunTimeouts::default(),
+            phase_boundaries: Vec::new(),
+            load_and_drain_completed_at: None,
         };
         let md = generate_summary(&rd, &manifest).unwrap();
         assert!(
@@ -633,6 +739,7 @@ mod tests {
             success: false,
             error_code: Some(-3),
             error_message: Some("invalid tx".into()),
+            phase: crate::data_model::Phase::Load,
         });
         drop(rwriter);
 
@@ -648,6 +755,8 @@ mod tests {
             scenario_config_hash: "".into(),
             target_tps: 0.0,
             timeouts: RunTimeouts::default(),
+            phase_boundaries: Vec::new(),
+            load_and_drain_completed_at: None,
         };
         let md = generate_summary(&rd, &manifest).unwrap();
         assert!(
@@ -661,6 +770,77 @@ mod tests {
         assert!(
             md.contains("sendrawtransaction"),
             "method name must appear with error code; got:\n{md}"
+        );
+    }
+
+    #[test]
+    fn generate_summary_rpc_latency_table_excludes_setup_phase_retries() {
+        // Reproduces the exact defect shape the Foundation flagged (Track 3's
+        // "60 intents produced 101 z_sendmany calls including 28 failed
+        // retries, reported as a 27.7% failure rate"): two failed
+        // Funding-phase z_sendmany calls (the funding fan-out's own
+        // anchor-confirmation retries) plus one successful Load-phase call
+        // for the same method. The workload table must reflect only the
+        // Load-phase call; the setup-phase retries must appear in the
+        // separate setup-phase table instead, not inflate the headline count.
+        use crate::data_model::{Backend, Phase, RpcCall};
+        use chrono::Utc;
+
+        let base = tempfile::tempdir().unwrap();
+        let rd = RunDir::create(base.path(), "phasescope").unwrap();
+
+        let call = |phase: Phase, success: bool, error_code: Option<i64>| RpcCall {
+            call_id: "c".into(),
+            run_id: rd.run_id.clone(),
+            method: "z_sendmany".into(),
+            backend: Backend::Zallet,
+            params_hash: None,
+            request_at: Utc::now(),
+            response_at: None,
+            latency_ms: Some(10),
+            success,
+            error_code,
+            error_message: None,
+            phase,
+        };
+
+        let writer = JsonlWriter::<RpcCall>::open(&rd.rpc_calls_path()).unwrap();
+        writer.write_record(&call(Phase::Funding, false, Some(-4)));
+        writer.write_record(&call(Phase::Funding, false, Some(-4)));
+        writer.write_record(&call(Phase::Load, true, None));
+        std::fs::write(rd.metrics_path(), "").unwrap();
+
+        let manifest = RunManifest {
+            run_id: rd.run_id.clone(),
+            run_started_at: Utc::now(),
+            run_completed_at: Some(Utc::now()),
+            simulator_commit: "".into(),
+            zebra_commit: "".into(),
+            zaino_commit: "".into(),
+            zallet_commit: "".into(),
+            scenario_name: "phasescope".into(),
+            scenario_config_hash: "".into(),
+            target_tps: 0.0,
+            timeouts: RunTimeouts::default(),
+            phase_boundaries: Vec::new(),
+            load_and_drain_completed_at: None,
+        };
+        let md = generate_summary(&rd, &manifest).unwrap();
+
+        let latency_section = md.split("## Setup-phase RPC activity").next().unwrap();
+        assert!(
+            latency_section.contains("| z_sendmany | Zallet |") && latency_section.contains("| 1 | 0 |"),
+            "workload table must show exactly 1 call, 0 errors for z_sendmany; got:\n{latency_section}"
+        );
+        assert!(
+            md.contains("## Setup-phase RPC activity"),
+            "setup-phase retries must still be visible somewhere; got:\n{md}"
+        );
+        let setup_section = &md[md.find("## Setup-phase RPC activity").unwrap()..];
+        assert!(
+            setup_section.contains("| z_sendmany | Zallet |")
+                && setup_section.contains("| 2 | 2 |"),
+            "setup-phase table must show the 2 failed Funding-phase calls; got:\n{setup_section}"
         );
     }
 
@@ -717,6 +897,8 @@ mod tests {
             scenario_config_hash: "".into(),
             target_tps: 0.0,
             timeouts: RunTimeouts::default(),
+            phase_boundaries: Vec::new(),
+            load_and_drain_completed_at: None,
         };
         let md = generate_summary(&rd, &manifest).unwrap();
         assert!(
@@ -754,6 +936,8 @@ mod tests {
             scenario_config_hash: "".into(),
             target_tps: 0.0,
             timeouts: RunTimeouts::default(),
+            phase_boundaries: Vec::new(),
+            load_and_drain_completed_at: None,
         };
         let returned = generate_summary(&rd, &manifest).unwrap();
         let on_disk = std::fs::read_to_string(rd.summary_path()).unwrap();
@@ -782,6 +966,8 @@ mod tests {
             scenario_config_hash: "".into(),
             target_tps: 0.0,
             timeouts: RunTimeouts::default(),
+            phase_boundaries: Vec::new(),
+            load_and_drain_completed_at: None,
         };
         let md = generate_summary(&rd, &manifest).unwrap();
         assert!(
@@ -810,6 +996,8 @@ mod tests {
             scenario_config_hash: "".into(),
             target_tps: 0.0,
             timeouts: RunTimeouts::default(),
+            phase_boundaries: Vec::new(),
+            load_and_drain_completed_at: None,
         };
         // Must not panic or return Err.
         let md = generate_summary(&rd, &manifest).unwrap();

@@ -201,8 +201,13 @@ recorded, whether it succeeds or fails. Written to `rpc_calls.jsonl` per run.
 | `success` | `bool` | Whether the call returned a result (not an error) | No |
 | `error_code` | `Option<i64>` | JSON-RPC error code if the call failed | No |
 | `error_message` | `Option<string>` | Error detail | No |
+| `phase` | `enum(Bootstrap, Readiness, Warmup, Funding, Load, Drain, Unknown)` | Lifecycle phase the call was issued during — see `docs/architecture/observability.md`'s `phase_boundaries` section. `Unknown` is the deserialization default for calls recorded before phase tagging existed; every phase-scoped report view excludes it rather than assuming `Load` | Yes — Z3-run-lifecycle-specific |
 
 This is the primary data source for the RPC compatibility matrix and latency analysis.
+The RPC compatibility matrix and load-curve/degradation analysis are scoped to
+`phase in {Load, Drain}` by default — the measured workload; setup-phase calls
+(`Bootstrap`/`Readiness`/`Warmup`/`Funding`) are aggregated separately in the findings
+report's "Setup-phase RPC activity" appendix instead.
 
 ---
 

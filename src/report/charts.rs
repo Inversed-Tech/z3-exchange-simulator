@@ -1,6 +1,7 @@
 //! PNG chart rendering for the findings report. Charts visualize the same
-//! data already tabulated in the Markdown (load-curve TPS and latency) —
-//! they exist to make the report skimmable, not to introduce new numbers.
+//! data already tabulated in the Markdown (load-curve RPC-call rate and
+//! latency) — they exist to make the report skimmable, not to introduce new
+//! numbers.
 //!
 //! Uses `plotters`' bitmap backend directly (no font-kit/system-font
 //! dependency), so chart generation has no external requirements beyond
@@ -26,8 +27,8 @@ const INK_PRIMARY: RGBColor = RGBColor(0x0b, 0x0b, 0x0b);
 const INK_SECONDARY: RGBColor = RGBColor(0x52, 0x51, 0x4e);
 const GRIDLINE: RGBColor = RGBColor(0xe1, 0xe0, 0xd9);
 const AXIS: RGBColor = RGBColor(0xc3, 0xc2, 0xb7);
-/// Categorical slot 1 — used alone for the single-series TPS chart, and for
-/// P50 in the latency chart.
+/// Categorical slot 1 — used alone for the single-series RPC-call-rate
+/// chart, and for P50 in the latency chart.
 const SERIES_BLUE: RGBColor = RGBColor(0x2a, 0x78, 0xd6);
 /// Categorical slot 2 — P95 in the latency chart.
 const SERIES_ORANGE: RGBColor = RGBColor(0xeb, 0x68, 0x34);
@@ -52,11 +53,18 @@ impl std::error::Error for ChartError {}
 
 fn sanitize_filename(s: &str) -> String {
     s.chars()
-        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect()
 }
 
-/// Renders a TPS-over-time line chart for one run's load curve to
+/// Renders an RPC-calls-per-second-over-time line chart (all methods
+/// combined — not a confirmed-transaction rate) for one run's load curve to
 /// `<dir>/<run_id>_tps.png`. Returns the absolute path written.
 pub fn render_tps_chart(
     dir: &Path,
@@ -70,17 +78,27 @@ pub fn render_tps_chart(
     let start = points[0].window_start;
     let series: Vec<(f64, f64)> = points
         .iter()
-        .map(|p| ((p.window_start - start).num_seconds() as f64, p.tps))
+        .map(|p| {
+            (
+                (p.window_start - start).num_seconds() as f64,
+                p.rpc_calls_per_second,
+            )
+        })
         .collect();
     let max_x = series.last().map(|(x, _)| *x).unwrap_or(1.0).max(1.0);
-    let max_y = series.iter().map(|(_, y)| *y).fold(0.0_f64, f64::max).max(1.0) * 1.15;
+    let max_y = series
+        .iter()
+        .map(|(_, y)| *y)
+        .fold(0.0_f64, f64::max)
+        .max(1.0)
+        * 1.15;
 
     let backend_path = path.clone();
     let root = BitMapBackend::new(&backend_path, (CHART_WIDTH, CHART_HEIGHT)).into_drawing_area();
     root.fill(&SURFACE).map_err(|e| ChartError(e.to_string()))?;
     let mut chart = ChartBuilder::on(&root)
         .caption(
-            format!("{run_id}: achieved TPS over time"),
+            format!("{run_id}: RPC calls per second over time"),
             ("sans-serif", 18).into_font().color(&INK_PRIMARY),
         )
         .margin(15)
@@ -95,7 +113,7 @@ pub fn render_tps_chart(
         .axis_style(AXIS)
         .label_style(("sans-serif", 12).into_font().color(&INK_SECONDARY))
         .x_desc("seconds since run start")
-        .y_desc("TPS")
+        .y_desc("RPC calls/s")
         .draw()
         .map_err(|e| ChartError(e.to_string()))?;
     chart
@@ -136,9 +154,18 @@ pub fn render_latency_chart(
     let start = points[0].window_start;
     let offset = |p: &LoadCurvePoint| (p.window_start - start).num_seconds() as f64;
 
-    let p50: Vec<(f64, f64)> = points.iter().filter_map(|p| p.p50_ms.map(|v| (offset(p), v))).collect();
-    let p95: Vec<(f64, f64)> = points.iter().filter_map(|p| p.p95_ms.map(|v| (offset(p), v))).collect();
-    let p99: Vec<(f64, f64)> = points.iter().filter_map(|p| p.p99_ms.map(|v| (offset(p), v))).collect();
+    let p50: Vec<(f64, f64)> = points
+        .iter()
+        .filter_map(|p| p.p50_ms.map(|v| (offset(p), v)))
+        .collect();
+    let p95: Vec<(f64, f64)> = points
+        .iter()
+        .filter_map(|p| p.p95_ms.map(|v| (offset(p), v)))
+        .collect();
+    let p99: Vec<(f64, f64)> = points
+        .iter()
+        .filter_map(|p| p.p99_ms.map(|v| (offset(p), v)))
+        .collect();
 
     let max_x = points.iter().map(offset).fold(0.0_f64, f64::max).max(1.0);
     let max_y = [&p50, &p95, &p99]
@@ -224,6 +251,7 @@ mod tests {
             success: latency.is_some(),
             error_code: None,
             error_message: None,
+            phase: crate::data_model::Phase::Unknown,
         }
     }
 
@@ -255,6 +283,9 @@ mod tests {
 
     #[test]
     fn sanitize_filename_replaces_unsafe_characters() {
-        assert_eq!(sanitize_filename("2026-08-04T18:04:54Z"), "2026-08-04T18_04_54Z");
+        assert_eq!(
+            sanitize_filename("2026-08-04T18:04:54Z"),
+            "2026-08-04T18_04_54Z"
+        );
     }
 }

@@ -6,12 +6,13 @@ use std::sync::Arc;
 use chrono::Utc;
 use tokio::time::{sleep, Duration};
 
-use crate::data_model::{MetricSample, ScenarioConfig};
+use crate::data_model::{MetricSample, Phase, ScenarioConfig};
 use crate::metrics::{
     generate_summary, write_manifest, JsonlRecorder, MetricsRecorder, RunDir, RunManifest,
 };
 use crate::rpc::{RpcClient, RpcError};
 use crate::scenarios::runner::funding::{self, FundedAccount, ANCHOR_CONFIRMATIONS};
+use crate::scenarios::runner::phase::PhaseTracker;
 use crate::scenarios::runner::provisioner::{provision, ProvisionedPopulation};
 use crate::scenarios::runner::RunOptions;
 use crate::scenarios::runner::RunnerError;
@@ -57,6 +58,7 @@ pub async fn setup(
     run_id: &str,
     run_dir: &RunDir,
     metrics: Arc<dyn MetricsRecorder>,
+    phase_tracker: &PhaseTracker,
 ) -> Result<SetupState, RunnerError> {
     // 1. Resolve this checkout's environment identity and acquire the
     //    per-env_id concurrency lock BEFORE touching Docker: a stable env_id
@@ -106,14 +108,17 @@ pub async fn setup(
         return Err(RunnerError::Setup(e.to_string()));
     }
 
-    // 4. Build the RPC client.
+    // 4. Build the RPC client, bound to this run's shared phase atomic so
+    //    every call it records — including from the background miner,
+    //    mempool watcher, and balance checker spawned later in the load
+    //    phase — is retagged the instant `phase_tracker.mark(...)` advances.
     let rpc = {
-        let client = RpcClient::new(&rpc_url, run_id, Some(metrics.clone()), None);
+        let mut client = RpcClient::new(&rpc_url, run_id, Some(metrics.clone()), None);
         if let Some((user, pass)) = basic_auth {
-            client.with_basic_auth(user, pass)
-        } else {
-            client
+            client = client.with_basic_auth(user, pass);
         }
+        client.attach_phase_tracker(phase_tracker.shared_atomic());
+        client
     };
     let rpc = Arc::new(rpc);
 
@@ -132,6 +137,7 @@ pub async fn setup(
     //    Zallet's rpc.discover) in the seconds after wait_until_ready()
     //    returns, which surfaces as transport errors or as unparseable
     //    (router-error) response bodies.
+    phase_tracker.mark(Phase::Readiness);
     let hot_wallet = {
         let mut attempts = 0u32;
         loop {
@@ -161,6 +167,7 @@ pub async fn setup(
 
     // 6. Warmup: mine blocks before provisioning. The hot wallet account was
     //    created above so Zallet will credit coinbase outputs as blocks arrive.
+    phase_tracker.mark(Phase::Warmup);
     if let Err(e) = warmup(&rpc, scenario, run_id, metrics.clone(), &hot_wallet_uuid).await {
         let _ = stack.stop().await;
         return Err(e);
@@ -193,6 +200,7 @@ pub async fn setup(
     //    also the real spendability proof for the warmup coinbase: the send
     //    retries while the wallet catches up, and fails loudly if the hot
     //    wallet's funds cannot actually be spent.
+    phase_tracker.mark(Phase::Funding);
     if let Err(e) = fund_active_accounts(&rpc, scenario, &hot_wallet, &provisioned).await {
         let _ = stack.stop().await;
         return Err(RunnerError::Setup(format!(

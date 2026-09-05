@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::sync::{
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicU64, AtomicU8, Ordering},
     Arc,
 };
 use std::time::Duration;
@@ -8,7 +8,7 @@ use std::time::Duration;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
-use crate::data_model::{Backend, RpcCall};
+use crate::data_model::{Backend, Phase, RpcCall};
 use crate::metrics::MetricsRecorder;
 
 // ── Private envelope types ────────────────────────────────────────────────────
@@ -269,11 +269,15 @@ pub struct PoolBalance {
 impl AccountBalance {
     /// Total spendable shielded balance (Sapling + Orchard + Ironwood), in zatoshis.
     pub fn shielded_zatoshis(&self) -> u64 {
-        [&self.pools.sapling, &self.pools.orchard, &self.pools.ironwood]
-            .into_iter()
-            .filter_map(|p| p.as_ref())
-            .map(|p| p.value_zat)
-            .sum()
+        [
+            &self.pools.sapling,
+            &self.pools.orchard,
+            &self.pools.ironwood,
+        ]
+        .into_iter()
+        .filter_map(|p| p.as_ref())
+        .map(|p| p.value_zat)
+        .sum()
     }
 
     /// Spendable transparent balance, in zatoshis.
@@ -536,6 +540,13 @@ pub struct RpcClient {
     /// the routing table. Used for clients pointed directly at Zaino's JSON-RPC
     /// mirror, where the router's method→backend mapping does not apply.
     backend_override: Option<Backend>,
+    /// Current lifecycle phase, read on every call to tag the recorded
+    /// `RpcCall`. Defaults to a private, unshared atomic initialized to
+    /// `Phase::Bootstrap`; `attach_phase_tracker` rebinds it to a
+    /// `PhaseTracker`'s shared handle so `tracker.mark(...)` retags every
+    /// subsequent call from any task holding a clone of this same
+    /// `Arc<RpcClient>` — see `crate::scenarios::runner::phase`.
+    current_phase: Arc<AtomicU8>,
 }
 
 impl RpcClient {
@@ -559,7 +570,26 @@ impl RpcClient {
             call_counter: AtomicU64::new(0),
             auth: None,
             backend_override: None,
+            current_phase: Arc::new(AtomicU8::new(Phase::Bootstrap as u8)),
         }
+    }
+
+    /// Rebinds this client's phase source to `atomic` — typically a
+    /// `PhaseTracker`'s `shared_atomic()` handle. Takes `&mut self`, so it
+    /// must be called on an owned client before it is wrapped in `Arc` (the
+    /// usual next step after construction); every RPC call issued afterward,
+    /// from any task holding a clone of that `Arc`, reads the same atomic and
+    /// is tagged with whatever phase the tracker last marked.
+    pub fn attach_phase_tracker(&mut self, atomic: Arc<AtomicU8>) {
+        self.current_phase = atomic;
+    }
+
+    /// The phase to tag the next recorded `RpcCall` with. Falls back to
+    /// `Phase::Unknown` on an out-of-range value, which should never occur —
+    /// only `PhaseTracker::mark` and this client's own constructor ever write
+    /// to the atomic, and both only ever store a valid `Phase` discriminant.
+    fn phase(&self) -> Phase {
+        Phase::try_from(self.current_phase.load(Ordering::Relaxed)).unwrap_or(Phase::Unknown)
     }
 
     /// Build a client pointed at Zaino's zcashd-style JSON-RPC mirror (regtest
@@ -680,6 +710,7 @@ impl RpcClient {
                 success: outcome.is_ok(),
                 error_code,
                 error_message,
+                phase: self.phase(),
             });
         }
 
@@ -747,6 +778,7 @@ impl RpcClient {
                 success: outcome.is_ok(),
                 error_code,
                 error_message,
+                phase: self.phase(),
             });
         }
 
@@ -1413,6 +1445,63 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert!(!calls[0].success);
         assert!(calls[0].error_message.is_some());
+    }
+
+    // ── phase tagging ─────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn new_client_tags_calls_bootstrap_by_default() {
+        use wiremock::{matchers, Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(matchers::method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": { "chain": "regtest", "blocks": 1, "headers": 1 },
+                "error": null,
+                "id": 1
+            })))
+            .mount(&server)
+            .await;
+
+        let rec = MockRecorder::new();
+        client_with_recorder(&server.uri(), rec.clone())
+            .get_blockchain_info()
+            .await
+            .unwrap();
+
+        assert_eq!(rec.recorded_calls()[0].phase, Phase::Bootstrap);
+    }
+
+    #[tokio::test]
+    async fn attach_phase_tracker_retags_subsequent_calls_immediately() {
+        use wiremock::{matchers, Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(matchers::method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": { "chain": "regtest", "blocks": 1, "headers": 1 },
+                "error": null,
+                "id": 1
+            })))
+            .mount(&server)
+            .await;
+
+        let rec = MockRecorder::new();
+        let mut client = client_with_recorder(&server.uri(), rec.clone());
+        let atomic = Arc::new(AtomicU8::new(Phase::Bootstrap as u8));
+        client.attach_phase_tracker(atomic.clone());
+
+        client.get_blockchain_info().await.unwrap();
+        // Simulates a PhaseTracker::mark(Phase::Load) call from elsewhere —
+        // the client shares the same atomic, so this must take effect
+        // without any further plumbing.
+        atomic.store(Phase::Load as u8, Ordering::Relaxed);
+        client.get_blockchain_info().await.unwrap();
+
+        let calls = rec.recorded_calls();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].phase, Phase::Bootstrap);
+        assert_eq!(calls[1].phase, Phase::Load);
     }
 
     // ── routing table ─────────────────────────────────────────────────────────

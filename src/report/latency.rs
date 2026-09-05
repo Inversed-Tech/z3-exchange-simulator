@@ -119,7 +119,7 @@ pub fn windowed_stats(calls: &[RpcCall], window_secs: i64) -> Vec<WindowStats> {
 }
 
 /// Achieved throughput per window across *all* methods combined — useful for
-/// a single TPS-vs-time curve rather than one per method.
+/// a single rate-vs-time curve rather than one per method.
 #[derive(Debug, Clone)]
 pub struct ThroughputWindow {
     pub window_start: DateTime<Utc>,
@@ -175,6 +175,7 @@ mod tests {
             success,
             error_code: if success { None } else { Some(-1) },
             error_message: None,
+            phase: crate::data_model::Phase::Unknown,
         }
     }
 

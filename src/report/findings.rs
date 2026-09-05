@@ -9,6 +9,8 @@
 
 use std::collections::{HashMap, HashSet};
 
+use crate::data_model::Phase;
+
 use super::load_curve::load_degradation_candidates;
 use super::loader::RunData;
 use super::rpc_matrix::{build_matrix, Category, MatrixStatus};
@@ -132,7 +134,7 @@ fn run_occurrence(runs: &[RunData], method: &str) -> (usize, usize) {
 /// docs/rpc/method-scope.md — so a failed `generate` call is excluded here
 /// the same way it is excluded from the stress latency histograms.
 fn rpc_failure_candidates(runs: &[RunData]) -> Vec<Finding> {
-    build_matrix(runs)
+    build_matrix(runs, Phase::is_workload)
         .into_iter()
         .filter(|row| row.category != Category::RegtestControl)
         .filter(|row| {
@@ -232,7 +234,7 @@ fn timeout_candidates(runs: &[RunData]) -> Vec<Finding> {
 /// noise from a single slow call, and excludes regtest-control methods for
 /// the same reason `rpc_failure_candidates` does.
 fn latency_outlier_candidates(runs: &[RunData]) -> Vec<Finding> {
-    build_matrix(runs)
+    build_matrix(runs, Phase::is_workload)
         .into_iter()
         .filter(|row| row.category != Category::RegtestControl)
         .filter(|row| row.calls >= MIN_TAIL_LATENCY_SAMPLE)
@@ -294,7 +296,7 @@ pub(crate) const UNIFORM_SLOWNESS_FLOOR_MS: f64 = 1000.0;
 /// RPC method sharing the same backend (see
 /// docs/concurrent-generate-pileup.md).
 fn uniformly_slow_candidates(runs: &[RunData]) -> Vec<Finding> {
-    build_matrix(runs)
+    build_matrix(runs, Phase::is_workload)
         .into_iter()
         .filter(|row| row.calls >= MIN_TAIL_LATENCY_SAMPLE)
         .filter_map(|row| {
@@ -452,6 +454,8 @@ mod tests {
             scenario_config_hash: "sha256:x".into(),
             target_tps: 1.0,
             timeouts: RunTimeouts::default(),
+            phase_boundaries: Vec::new(),
+            load_and_drain_completed_at: None,
         }
     }
 
@@ -484,6 +488,7 @@ mod tests {
             success,
             error_code,
             error_message: None,
+            phase: crate::data_model::Phase::Load,
         }
     }
 
@@ -549,7 +554,11 @@ mod tests {
 
     #[test]
     fn rpc_failure_evidence_reports_run_occurrence() {
-        let r1 = run("r1", vec![call("z_sendmany", false, None, Some(-4))], vec![]);
+        let r1 = run(
+            "r1",
+            vec![call("z_sendmany", false, None, Some(-4))],
+            vec![],
+        );
         let r2 = run("r2", vec![call("z_sendmany", true, Some(10), None)], vec![]);
         let findings = flag_candidates(&[r1, r2]);
         let f = findings
@@ -613,8 +622,9 @@ mod tests {
         let findings = flag_candidates(&[r]);
         let f = findings
             .iter()
-            .find(|f| f.category == FindingCategory::LatencyOutlier
-                && f.summary.contains("z_sendmany"))
+            .find(|f| {
+                f.category == FindingCategory::LatencyOutlier && f.summary.contains("z_sendmany")
+            })
             .expect("expected a latency outlier finding");
         assert_eq!(f.severity, Severity::High); // ratio >= 10x
     }
@@ -737,7 +747,9 @@ mod tests {
         let findings = flag_candidates(&[r]);
         let f = findings
             .iter()
-            .find(|f| f.category == FindingCategory::FlowTypeDisparity && f.summary.contains("ZToT"))
+            .find(|f| {
+                f.category == FindingCategory::FlowTypeDisparity && f.summary.contains("ZToT")
+            })
             .expect("expected a flow type disparity finding");
         assert_eq!(f.severity, Severity::High); // 100% vs 50% overall = 50pp gap
     }

@@ -36,10 +36,16 @@ pub struct ProvingTimeStats {
 
 #[derive(Debug, Clone, Default)]
 pub struct SystemHealth {
-    /// From the `tps_achieved` metric — the simulator's own run-average
-    /// throughput figure. Distinct from (and a useful cross-check against)
-    /// this report's own per-window TPS curve in `load_curve.rs`.
-    pub achieved_tps: Option<f64>,
+    /// From the `scheduled_dispatch_rate` metric — how many intents per
+    /// second the scheduler actually dispatched, over real load-phase
+    /// elapsed time. Not a confirmed-transaction rate — see
+    /// `confirmed_tx_throughput` for that, the only figure this report may
+    /// label "TPS".
+    pub scheduled_dispatch_rate: Option<f64>,
+    /// From the `confirmed_tx_throughput` metric — confirmed transactions
+    /// per second of load+drain wall-clock time. This is the run's
+    /// confirmed_tx_throughput figure; the report labels it "TPS".
+    pub confirmed_tx_throughput: Option<f64>,
     pub peak_mempool_tx_count: Option<f64>,
     pub peak_mempool_bytes: Option<f64>,
     /// Count of `mempool_saturated` samples — emitted once every sampling
@@ -60,7 +66,8 @@ pub struct SystemHealth {
 /// top of the RPC-log-derived sections, not something a run can fail to
 /// produce.
 pub fn compute_system_health(run: &RunData) -> SystemHealth {
-    let mut achieved_tps = None;
+    let mut scheduled_dispatch_rate = None;
+    let mut confirmed_tx_throughput = None;
     let mut peak_mempool_tx_count: Option<f64> = None;
     let mut peak_mempool_bytes: Option<f64> = None;
     let mut saturation_events = 0u64;
@@ -70,7 +77,8 @@ pub fn compute_system_health(run: &RunData) -> SystemHealth {
 
     for sample in &run.metrics {
         match sample.metric_name.as_str() {
-            "tps_achieved" => achieved_tps = Some(sample.value),
+            "scheduled_dispatch_rate" => scheduled_dispatch_rate = Some(sample.value),
+            "confirmed_tx_throughput" => confirmed_tx_throughput = Some(sample.value),
             "mempool_tx_count" => {
                 peak_mempool_tx_count =
                     Some(peak_mempool_tx_count.unwrap_or(0.0).max(sample.value));
@@ -129,7 +137,8 @@ pub fn compute_system_health(run: &RunData) -> SystemHealth {
         .collect();
 
     SystemHealth {
-        achieved_tps,
+        scheduled_dispatch_rate,
+        confirmed_tx_throughput,
         peak_mempool_tx_count,
         peak_mempool_bytes,
         saturation_events,
@@ -160,6 +169,8 @@ mod tests {
                 scenario_config_hash: "sha256:x".into(),
                 target_tps: 8.0,
                 timeouts: RunTimeouts::default(),
+                phase_boundaries: Vec::new(),
+                load_and_drain_completed_at: None,
             },
             rpc_calls: Vec::new(),
             intents: Vec::new(),
@@ -184,7 +195,8 @@ mod tests {
     #[test]
     fn empty_metrics_produce_empty_health() {
         let h = compute_system_health(&run_with_metrics(Vec::new()));
-        assert!(h.achieved_tps.is_none());
+        assert!(h.scheduled_dispatch_rate.is_none());
+        assert!(h.confirmed_tx_throughput.is_none());
         assert!(h.peak_mempool_tx_count.is_none());
         assert!(h.proving_time.is_none());
         assert!(h.process_peaks.is_empty());
@@ -192,9 +204,23 @@ mod tests {
     }
 
     #[test]
-    fn achieved_tps_reads_the_metric_value() {
-        let h = compute_system_health(&run_with_metrics(vec![sample("tps_achieved", 6.6, &[])]));
-        assert_eq!(h.achieved_tps, Some(6.6));
+    fn scheduled_dispatch_rate_reads_the_metric_value() {
+        let h = compute_system_health(&run_with_metrics(vec![sample(
+            "scheduled_dispatch_rate",
+            6.6,
+            &[],
+        )]));
+        assert_eq!(h.scheduled_dispatch_rate, Some(6.6));
+    }
+
+    #[test]
+    fn confirmed_tx_throughput_reads_the_metric_value() {
+        let h = compute_system_health(&run_with_metrics(vec![sample(
+            "confirmed_tx_throughput",
+            4.2,
+            &[],
+        )]));
+        assert_eq!(h.confirmed_tx_throughput, Some(4.2));
     }
 
     #[test]

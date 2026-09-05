@@ -14,6 +14,8 @@
 
 use std::collections::{HashMap, HashSet};
 
+use crate::data_model::Phase;
+
 use super::loader::RunData;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -333,7 +335,10 @@ pub const IN_SCOPE_METHODS: &[RosterEntry] = &[
 /// test, extended here to production code so the rendered report can pull
 /// in the doc's zcashd-parity/deviation notes rather than requiring a
 /// reader to cross-reference a separate file.
-const COVERAGE_MATRIX_DOC: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/docs/rpc/rpc-coverage-matrix.md");
+const COVERAGE_MATRIX_DOC: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/docs/rpc/rpc-coverage-matrix.md"
+);
 
 /// Extracts the `## Matrix` ... `## Removed or replaced from zcashd` slice
 /// of the coverage-matrix doc — the region whose backtick-quoted first
@@ -454,8 +459,11 @@ fn percentile_value(sorted: &[u64], p: f64) -> f64 {
 }
 
 /// Builds one row per roster method, aggregating observed calls to that
-/// method across every provided run.
-pub fn build_matrix(runs: &[RunData]) -> Vec<MatrixRow> {
+/// method across every provided run whose `phase` satisfies `phase_filter`.
+/// Pass [`Phase::is_workload`] for the headline Load/Drain-scoped view, or
+/// [`Phase::is_setup`] for the setup-phase appendix — see `markdown.rs`'s two
+/// call sites. `Phase::Unknown` (a pre-phase-tagging run) matches neither.
+pub fn build_matrix(runs: &[RunData], phase_filter: impl Fn(Phase) -> bool) -> Vec<MatrixRow> {
     IN_SCOPE_METHODS
         .iter()
         .map(|entry| {
@@ -468,6 +476,9 @@ pub fn build_matrix(runs: &[RunData]) -> Vec<MatrixRow> {
             for run in runs {
                 for call in &run.rpc_calls {
                     if call.method != entry.method {
+                        continue;
+                    }
+                    if !phase_filter(call.phase) {
                         continue;
                     }
                     calls += 1;
@@ -543,13 +554,18 @@ pub struct UnlistedRow {
     pub p99_ms: Option<f64>,
 }
 
-/// Aggregates RPC calls whose method is *not* in [`IN_SCOPE_METHODS`].
+/// Aggregates RPC calls whose method is *not* in [`IN_SCOPE_METHODS`],
+/// scoped by `phase_filter` the same way [`build_matrix`] is — this function
+/// is rendered directly under the RPC compatibility matrix, whose stated
+/// scope (`Phase::is_workload` by default) it must match, or an unlisted
+/// method exercised only during setup would silently appear in a section
+/// whose own text claims to exclude setup-phase activity.
 /// `build_matrix` silently excludes these (see its own
 /// `build_matrix_ignores_calls_to_methods_outside_the_roster` test) — a real
 /// method actually exercised against Zebra or Zallet but missing from the
 /// Foundation's confirmed roster would otherwise be invisible in this
 /// report, not even shown as "Not tested."
-pub fn build_unlisted(runs: &[RunData]) -> Vec<UnlistedRow> {
+pub fn build_unlisted(runs: &[RunData], phase_filter: impl Fn(Phase) -> bool) -> Vec<UnlistedRow> {
     let roster: HashSet<&str> = IN_SCOPE_METHODS.iter().map(|e| e.method).collect();
 
     #[derive(Default)]
@@ -565,6 +581,9 @@ pub fn build_unlisted(runs: &[RunData]) -> Vec<UnlistedRow> {
     for run in runs {
         for call in &run.rpc_calls {
             if roster.contains(call.method.as_str()) {
+                continue;
+            }
+            if !phase_filter(call.phase) {
                 continue;
             }
             let entry = by_method.entry(call.method.clone()).or_default();
@@ -648,6 +667,8 @@ mod tests {
                 scenario_config_hash: "sha256:x".into(),
                 target_tps: 1.0,
                 timeouts: RunTimeouts::default(),
+                phase_boundaries: Vec::new(),
+                load_and_drain_completed_at: None,
             },
             rpc_calls: calls,
             intents: Vec::<IntentRecord>::new(),
@@ -674,18 +695,26 @@ mod tests {
             success,
             error_code,
             error_message: None,
+            phase: crate::data_model::Phase::Load,
+        }
+    }
+
+    fn call_with_phase(method: &str, success: bool, phase: Phase) -> RpcCall {
+        RpcCall {
+            phase,
+            ..call(method, success, Some(5), None)
         }
     }
 
     #[test]
     fn build_matrix_has_one_row_per_roster_method() {
-        let matrix = build_matrix(&[]);
+        let matrix = build_matrix(&[], Phase::is_workload);
         assert_eq!(matrix.len(), IN_SCOPE_METHODS.len());
     }
 
     #[test]
     fn build_matrix_marks_unobserved_methods_not_tested() {
-        let matrix = build_matrix(&[]);
+        let matrix = build_matrix(&[], Phase::is_workload);
         assert!(matrix.iter().all(|r| r.status == MatrixStatus::NotTested));
         assert!(matrix.iter().all(|r| r.calls == 0));
     }
@@ -693,7 +722,7 @@ mod tests {
     #[test]
     fn build_matrix_marks_all_success_correctly() {
         let run = run_with_calls(vec![call("getblockcount", true, Some(5), None)]);
-        let matrix = build_matrix(&[run]);
+        let matrix = build_matrix(&[run], Phase::is_workload);
         let row = matrix.iter().find(|r| r.method == "getblockcount").unwrap();
         assert_eq!(row.status, MatrixStatus::ExercisedAllSuccess);
         assert_eq!(row.calls, 1);
@@ -702,12 +731,70 @@ mod tests {
     }
 
     #[test]
+    fn build_matrix_default_scope_excludes_setup_phases() {
+        // A mix of failed Funding-phase calls (the funding-fan-out's own
+        // anchor-confirmation retries) and successful Load-phase calls for
+        // the same method — the exact shape that would otherwise inflate
+        // the headline failure rate with setup-phase retry noise.
+        let run = run_with_calls(vec![
+            call_with_phase("z_sendmany", false, Phase::Funding),
+            call_with_phase("z_sendmany", false, Phase::Funding),
+            call_with_phase("z_sendmany", true, Phase::Load),
+        ]);
+        let workload_matrix = build_matrix(&[run], Phase::is_workload);
+        let row = workload_matrix
+            .iter()
+            .find(|r| r.method == "z_sendmany")
+            .unwrap();
+        assert_eq!(row.calls, 1, "only the Load-phase call should count");
+        assert_eq!(row.status, MatrixStatus::ExercisedAllSuccess);
+    }
+
+    #[test]
+    fn build_matrix_setup_scope_includes_only_setup_phases() {
+        let run = run_with_calls(vec![
+            call_with_phase("z_sendmany", false, Phase::Funding),
+            call_with_phase("z_sendmany", true, Phase::Load),
+            call_with_phase("z_sendmany", false, Phase::Unknown),
+        ]);
+        let setup_matrix = build_matrix(&[run], Phase::is_setup);
+        let row = setup_matrix
+            .iter()
+            .find(|r| r.method == "z_sendmany")
+            .unwrap();
+        assert_eq!(row.calls, 1, "only the Funding-phase call should count");
+        assert_eq!(row.status, MatrixStatus::ExercisedAllFailed);
+    }
+
+    #[test]
+    fn build_matrix_unknown_phase_excluded_from_both_scopes() {
+        let run = run_with_calls(vec![call_with_phase("getblockcount", true, Phase::Unknown)]);
+        assert_eq!(
+            build_matrix(&[run], Phase::is_workload)
+                .iter()
+                .find(|r| r.method == "getblockcount")
+                .unwrap()
+                .calls,
+            0
+        );
+        let run = run_with_calls(vec![call_with_phase("getblockcount", true, Phase::Unknown)]);
+        assert_eq!(
+            build_matrix(&[run], Phase::is_setup)
+                .iter()
+                .find(|r| r.method == "getblockcount")
+                .unwrap()
+                .calls,
+            0
+        );
+    }
+
+    #[test]
     fn build_matrix_marks_partial_failure_correctly() {
         let run = run_with_calls(vec![
             call("z_sendmany", true, Some(10), None),
             call("z_sendmany", false, None, Some(-4)),
         ]);
-        let matrix = build_matrix(&[run]);
+        let matrix = build_matrix(&[run], Phase::is_workload);
         let row = matrix.iter().find(|r| r.method == "z_sendmany").unwrap();
         assert_eq!(row.status, MatrixStatus::ExercisedPartialFailure);
         assert_eq!(row.calls, 2);
@@ -718,7 +805,7 @@ mod tests {
     #[test]
     fn build_matrix_marks_all_failed_correctly() {
         let run = run_with_calls(vec![call("z_listunspent", false, None, Some(-20))]);
-        let matrix = build_matrix(&[run]);
+        let matrix = build_matrix(&[run], Phase::is_workload);
         let row = matrix.iter().find(|r| r.method == "z_listunspent").unwrap();
         assert_eq!(row.status, MatrixStatus::ExercisedAllFailed);
     }
@@ -727,7 +814,7 @@ mod tests {
     fn build_matrix_aggregates_across_multiple_runs() {
         let run1 = run_with_calls(vec![call("getblockcount", true, Some(5), None)]);
         let run2 = run_with_calls(vec![call("getblockcount", true, Some(15), None)]);
-        let matrix = build_matrix(&[run1, run2]);
+        let matrix = build_matrix(&[run1, run2], Phase::is_workload);
         let row = matrix.iter().find(|r| r.method == "getblockcount").unwrap();
         assert_eq!(row.calls, 2);
         assert_eq!(row.p50_ms, Some(15.0));
@@ -736,7 +823,7 @@ mod tests {
     #[test]
     fn build_matrix_ignores_calls_to_methods_outside_the_roster() {
         let run = run_with_calls(vec![call("some_unknown_method", true, Some(1), None)]);
-        let matrix = build_matrix(&[run]);
+        let matrix = build_matrix(&[run], Phase::is_workload);
         assert!(matrix.iter().all(|r| r.method != "some_unknown_method"));
     }
 
@@ -790,7 +877,10 @@ mod tests {
     #[test]
     fn roster_matches_documented_coverage_matrix_exactly() {
         let documented = methods_documented_in_coverage_matrix();
-        let roster: HashSet<String> = IN_SCOPE_METHODS.iter().map(|e| e.method.to_string()).collect();
+        let roster: HashSet<String> = IN_SCOPE_METHODS
+            .iter()
+            .map(|e| e.method.to_string())
+            .collect();
 
         let missing_from_roster: Vec<&String> = documented.difference(&roster).collect();
         let extra_in_roster: Vec<&String> = roster.difference(&documented).collect();
@@ -810,7 +900,7 @@ mod tests {
             call("z_getbalanceforaccount", true, Some(7), None),
             call("getblockcount", true, Some(2), None), // in-roster, must not appear
         ]);
-        let unlisted = build_unlisted(&[run]);
+        let unlisted = build_unlisted(&[run], Phase::is_workload);
         assert_eq!(unlisted.len(), 1);
         let row = &unlisted[0];
         assert_eq!(row.method, "z_getbalanceforaccount");
@@ -822,7 +912,36 @@ mod tests {
     #[test]
     fn build_unlisted_empty_when_every_call_is_in_roster() {
         let run = run_with_calls(vec![call("getblockcount", true, Some(2), None)]);
-        assert!(build_unlisted(&[run]).is_empty());
+        assert!(build_unlisted(&[run], Phase::is_workload).is_empty());
+    }
+
+    #[test]
+    fn build_unlisted_default_scope_excludes_setup_phases() {
+        // Regression guard: an off-roster method exercised only during setup
+        // (e.g. z_getbalanceforaccount, called from warmup()/fund_accounts())
+        // must not appear in the Load/Drain-scoped "Observed outside the
+        // tracked roster" section nested under the headline RPC matrix.
+        let run = run_with_calls(vec![call_with_phase(
+            "z_getbalanceforaccount",
+            true,
+            Phase::Funding,
+        )]);
+        assert!(build_unlisted(&[run], Phase::is_workload).is_empty());
+    }
+
+    #[test]
+    fn build_unlisted_setup_scope_finds_setup_only_methods() {
+        // The symmetric fix: the same off-roster method must still surface
+        // somewhere — in the setup-phase unlisted listing — so it is never
+        // silently invisible just because it wasn't exercised during Load/Drain.
+        let run = run_with_calls(vec![call_with_phase(
+            "z_getbalanceforaccount",
+            true,
+            Phase::Funding,
+        )]);
+        let unlisted = build_unlisted(&[run], Phase::is_setup);
+        assert_eq!(unlisted.len(), 1);
+        assert_eq!(unlisted[0].method, "z_getbalanceforaccount");
     }
 
     #[test]
@@ -831,8 +950,11 @@ mod tests {
             call("z_getbalanceforaccount", true, Some(5), None),
             call("z_getbalanceforaccount", false, None, Some(-1)),
         ]);
-        let unlisted = build_unlisted(&[run]);
-        let row = unlisted.iter().find(|r| r.method == "z_getbalanceforaccount").unwrap();
+        let unlisted = build_unlisted(&[run], Phase::is_workload);
+        let row = unlisted
+            .iter()
+            .find(|r| r.method == "z_getbalanceforaccount")
+            .unwrap();
         assert_eq!(row.status, MatrixStatus::ExercisedPartialFailure);
         assert_eq!(row.error_codes, vec![-1]);
     }
@@ -848,7 +970,8 @@ mod tests {
 
     #[test]
     fn parse_parity_row_extracts_expected_columns() {
-        let line = "| `getblockchaininfo` | Zebra | Stress | Yes | N/A | Yes | Yes | TBD | Some note. |";
+        let line =
+            "| `getblockchaininfo` | Zebra | Stress | Yes | N/A | Yes | Yes | TBD | Some note. |";
         let (method, info) = parse_parity_row(line).expect("should parse a matrix row");
         assert_eq!(method, "getblockchaininfo");
         assert_eq!(info.zcashd_equiv, "Yes");

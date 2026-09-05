@@ -37,12 +37,45 @@ scenario configuration used. Required for any finding to be reportable.
     "max_operation_wait_ms": 120000,
     "confirmation_poll_interval_ms": 1000,
     "max_confirmation_wait_ms": 60000
-  }
+  },
+  "phase_boundaries": [
+    { "phase": "bootstrap", "started_at": "2026-06-02T14:00:00Z" },
+    { "phase": "readiness", "started_at": "2026-06-02T14:00:04Z" },
+    { "phase": "warmup", "started_at": "2026-06-02T14:00:06Z" },
+    { "phase": "funding", "started_at": "2026-06-02T14:00:40Z" },
+    { "phase": "load", "started_at": "2026-06-02T14:00:55Z" },
+    { "phase": "drain", "started_at": "2026-06-02T14:01:00Z" }
+  ],
+  "load_and_drain_completed_at": "2026-06-02T14:01:02Z"
 }
 ```
 
 **Run ID format:** `<YYYYMMDDTHHMMSSZ>-<scenario-name>`. Sortable, human-readable, and
 unique per run (assuming no two runs of the same scenario start in the same second).
+
+**`phase_boundaries`** records the wall-clock start time of each lifecycle phase this run
+passed through, in order: `bootstrap` (stack start, before it reports ready) →
+`readiness` (hot-wallet resolution) → `warmup` (mining warmup blocks) → `funding`
+(the hot-wallet-to-synthetic-account funding fan-out) → `load` (the measured workload) →
+`drain` (draining in-flight intents after dispatch stops). Every `RpcCall` in
+`rpc_calls.jsonl` carries the same `phase` it was issued during, so workload-scoped
+report views (the RPC compatibility matrix, load curve, degradation detection) can
+exclude setup-phase activity by construction rather than by convention. A run
+directory written before phase tagging existed has no `phase_boundaries` (an old
+manifest still deserializes — the field defaults to empty) and every `RpcCall` in it
+deserializes with `phase: "unknown"`, which every phase-scoped view excludes rather
+than mislabeling as `load`.
+
+**`load_and_drain_completed_at`** records the wall-clock instant the Drain phase's own
+work (draining in-flight intents) finished — the same instant `confirmed_tx_throughput`'s
+elapsed-time window stops. This is deliberately **not** the same as `run_completed_at`:
+the gap between the two is Z3 stack teardown (`docker compose down`), which is
+environment/host overhead, not part of the measured workload. The findings report's
+"Setup phase timing" section uses this field, rather than `run_completed_at`, as the
+Drain row's own end boundary, and shows any residual gap as a separate Teardown row —
+so the Drain duration shown there always reconciles with `confirmed_tx_throughput`.
+`None`/absent for a manifest predating this field, or a run whose load phase never
+completed (setup failed before Drain was reached).
 
 **`simulator_commit` is embedded at compile time** (`build.rs` shells out to
 `git rev-parse HEAD` at build time and bakes the result into the binary via
@@ -88,10 +121,17 @@ One JSON object per line, one line per RPC call. Written incrementally during th
 so partial data is preserved if a run crashes.
 
 ```json
-{"call_id":"a1b2c3","run_id":"20260602T140000Z-smoke","method":"getblockchaininfo","component":"Zebra","request_at":"2026-06-02T14:00:01.000Z","response_at":"2026-06-02T14:00:01.012Z","latency_ms":12,"success":true,"error_code":null,"error_message":null}
-{"call_id":"d4e5f6","run_id":"20260602T140000Z-smoke","method":"z_sendmany","component":"Zallet","request_at":"2026-06-02T14:00:02.000Z","response_at":"2026-06-02T14:00:02.008Z","latency_ms":8,"success":true,"error_code":null,"error_message":null}
-{"call_id":"g7h8i9","run_id":"20260602T140000Z-smoke","method":"getnewaddress","component":"Zallet","request_at":"2026-06-02T14:00:03.000Z","response_at":null,"latency_ms":null,"success":false,"error_code":-32601,"error_message":"Method not found"}
+{"call_id":"a1b2c3","run_id":"20260602T140000Z-smoke","method":"getblockchaininfo","component":"Zebra","request_at":"2026-06-02T14:00:01.000Z","response_at":"2026-06-02T14:00:01.012Z","latency_ms":12,"success":true,"error_code":null,"error_message":null,"phase":"warmup"}
+{"call_id":"d4e5f6","run_id":"20260602T140000Z-smoke","method":"z_sendmany","component":"Zallet","request_at":"2026-06-02T14:00:02.000Z","response_at":"2026-06-02T14:00:02.008Z","latency_ms":8,"success":true,"error_code":null,"error_message":null,"phase":"load"}
+{"call_id":"g7h8i9","run_id":"20260602T140000Z-smoke","method":"getnewaddress","component":"Zallet","request_at":"2026-06-02T14:00:03.000Z","response_at":null,"latency_ms":null,"success":false,"error_code":-32601,"error_message":"Method not found","phase":"load"}
 ```
+
+`phase` names the lifecycle stage the call was issued during — one of `bootstrap`,
+`readiness`, `warmup`, `funding`, `load`, `drain`, or `unknown` (a run predating phase
+tagging) — see `phase_boundaries` above. Report views scoped to the measured workload
+(the RPC compatibility matrix, load curve, degradation detection) include only `load`
+and `drain` calls; setup-phase calls (`bootstrap`/`readiness`/`warmup`/`funding`) are
+shown separately, in their own unscored appendix.
 
 This file is the primary input for:
 - latency histograms (P50/P95/P99 per method),
@@ -132,7 +172,8 @@ the method's routing table.
 | `proving_time_ms` | — | ZK proof generation time for shielded txs |
 | `active_accounts` | — | Accounts actively transacting at sample time |
 | `block_height` | — | Current chain height |
-| `tps_achieved` | — | Observed transactions per second vs. target |
+| `scheduled_dispatch_rate` | — | Intents dispatched per second of actual load-phase elapsed time (not the configured duration) — a scheduler-behavior figure, not a confirmed-transaction rate |
+| `confirmed_tx_throughput` | — | Confirmed transactions per second of Load+Drain wall-clock time — the only metric this report labels "TPS" |
 | `mempool_saturation_event` | `threshold` | Recorded once when mempool depth crosses the saturation threshold; value is the observed depth at crossing |
 | `process_cpu_percent` | `process` | CPU usage of each Docker container (Zebra, Zaino, Zallet) |
 | `process_memory_mb` | `process` | Memory usage of each Docker container |
@@ -184,13 +225,25 @@ the Foundation and component teams without requiring them to parse JSONL files.
 - Z3 commits: Zebra <sha>, Zaino <sha>, Zallet <sha>
 
 ## Load results
-- Target TPS: <n>
-- Achieved TPS: <n>
+- Target dispatch rate: <n> intents/s
+- Scheduled dispatch rate: <n> intents/s (actual load-phase elapsed time, not the configured duration)
+- Confirmed tx throughput (TPS, from `confirmed_tx_throughput`): <n>
 - Total transactions attempted: <n>
 - Confirmed: <n> (<pct>%)
 - Failed: <n> (<pct>%)
 
 ## RPC latency (P50 / P95 / P99)
+Scoped to Load/Drain-phase calls only — the measured workload. Setup-phase retries
+(e.g. the funding fan-out's own anchor-confirmation retries) never inflate this table's
+Calls/Errors counts.
+| Method | Component | P50 ms | P95 ms | P99 ms | Errors |
+|---|---|---|---|---|---|
+| ...     | ...       | ...    | ...    | ...    | ...    |
+
+## Setup-phase RPC activity
+Present only when the run recorded setup-phase (`Bootstrap`/`Readiness`/`Warmup`/`Funding`)
+calls. Same table shape as above, scoped to those phases instead — informational, not
+mixed into the workload table.
 | Method | Component | P50 ms | P95 ms | P99 ms | Errors |
 |---|---|---|---|---|---|
 | ...     | ...       | ...    | ...    | ...    | ...    |

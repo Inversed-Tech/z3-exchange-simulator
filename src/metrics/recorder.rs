@@ -130,6 +130,7 @@ mod tests {
             success: true,
             error_code: None,
             error_message: None,
+            phase: crate::data_model::Phase::Unknown,
         };
         rec.record_rpc_call(call);
         let content = std::fs::read_to_string(rd.rpc_calls_path()).unwrap();
@@ -155,6 +156,7 @@ mod tests {
             success: true,
             error_code: None,
             error_message: None,
+            phase: crate::data_model::Phase::Unknown,
         };
         rec.record_rpc_call(call);
         let (p50, _, _) = rec.latency.percentiles("z_getbalances", "Zallet").unwrap();
@@ -180,6 +182,7 @@ mod tests {
             success: true,
             error_code: None,
             error_message: None,
+            phase: crate::data_model::Phase::Unknown,
         };
         rec.record_rpc_call(call);
         rec.flush_latency_samples("r-1");
@@ -213,6 +216,7 @@ mod tests {
             success: true,
             error_code: None,
             error_message: None,
+            phase: crate::data_model::Phase::Unknown,
         });
         rec.record_metric(MetricSample {
             run_id: "r".into(),
@@ -242,6 +246,7 @@ mod tests {
             success: true,
             error_code: None,
             error_message: None,
+            phase: crate::data_model::Phase::Unknown,
         };
         rec.record_rpc_call(call);
         let content = std::fs::read_to_string(rd.rpc_calls_path()).unwrap();
@@ -306,6 +311,7 @@ mod tests {
             success: true,
             error_code: None,
             error_message: None,
+            phase: crate::data_model::Phase::Unknown,
         };
 
         rec.record_rpc_call(make_call(100));

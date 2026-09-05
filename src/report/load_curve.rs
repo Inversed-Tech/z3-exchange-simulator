@@ -1,8 +1,8 @@
 //! Per-run load-curve analysis: correlates achieved throughput against
 //! latency and error rate across a run's own time windows, to surface
 //! candidate inflection/degradation points for ramp and burst scenarios —
-//! see docs/scope.md's "load-curve results (TPS vs. latency, inflection
-//! points, degradation modes)" requirement.
+//! see docs/scope.md's "load-curve results (throughput vs. latency,
+//! inflection points, degradation modes)" requirement.
 //!
 //! Deliberately computed **per run**, never merged across runs the way the
 //! RPC matrix is: two runs' time series only make sense to overlay if they
@@ -46,16 +46,19 @@ fn percentile_value(sorted: &[u64], p: f64) -> f64 {
 }
 
 /// One time window's throughput, latency, and error rate across every RPC
-/// call in the window, all methods combined — the single TPS-vs-latency
+/// call in the window, all methods combined — the single throughput-vs-latency
 /// curve scope.md asks for, as opposed to `report::latency::windowed_stats`'s
-/// per-method breakdown.
+/// per-method breakdown. `rpc_calls_per_second` counts every RPC call in the
+/// window regardless of method or outcome — it is not a confirmed-transaction
+/// rate (see `crate::data_model` and `RunManifest`'s `confirmed_tx_throughput`
+/// metric for that).
 #[derive(Debug, Clone)]
 pub struct LoadCurvePoint {
     pub window_start: DateTime<Utc>,
     pub window_end: DateTime<Utc>,
     pub calls: u64,
     pub errors: u64,
-    pub tps: f64,
+    pub rpc_calls_per_second: f64,
     pub p50_ms: Option<f64>,
     pub p95_ms: Option<f64>,
     pub p99_ms: Option<f64>,
@@ -116,7 +119,7 @@ pub fn windowed_load_curve(calls: &[RpcCall], window_secs: i64) -> Vec<LoadCurve
                 window_end: b.window_start + chrono::Duration::seconds(window_secs),
                 calls: b.calls,
                 errors: b.errors,
-                tps: b.calls as f64 / window_secs as f64,
+                rpc_calls_per_second: b.calls as f64 / window_secs as f64,
                 p50_ms: p50,
                 p95_ms: p95,
                 p99_ms: p99,
@@ -136,7 +139,7 @@ pub struct DegradationPoint {
     pub window_start: DateTime<Utc>,
     pub window_end: DateTime<Utc>,
     pub offset_secs: i64,
-    pub tps: f64,
+    pub rpc_calls_per_second: f64,
     pub calls: u64,
     pub errors: u64,
     pub error_rate: f64,
@@ -193,7 +196,7 @@ pub fn find_degradation_point(points: &[LoadCurvePoint]) -> Option<DegradationPo
             window_start: point.window_start,
             window_end: point.window_end,
             offset_secs: (point.window_start - run_start).num_seconds(),
-            tps: point.tps,
+            rpc_calls_per_second: point.rpc_calls_per_second,
             calls: point.calls,
             errors: point.errors,
             error_rate,
@@ -207,23 +210,37 @@ pub fn find_degradation_point(points: &[LoadCurvePoint]) -> Option<DegradationPo
     None
 }
 
-/// The window with the highest achieved TPS in a run's load curve — used
-/// for the per-run "peak throughput" digest line, distinct from the
-/// candidate degradation point (a run can peak well before or after it
-/// degrades).
+/// The window with the highest RPC-call rate (all methods combined) in a
+/// run's load curve — used for the per-run "peak throughput" digest line,
+/// distinct from the candidate degradation point (a run can peak well
+/// before or after it degrades).
 pub fn peak_tps_point(points: &[LoadCurvePoint]) -> Option<&LoadCurvePoint> {
-    points
-        .iter()
-        .max_by(|a, b| a.tps.partial_cmp(&b.tps).unwrap())
+    points.iter().max_by(|a, b| {
+        a.rpc_calls_per_second
+            .partial_cmp(&b.rpc_calls_per_second)
+            .unwrap()
+    })
 }
 
 /// Flags at most one candidate degradation point per run — see
-/// [`find_degradation_point`] for the exact rule.
+/// [`find_degradation_point`] for the exact rule. Scoped to `Load`/`Drain`
+/// RPC calls only (see `crate::data_model::Phase::is_workload`): setup-phase
+/// activity (bootstrap, warmup mining, funding fan-out) is not the measured
+/// workload and must not feed degradation detection.
 pub fn load_degradation_candidates(runs: &[RunData]) -> Vec<Finding> {
-    let fmt_ms = |v: Option<f64>| v.map(|v| format!("{v:.0}ms")).unwrap_or_else(|| "N/A".into());
+    let fmt_ms = |v: Option<f64>| {
+        v.map(|v| format!("{v:.0}ms"))
+            .unwrap_or_else(|| "N/A".into())
+    };
     let mut out = Vec::new();
     for run in runs {
-        let points = windowed_load_curve(&run.rpc_calls, DEFAULT_WINDOW_SECS);
+        let workload_calls: Vec<RpcCall> = run
+            .rpc_calls
+            .iter()
+            .filter(|c| c.phase.is_workload())
+            .cloned()
+            .collect();
+        let points = windowed_load_curve(&workload_calls, DEFAULT_WINDOW_SECS);
         let Some(d) = find_degradation_point(&points) else {
             continue;
         };
@@ -231,10 +248,10 @@ pub fn load_degradation_candidates(runs: &[RunData]) -> Vec<Finding> {
             category: FindingCategory::LoadDegradation,
             severity: d.severity,
             summary: format!(
-                "{}: candidate inflection point at +{}s — {:.1} TPS, P99 {}, error rate {:.0}%",
+                "{}: candidate inflection point at +{}s — {:.1} RPC calls/s, P99 {}, error rate {:.0}%",
                 run.manifest.run_id,
                 d.offset_secs,
-                d.tps,
+                d.rpc_calls_per_second,
                 fmt_ms(d.p99_ms),
                 d.error_rate * 100.0,
             ),
@@ -274,6 +291,19 @@ mod tests {
             success,
             error_code: if success { None } else { Some(-1) },
             error_message: None,
+            phase: crate::data_model::Phase::Load,
+        }
+    }
+
+    fn call_at_phase(
+        secs_offset: i64,
+        latency_ms: Option<u64>,
+        success: bool,
+        phase: crate::data_model::Phase,
+    ) -> RpcCall {
+        RpcCall {
+            phase,
+            ..call_at(secs_offset, latency_ms, success)
         }
     }
 
@@ -318,6 +348,8 @@ mod tests {
                 scenario_config_hash: "sha256:x".into(),
                 target_tps: 10.0,
                 timeouts: RunTimeouts::default(),
+                phase_boundaries: Vec::new(),
+                load_and_drain_completed_at: None,
             },
             rpc_calls: calls,
             intents: Vec::new(),
@@ -380,6 +412,60 @@ mod tests {
     }
 
     #[test]
+    fn load_degradation_candidates_excludes_setup_phase_calls() {
+        // The exact same latency-jump shape that
+        // flags_degradation_when_latency_jumps_past_baseline detects — but
+        // every call is tagged Funding (the funding fan-out's own mining),
+        // not Load/Drain. It must not be flagged: setup-phase activity is
+        // not the measured workload.
+        let mut calls: Vec<RpcCall> = Vec::new();
+        for i in 0..6 {
+            calls.push(call_at_phase(
+                i,
+                Some(20),
+                true,
+                crate::data_model::Phase::Funding,
+            ));
+        }
+        for i in 10..16 {
+            calls.push(call_at_phase(
+                i,
+                Some(400),
+                true,
+                crate::data_model::Phase::Funding,
+            ));
+        }
+        let r = run_with_calls("r1", calls);
+        assert!(load_degradation_candidates(&[r]).is_empty());
+    }
+
+    #[test]
+    fn load_degradation_candidates_still_fires_when_drain_phase_calls_are_present() {
+        // Drain-phase calls are part of the measured workload alongside
+        // Load — a degradation that only shows up in the drain tail must
+        // still be caught.
+        let mut calls: Vec<RpcCall> = Vec::new();
+        for i in 0..6 {
+            calls.push(call_at_phase(
+                i,
+                Some(20),
+                true,
+                crate::data_model::Phase::Load,
+            ));
+        }
+        for i in 10..16 {
+            calls.push(call_at_phase(
+                i,
+                Some(400),
+                true,
+                crate::data_model::Phase::Drain,
+            ));
+        }
+        let r = run_with_calls("r1", calls);
+        assert!(!load_degradation_candidates(&[r]).is_empty());
+    }
+
+    #[test]
     fn at_most_one_degradation_finding_per_run() {
         let mut calls: Vec<RpcCall> = Vec::new();
         for i in 0..6 {
@@ -427,6 +513,8 @@ mod tests {
         let r = run_with_calls("r1", calls);
         let findings = load_degradation_candidates(&[r]);
         assert_eq!(findings.len(), 1);
-        assert!(findings[0].summary.contains(&format!("+{}s", direct.offset_secs)));
+        assert!(findings[0]
+            .summary
+            .contains(&format!("+{}s", direct.offset_secs)));
     }
 }

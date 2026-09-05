@@ -29,6 +29,29 @@ pub struct RunManifest {
     pub scenario_config_hash: String,
     pub target_tps: f64,
     pub timeouts: RunTimeouts,
+    /// Wall-clock start time of each lifecycle phase this run passed through
+    /// (see `crate::data_model::Phase`), in the order they occurred. Absent
+    /// (empty) on manifests written before phase instrumentation landed —
+    /// `#[serde(default)]` lets those older manifests keep deserializing.
+    #[serde(default)]
+    pub phase_boundaries: Vec<PhaseBoundary>,
+    /// Wall-clock instant `load_phase()` returned — i.e. the moment the
+    /// Drain phase's own work (not the Z3 stack's subsequent teardown)
+    /// finished. This, not `run_completed_at` (which includes teardown
+    /// time), is the correct end boundary for the Drain phase's *measured*
+    /// duration and for `confirmed_tx_throughput`'s elapsed-time window —
+    /// both stop counting at this same instant. `None` when the run never
+    /// reached this point (setup failed) or predates this field.
+    #[serde(default)]
+    pub load_and_drain_completed_at: Option<DateTime<Utc>>,
+}
+
+/// One lifecycle phase's start time, as recorded by
+/// `crate::scenarios::runner::phase::PhaseTracker`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PhaseBoundary {
+    pub phase: crate::data_model::Phase,
+    pub started_at: DateTime<Utc>,
 }
 
 pub fn write_manifest(path: &Path, manifest: &RunManifest) -> Result<(), MetricsError> {
@@ -125,6 +148,8 @@ mod tests {
             scenario_config_hash: "sha256:deadbeef".into(),
             target_tps: 10.0,
             timeouts: RunTimeouts::default(),
+            phase_boundaries: Vec::new(),
+            load_and_drain_completed_at: None,
         };
         write_manifest(&path, &m).unwrap();
         let back = read_manifest(&path).unwrap();
@@ -234,6 +259,8 @@ overrides:
                 scenario_config_hash: "".into(),
                 target_tps: 0.0,
                 timeouts: RunTimeouts::default(),
+                phase_boundaries: Vec::new(),
+                load_and_drain_completed_at: None,
             },
         )
         .unwrap();
@@ -264,6 +291,8 @@ overrides:
             scenario_config_hash: "hash".into(),
             target_tps: 5.0,
             timeouts: RunTimeouts::default(),
+            phase_boundaries: Vec::new(),
+            load_and_drain_completed_at: None,
         };
         write_manifest(&path, &m).unwrap();
         let partial = read_manifest(&path).unwrap();
@@ -297,6 +326,8 @@ overrides:
             scenario_config_hash: "".into(),
             target_tps: 0.0,
             timeouts: RunTimeouts::default(),
+            phase_boundaries: Vec::new(),
+            load_and_drain_completed_at: None,
         };
         write_manifest(&path, &m).unwrap();
         let back = read_manifest(&path).unwrap();
