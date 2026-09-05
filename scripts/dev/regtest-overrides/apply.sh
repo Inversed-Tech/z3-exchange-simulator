@@ -28,12 +28,15 @@
 #   5. Copies docker-compose.regtest.override.yml (Zaino 0.6.0 private-bind
 #      fix) into the stack directory.
 #
-# Run order on a fresh machine:
+# Run order on a fresh machine — or just run scripts/dev/bootstrap.sh, which
+# sequences all of this (plus a dependency check) as one command:
 #   bash scripts/dev/clone-z3.sh
 #   bash scripts/dev/regtest-overrides/apply.sh          # this script
 #   bash scripts/dev/zallet-release-image/build.sh       # local Zallet image
-#   (cd external/z3 && ./scripts/regtest-init.sh)
-#   bash scripts/dev/regtest-miner-setup.sh
+#   ./target/debug/z3sim print-versions                  # brings the stack up
+#                                                         # and bootstraps the
+#                                                         # wallet/miner (see
+#                                                         # Z3Config::ensure_wallet_bootstrapped)
 #
 # Requirements: the stack's own setup-network.sh requirements (rage-keygen,
 # openssl) plus GNU sed.
@@ -184,5 +187,6 @@ log "==> Copied docker-compose.regtest.override.yml into $Z3_DIR."
 log ""
 log "Override set applied. Next steps:"
 log "  bash scripts/dev/zallet-release-image/build.sh ${ZALLET_VERSION}"
-log "  (cd ${Z3_DIR} && ./scripts/regtest-init.sh)"
-log "  bash scripts/dev/regtest-miner-setup.sh"
+log "  cargo build && ./target/debug/z3sim print-versions   # brings the stack up and"
+log "                                                        # bootstraps the wallet/miner"
+log "(or just run scripts/dev/bootstrap.sh, which sequences all of the above)"

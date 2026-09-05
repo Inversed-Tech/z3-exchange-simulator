@@ -270,7 +270,9 @@ regtest_nuparams = [ …, "4dec4df0:3", "5437f330:3" ]
   `z_send_many_with_policy`; `AccountInfo` now carries the `addresses` array so callers can
   reuse instead of derive.
 - `scripts/dev/regtest-miner-setup.sh` — points `miner_address` at the hot wallet, the
-  account the runner spends from.
+  account the runner spends from. Sequenced automatically (idempotent, per env_id) by
+  `Z3Config::ensure_wallet_bootstrapped` (`src/z3/mod.rs`) ahead of every `z3sim run`/
+  `z3sim print-versions` — see `scripts/dev/bootstrap.sh` for the one-command setup path.
 
 ---
 

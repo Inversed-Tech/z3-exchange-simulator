@@ -111,9 +111,8 @@ z3-exchange-simulator/
 # Clone the Z3 Docker Compose stack at the pinned commit
 make clone-z3
 
-# Start the Z3 regtest stack (one-time init, then up)
-cd external/z3 && ./scripts/regtest-init.sh
-docker compose --env-file .env.regtest up -d
+# Check dependencies, apply the working override stack, and bring it up
+make bootstrap
 
 # Build the simulator binary
 make build
@@ -121,6 +120,12 @@ make build
 # Run the smoke scenario
 ./target/debug/z3sim run --scenario configs/scenarios/smoke.yaml
 ```
+
+`make bootstrap` (`scripts/dev/bootstrap.sh`) checks required local dependencies
+(Docker, Docker Compose, `rage-keygen`, OpenSSL, `curl`, `jq`, Rust build dependencies,
+disk space), applies the working component set described below, and brings the stack up
+with a bootstrapped wallet and miner account — printing the exact image each component is
+running. It's safe to re-run (every step it sequences is idempotent).
 
 ## Resetting the regtest environment
 
@@ -165,15 +170,19 @@ see [`docs/integration/pinned-commits.md`](docs/integration/pinned-commits.md).
 | Zaino | `0.4.0-rc.2` (`zingodevops/zainod:0.4.0-rc.2`) | `0cf4fd5008a7536e3495e3e377073faac1cb28f3` |
 | Zallet | `v0.1.0-alpha.3` (`electriccoinco/zallet:v0.1.0-alpha.3`) | `6fc85f68cf5ebe456160c6518255a83129e7d21c` |
 
-**Regtest override set.** The frozen Zallet pin cannot spend from any pool (its
-`z_sendmany` passes a shielded-only spend policy to the proposal builder), so no scenario
-can confirm a transaction on the pins above. Live runs use the upstream-coherent override
-set recorded in the `overrides:` section of [`z3-commits.lock`](z3-commits.lock) — Zebra
-`v6.0.0` + Zaino `0.6.0` + Zallet `v0.1.0-beta.2` (built locally by
+**Reproducibility reference only** — this pin cannot complete a transaction end-to-end
+(its Zallet `z_sendmany` passes a shielded-only spend policy to the proposal builder, so
+it cannot spend from any pool; see
+[`docs/zallet-transparent-spending-bug.md`](docs/zallet-transparent-spending-bug.md)) and
+is not used by `make bootstrap`. The override set below is what actually runs.
+
+**Regtest override set.** Live runs use the upstream-coherent override set recorded in
+the `overrides:` section of [`z3-commits.lock`](z3-commits.lock) — Zebra `v6.0.0` + Zaino
+`0.6.0` + Zallet `v0.1.0-beta.2` (built locally by
 [`scripts/dev/zallet-release-image/build.sh`](scripts/dev/zallet-release-image/build.sh);
 upstream publishes no image past alpha.3) — applied via `Z3_*_IMAGE` variables in
-`external/z3/.env.regtest`. The full evidence trail is in
-[`docs/regtest-funding-plan.md`](docs/regtest-funding-plan.md).
+`external/z3/.env.regtest`. `make bootstrap` applies this set automatically; the full
+evidence trail is in [`docs/regtest-funding-plan.md`](docs/regtest-funding-plan.md).
 
 ## Development commands
 
@@ -181,6 +190,7 @@ upstream publishes no image past alpha.3) — applied via `Z3_*_IMAGE` variables
 make help                # List all available commands
 make setup               # Check local development dependencies
 make clone-z3            # Clone pinned Z3 repositories
+make bootstrap           # Check dependencies, apply the working override stack, bring it up
 make build               # Build the simulator binary (debug)
 make build-release       # Build an optimized release binary
 make test                # Run all tests

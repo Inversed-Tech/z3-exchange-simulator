@@ -14,6 +14,7 @@ use crate::scenarios::runner::{
     load_scenario, validate_scenario, ConfigError, LoadShape, RunOptions, RunnerError,
 };
 use crate::synthetic::{write_fixtures, AccountGenerator, FixtureError, GeneratorError};
+use crate::z3::{env_id, run_lock, Z3Config, Z3Error, Z3Stack};
 
 // ── Cli types ─────────────────────────────────────────────────────────────────
 
@@ -40,8 +41,15 @@ pub struct Cli {
 pub enum Commands {
     Run(RunArgs),
     GenerateFixtures(GenerateFixturesArgs),
-    ValidateScenario { path: PathBuf },
+    ValidateScenario {
+        path: PathBuf,
+    },
     Report(ReportArgs),
+    /// Bring up this checkout's Z3 stack (bootstrapping the wallet and miner
+    /// if needed) and print the exact image each component is running.
+    /// Thin wrapper used by `scripts/dev/bootstrap.sh`'s final phase — see
+    /// `docs/regtest-funding-plan.md`.
+    PrintVersions(PrintVersionsArgs),
 }
 
 #[derive(clap::Args)]
@@ -122,6 +130,21 @@ pub struct RunArgs {
     pub run_lock_dir: Option<PathBuf>,
 }
 
+#[derive(clap::Args, Default)]
+pub struct PrintVersionsArgs {
+    /// Test-only overrides for `compose_dir`/`env_id_cache_path`/
+    /// `run_lock_dir` — never real CLI flags (`#[arg(skip)]`). See
+    /// `RunArgs`'s equivalent fields for why: this keeps a test exercising
+    /// this command from reaching a real `external/z3` checkout or writing
+    /// into the real checkout's `configs/local/`.
+    #[arg(skip)]
+    pub compose_dir: Option<PathBuf>,
+    #[arg(skip)]
+    pub env_id_cache_path: Option<PathBuf>,
+    #[arg(skip)]
+    pub run_lock_dir: Option<PathBuf>,
+}
+
 #[derive(clap::Args)]
 pub struct GenerateFixturesArgs {
     /// Scenario YAML to derive seed and account params from
@@ -160,6 +183,9 @@ pub enum CliError {
     Io(std::io::Error),
     /// SIGINT received; teardown completed; triggers exit 130.
     Interrupted,
+    /// `print-versions` failed to resolve the environment, bootstrap the
+    /// wallet, bring the stack up, or query its running images.
+    Z3(Z3Error),
 }
 
 impl std::fmt::Display for CliError {
@@ -182,6 +208,7 @@ impl std::fmt::Display for CliError {
             CliError::InvalidArgs(s) => write!(f, "invalid arguments: {s}"),
             CliError::Io(e) => write!(f, "{e}"),
             CliError::Interrupted => write!(f, "interrupted"),
+            CliError::Z3(e) => write!(f, "{e}"),
         }
     }
 }
@@ -195,6 +222,7 @@ impl std::error::Error for CliError {
             CliError::Generator(e) => Some(e),
             CliError::Report(e) => Some(e),
             CliError::Io(e) => Some(e),
+            CliError::Z3(e) => Some(e),
             _ => None,
         }
     }
@@ -354,6 +382,80 @@ fn generate_fixtures_command(args: &GenerateFixturesArgs) -> Result<(), CliError
     Ok(())
 }
 
+// ── print_versions_command ────────────────────────────────────────────────────
+
+/// Bring this checkout's env-id-derived Z3 stack up (bootstrapping the
+/// wallet/miner if this is the first time this environment has been used),
+/// then print the resolved image each component is actually running.
+///
+/// Deliberately reuses the SAME env-id resolution `z3sim run` uses (stable,
+/// cache-based — see `env_id::resolve_env_id`): whatever environment this
+/// brings up and bootstraps here is the exact one a subsequent `z3sim run`
+/// on this checkout reuses, so bootstrap's own work is never wasted or
+/// duplicated under a second, different project name.
+///
+/// Acquires the same per-`env_id` `RunLock` `lifecycle::setup` does, in the
+/// same order (resolve env_id, then lock, before anything touches Docker) —
+/// without it, a concurrent `z3sim run` against the same (stable) `env_id`
+/// and this command's own `bring_up`/teardown-on-error could race Docker
+/// operations against each other with no "environment busy" signal, exactly
+/// what Track 2's lock exists to prevent. Held for this function's duration
+/// via the returned guard's ordinary `Drop`.
+async fn print_versions_command(args: &PrintVersionsArgs) -> Result<(), CliError> {
+    let compose_dir = args
+        .compose_dir
+        .clone()
+        .unwrap_or_else(|| PathBuf::from("external/z3"));
+    let env_id_cache_path = args
+        .env_id_cache_path
+        .clone()
+        .unwrap_or_else(|| PathBuf::from("configs/local/env-id"));
+    let run_lock_dir = args
+        .run_lock_dir
+        .clone()
+        .unwrap_or_else(|| PathBuf::from("configs/local"));
+
+    let resolved_env_id =
+        env_id::resolve_env_id(&env_id_cache_path, false).map_err(CliError::Z3)?;
+    let _run_lock = run_lock::acquire(&resolved_env_id, &run_lock_dir).map_err(CliError::Z3)?;
+    let log_dir = PathBuf::from("configs/local/bootstrap-logs");
+    let z3_config = Z3Config::for_run("bootstrap", log_dir, &resolved_env_id, compose_dir)
+        .map_err(CliError::Z3)?;
+
+    z3_config
+        .ensure_wallet_bootstrapped()
+        .await
+        .map_err(CliError::Z3)?;
+
+    // On failure, best-effort tear the stack back down before returning —
+    // `bring_up` may have brought some containers up before the health check
+    // timed out, and mirrors the same failure-cleanup convention
+    // `lifecycle::setup` uses around `Z3Stack::start`.
+    let mut stack = Z3Stack::new(z3_config, None);
+    if let Err(e) = stack.bring_up().await {
+        let _ = stack.stop().await;
+        return Err(CliError::Z3(e));
+    }
+
+    let images = stack.image_digests().await.map_err(CliError::Z3)?;
+    println!(
+        "Running images for environment {resolved_env_id} (image IDs are local content \
+         hashes, not necessarily pullable registry digests — see \
+         docs/regtest-funding-plan.md):"
+    );
+    for img in &images {
+        let label = match img.service.as_str() {
+            "zebra" => "Zebra",
+            "zaino" => "Zaino",
+            "zallet" => "Zallet",
+            "rpc-router" => "RPC Router",
+            other => other,
+        };
+        println!("  {label:<10}: {} (image id {})", img.image, img.id);
+    }
+    Ok(())
+}
+
 // ── run_command ───────────────────────────────────────────────────────────────
 
 /// Apply `RunArgs`'s test-only path overrides (see their doc comments) onto
@@ -454,6 +556,7 @@ pub async fn dispatch(cli: Cli) -> Result<(), CliError> {
         Commands::GenerateFixtures(args) => generate_fixtures_command(&args),
         Commands::ValidateScenario { path } => validate_scenario_command(&path),
         Commands::Report(args) => report_command(&args),
+        Commands::PrintVersions(args) => print_versions_command(&args).await,
     }
 }
 

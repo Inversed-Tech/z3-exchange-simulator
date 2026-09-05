@@ -4,6 +4,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::task::JoinHandle;
@@ -452,15 +453,65 @@ impl Z3Stack {
     /// Start the Docker Compose stack, wait for the RPC Router to become healthy,
     /// then launch background log capture and resource sampling tasks.
     pub async fn start(&mut self) -> Result<(), Z3Error> {
+        self.bring_up().await?;
+        self.spawn_log_capture();
+        self.spawn_resource_sampling();
+        Ok(())
+    }
+
+    /// Bring the Compose stack up and wait for the RPC Router to become
+    /// healthy, without spawning the log-capture/resource-sampling background
+    /// tasks a full scenario run keeps alive for its own duration.
+    ///
+    /// Used by `z3sim print-versions` (bootstrap's version-printing step),
+    /// which is a short-lived process: `spawn_log_capture`'s tasks each hold
+    /// a `docker compose logs --follow` child process open for as long as
+    /// they run, and are only ever reaped by `stop()`'s explicit
+    /// `handle.abort()` — a caller that starts the stack, prints versions,
+    /// and exits (rather than running a full scenario and calling `stop()`)
+    /// would otherwise leak those child processes as orphans.
+    pub async fn bring_up(&mut self) -> Result<(), Z3Error> {
         self.check_preconditions()?;
         tokio::fs::create_dir_all(&self.config.log_dir)
             .await
             .map_err(Z3Error::LogDirCreate)?;
         self.run_compose(&["up", "-d"]).await?;
         self.wait_until_ready().await?;
-        self.spawn_log_capture();
-        self.spawn_resource_sampling();
         Ok(())
+    }
+
+    /// Resolve the image (repository:tag) and image ID Docker actually used
+    /// for each of [`VERSION_SERVICES`] in this stack's Compose project.
+    ///
+    /// Requires the project to already have created containers (i.e.
+    /// [`Z3Stack::start`]/[`Z3Stack::bring_up`] has run at least once) —
+    /// `docker compose images` reports on containers, not on compose config
+    /// alone, and returns nothing for a project that has never been brought
+    /// up.
+    pub async fn image_digests(&self) -> Result<Vec<ImageInfo>, Z3Error> {
+        let args = ["images", "--format", "json"];
+        let full_args = compose_base_args(&self.config.compose_project, &args);
+        let output = Command::new("docker")
+            .args(&full_args)
+            .envs(self.config.compose_env_overrides.iter().cloned())
+            .current_dir(&self.config.compose_dir)
+            .output()
+            .await
+            .map_err(|e| Z3Error::ComposeCommand {
+                args: args.join(" "),
+                stderr: e.to_string(),
+            })?;
+
+        if !output.status.success() {
+            return Err(Z3Error::ComposeCommand {
+                args: args.join(" "),
+                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            });
+        }
+        parse_compose_images(
+            &String::from_utf8_lossy(&output.stdout),
+            &self.config.compose_project,
+        )
     }
 
     /// Abort background tasks and bring the Docker Compose stack down.
@@ -654,6 +705,92 @@ async fn capture_logs(
             let _ = writer.flush().await;
         }
     }
+}
+
+/// One component's resolved image identity, from `docker compose images
+/// --format json` for a given, already-running Compose project.
+///
+/// Labeled `id`, not `digest`, deliberately: `docker compose images`'s own
+/// `ID` field is the local content-addressed image ID, which is not
+/// guaranteed to equal a pullable registry manifest digest (storage-driver
+/// dependent) — and a locally-built image (Zallet, the RPC Router: neither is
+/// ever pushed to a registry) has no registry digest to compare against at
+/// all. It is still a unique, reproducible content hash of the image bytes
+/// actually running, which is what "prove which image bytes ran" needs, just
+/// not the same claim a registry digest would be.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImageInfo {
+    pub service: String,
+    pub image: String,
+    pub id: String,
+}
+
+/// Services [`parse_compose_images`] reports on, in print/manifest order.
+/// Deliberately distinct from [`SERVICES`] (log-capture/`docker stats` scope:
+/// zebra/zallet/zaino only, matched against every sampled container) — this
+/// additionally covers the RPC Router, which has its own image identity worth
+/// surfacing here but no log-capture or resource-sampling role of its own.
+const VERSION_SERVICES: &[&str] = &["zebra", "zaino", "zallet", "rpc-router"];
+
+/// Parse `docker compose images --format json`'s output for `project`,
+/// keeping only [`VERSION_SERVICES`] — this drops the stack's one-shot
+/// permission/setup helper containers (`cookie-permissions`,
+/// `zallet-permissions`), which `docker compose images` reports on too but
+/// which have no image identity a reader would want surfaced here — and
+/// deriving each kept container's service name by stripping the
+/// `<project>-` prefix (mirrors [`container_in_project`]) and the trailing
+/// Compose replica index (`-<n>`).
+///
+/// Returns an empty list, not an error, for the literal JSON `null` `docker
+/// compose images` prints when the project has no created containers yet
+/// (i.e. before `up -d` has ever run for it) — an absent stack is not a
+/// parse failure.
+fn parse_compose_images(json: &str, project: &str) -> Result<Vec<ImageInfo>, Z3Error> {
+    #[derive(Deserialize)]
+    struct RawImage {
+        #[serde(rename = "ID")]
+        id: String,
+        #[serde(rename = "ContainerName")]
+        container_name: String,
+        #[serde(rename = "Repository")]
+        repository: String,
+        #[serde(rename = "Tag")]
+        tag: String,
+    }
+
+    let trimmed = json.trim();
+    if trimmed.is_empty() || trimmed == "null" {
+        return Ok(Vec::new());
+    }
+    let raw: Vec<RawImage> =
+        serde_json::from_str(trimmed).map_err(|e| Z3Error::ComposeCommand {
+            args: "images --format json".to_string(),
+            stderr: format!("could not parse `docker compose images` output: {e}"),
+        })?;
+
+    let prefix = format!("{project}-");
+    let mut out = Vec::new();
+    for img in raw {
+        let Some(rest) = img.container_name.strip_prefix(&prefix) else {
+            continue;
+        };
+        let service = rest.rsplit_once('-').map_or(rest, |(svc, _n)| svc);
+        if !VERSION_SERVICES.contains(&service) {
+            continue;
+        }
+        out.push(ImageInfo {
+            service: service.to_string(),
+            image: format!("{}:{}", img.repository, img.tag),
+            id: img.id,
+        });
+    }
+    out.sort_by_key(|i| {
+        VERSION_SERVICES
+            .iter()
+            .position(|s| *s == i.service)
+            .unwrap_or(usize::MAX)
+    });
+    Ok(out)
 }
 
 /// Whether a `docker stats` container name belongs to the given Compose project.
@@ -1364,5 +1501,76 @@ networks:
 
         let client = reqwest::Client::new();
         assert!(!health_check(&client, &format!("http://{addr}"), None).await);
+    }
+
+    // ── parse_compose_images ─────────────────────────────────────────────────
+
+    /// Captured verbatim from `docker compose images --format json` against a
+    /// real, live-brought-up regtest stack (project `z3-sim-9387ad5f`) — not
+    /// hand-constructed, so this fixture matches Docker's actual field names
+    /// and casing (`ID`/`ContainerName`/`Repository`/`Tag`) exactly.
+    const REAL_COMPOSE_IMAGES_JSON: &str = r#"[{"ID":"sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b","ContainerName":"z3-sim-9387ad5f-cookie-permissions-1","Repository":"alpine","Tag":"3","Platform":"linux/arm64/v8","Size":4193907,"Created":"2026-06-16T00:01:20.474100947Z","LastTagTime":"2026-07-30T14:34:03.729680089Z"},{"ID":"sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b","ContainerName":"z3-sim-9387ad5f-zallet-permissions-1","Repository":"alpine","Tag":"3","Platform":"linux/arm64/v8","Size":4193907,"Created":"2026-06-16T00:01:20.474100947Z","LastTagTime":"2026-07-30T14:34:03.729680089Z"},{"ID":"sha256:5b8dcbe525fd86a3faa469a497a0770c7b0512476467ac4b495c201dd5cd4040","ContainerName":"z3-sim-9387ad5f-rpc-router-1","Repository":"z3-sim-9387ad5f-rpc-router","Tag":"latest","Platform":"linux/arm64","Size":11584117,"Created":"2026-09-04T13:04:27.893797676Z","LastTagTime":"2026-09-04T16:25:22.222079005Z"},{"ID":"sha256:a9059a7b8a32d294905d1dcb72987d9dfd2443a39f3453d92a9e5b46aa523f9f","ContainerName":"z3-sim-9387ad5f-zallet-1","Repository":"z3sim/zallet","Tag":"v0.1.0-beta.2","Platform":"linux/amd64","Size":175070006,"Created":"2026-07-31T13:27:25.55376018Z","LastTagTime":"2026-07-31T13:27:29.277409001Z"},{"ID":"sha256:3ed6cbb5ed85d6a610ec5cf80cffb4a14a6f5b2517abad754a296cad95605bb0","ContainerName":"z3-sim-9387ad5f-zaino-1","Repository":"zingodevops/zainod","Tag":"0.6.0-no-tls","Platform":"linux/amd64","Size":46126956,"Created":"2026-07-13T20:25:28.831733091Z","LastTagTime":"2026-07-30T14:34:49.078297388Z"},{"ID":"sha256:78a10b7f24b83a86e6223d97e857094a353454e3268f84a87bd987e7140a33bb","ContainerName":"z3-sim-9387ad5f-zebra-1","Repository":"zfnd/zebra","Tag":"6.0.0","Platform":"linux/amd64","Size":118207384,"Created":"2026-07-10T21:17:50Z","LastTagTime":"2026-08-06T15:04:54.156594668Z"}]"#;
+
+    #[test]
+    fn parse_compose_images_matches_docker_compose_images_output() {
+        let images = parse_compose_images(REAL_COMPOSE_IMAGES_JSON, "z3-sim-9387ad5f").unwrap();
+        assert_eq!(
+            images,
+            vec![
+                ImageInfo {
+                    service: "zebra".into(),
+                    image: "zfnd/zebra:6.0.0".into(),
+                    id: "sha256:78a10b7f24b83a86e6223d97e857094a353454e3268f84a87bd987e7140a33bb"
+                        .into(),
+                },
+                ImageInfo {
+                    service: "zaino".into(),
+                    image: "zingodevops/zainod:0.6.0-no-tls".into(),
+                    id: "sha256:3ed6cbb5ed85d6a610ec5cf80cffb4a14a6f5b2517abad754a296cad95605bb0"
+                        .into(),
+                },
+                ImageInfo {
+                    service: "zallet".into(),
+                    image: "z3sim/zallet:v0.1.0-beta.2".into(),
+                    id: "sha256:a9059a7b8a32d294905d1dcb72987d9dfd2443a39f3453d92a9e5b46aa523f9f"
+                        .into(),
+                },
+                ImageInfo {
+                    service: "rpc-router".into(),
+                    image: "z3-sim-9387ad5f-rpc-router:latest".into(),
+                    id: "sha256:5b8dcbe525fd86a3faa469a497a0770c7b0512476467ac4b495c201dd5cd4040"
+                        .into(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_compose_images_excludes_permission_helper_containers() {
+        let images = parse_compose_images(REAL_COMPOSE_IMAGES_JSON, "z3-sim-9387ad5f").unwrap();
+        assert!(images.iter().all(|i| i.service != "cookie-permissions"));
+        assert!(images.iter().all(|i| i.service != "zallet-permissions"));
+        assert_eq!(images.len(), 4, "expected exactly the 4 VERSION_SERVICES");
+    }
+
+    #[test]
+    fn parse_compose_images_null_yields_empty_not_error() {
+        let images = parse_compose_images("null", "z3-sim-9387ad5f").unwrap();
+        assert!(images.is_empty());
+    }
+
+    #[test]
+    fn parse_compose_images_only_matches_own_project_prefix() {
+        // A container from a DIFFERENT project must never be attributed to
+        // this one, even if its own suffix looks like a known service.
+        let json = r#"[{"ID":"sha256:abc","ContainerName":"z3-sim-other0000-zebra-1","Repository":"zfnd/zebra","Tag":"6.0.0"}]"#;
+        let images = parse_compose_images(json, "z3-sim-9387ad5f").unwrap();
+        assert!(images.is_empty());
+    }
+
+    #[test]
+    fn parse_compose_images_rejects_malformed_json() {
+        let err = parse_compose_images("not json", "z3-sim-9387ad5f").unwrap_err();
+        assert!(matches!(err, Z3Error::ComposeCommand { .. }));
     }
 }
