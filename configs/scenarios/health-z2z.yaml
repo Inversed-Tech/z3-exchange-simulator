@@ -32,3 +32,16 @@ activity_profiles:
 amounts:
   min_zatoshis: 10000
   max_zatoshis: 1000000
+
+
+# Baselined against run 20260906T083848Z-health-z2z: attempted 25, confirmed 9,
+# failed 16 — all mempool_conflict under the current IntentFailureClass::classify
+# (13 transparent-style "already spent" rejections, 3 Orchard "duplicate
+# nullifier" double-spends, both classified as mempool_conflict) — concurrent
+# shielded intents racing the same note within the small, high-concurrency
+# account pool, timed_out 0 (see experiments/runs/20260906T083848Z-health-z2z/).
+expectations:
+  min_confirmed: 8
+  max_terminal_failures: 20
+  max_timeouts: 0
+  allowed_error_classes: []

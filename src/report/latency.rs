@@ -176,6 +176,8 @@ mod tests {
             error_code: if success { None } else { Some(-1) },
             error_message: None,
             phase: crate::data_model::Phase::Unknown,
+            intent_id: None,
+            attempt_number: 1,
         }
     }
 

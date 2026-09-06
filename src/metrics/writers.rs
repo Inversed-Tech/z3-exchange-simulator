@@ -100,6 +100,8 @@ mod tests {
             error_code: None,
             error_message: None,
             phase: crate::data_model::Phase::Unknown,
+            intent_id: None,
+            attempt_number: 1,
         };
         writer.write_record(&call);
         let content = std::fs::read_to_string(&path).unwrap();

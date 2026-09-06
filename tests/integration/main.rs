@@ -29,29 +29,19 @@ async fn test_smoke_scenario_via_runner() {
         "expected at least one intent"
     );
 
-    // Minimum confirmation rate. Before the measured funding pipeline landed,
-    // a run that confirmed 0 of 60 intents still passed this test, because it
-    // only asserted that the runner returned Ok — the 100%-failure regression
-    // was invisible (docs/regtest-funding-plan.md). `confirmed > 0` alone
-    // would catch that; the 50% floor also catches systemic partial failures
-    // (e.g. one flow type's `from` form or privacy policy broken) while
-    // tolerating individual timeouts under load.
-    let confirmed_rate = result.stats.confirmed as f64 / result.stats.total_attempted as f64;
+    // Pass/fail against smoke.yaml's own `expectations` block (Track 3) —
+    // the test and the product now enforce the same threshold, instead of an
+    // independently-maintained 50% floor that could silently drift from what
+    // the scenario file itself declares. Before the measured funding pipeline
+    // landed, a run that confirmed 0 of 60 intents still passed this test,
+    // because it only asserted that the runner returned Ok — the
+    // 100%-failure regression was invisible (docs/regtest-funding-plan.md).
     assert!(
-        result.stats.confirmed > 0,
-        "no intent confirmed at all — the funding pipeline or spend path is broken \
-         (attempted {}, failed {}, timed out {})",
+        result.assertion.passed,
+        "scenario assertions failed: {:?} (attempted {}, confirmed {}, failed {}, timed out {})",
+        result.assertion.violations,
         result.stats.total_attempted,
-        result.stats.failed,
-        result.stats.timed_out,
-    );
-    assert!(
-        confirmed_rate >= 0.5,
-        "confirmation rate {:.0}% below the 50% floor (confirmed {}, attempted {}, \
-         failed {}, timed out {})",
-        confirmed_rate * 100.0,
         result.stats.confirmed,
-        result.stats.total_attempted,
         result.stats.failed,
         result.stats.timed_out,
     );
@@ -65,6 +55,66 @@ async fn test_smoke_scenario_via_runner() {
             );
         }
     }
+}
+
+/// A scenario whose `expectations.min_confirmed` is set above what the stack
+/// can plausibly achieve must exit `2` (not `0`/`1`) and name the violated
+/// threshold on stderr — the automated version of the client's own
+/// "deliberately failed scenario returns nonzero" acceptance step.
+///
+/// Run with: `cargo test -- --ignored test_deliberately_failing_scenario_exits_2_with_violation_in_report`
+#[test]
+#[ignore = "requires live Z3 regtest stack; run with: cargo test -- --ignored test_deliberately_failing_scenario_exits_2_with_violation_in_report"]
+fn test_deliberately_failing_scenario_exits_2_with_violation_in_report() {
+    let smoke = std::fs::read_to_string("configs/scenarios/smoke.yaml").unwrap();
+    // Impossible floor: no stack can confirm 999999 intents in a 60s load
+    // phase at 1 TPS. Every other field is unchanged from smoke.yaml.
+    let impossible = smoke.replace("min_confirmed: 60", "min_confirmed: 999999");
+    assert_ne!(
+        impossible, smoke,
+        "expected to find and replace min_confirmed: 60 in smoke.yaml"
+    );
+    let mut tmp = tempfile::NamedTempFile::with_suffix(".yaml").unwrap();
+    std::io::Write::write_all(&mut tmp, impossible.as_bytes()).unwrap();
+
+    // NOTE: deliberately does NOT pass `--fresh-env`. That was tried as a
+    // way to avoid depending on this checkout's default stable environment's
+    // state, but on at least one development host it reliably hit a *worse*
+    // dependency instead: Docker's own default-address-pool bookkeeping,
+    // exhausted host-wide by unrelated Docker projects, rejects every
+    // derived subnet with "Pool overlaps" regardless of which random env_id
+    // --fresh-env mints (reproduced against two different env_ids in a row).
+    // The stable, reused environment is the one that has actually run this
+    // scenario successfully in practice — see docs/zallet-wallet-scan-lag.md
+    // for its own failure mode (a long-lived chain making Zallet's startup
+    // rescan exceed the readiness wait) and `scripts/dev/regtest-reset.sh`
+    // for the recovery: run that before this test if it fails with a Setup
+    // error rather than reaching the load phase.
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_z3sim"))
+        .arg("run")
+        .arg("--scenario")
+        .arg(tmp.path())
+        .output()
+        .expect("failed to invoke z3sim run");
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "expected exit code 2, got {:?} (stdout: {}, stderr: {})",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("min_confirmed"),
+        "expected the violated threshold named on stderr: {stderr}"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Result   : FAIL"),
+        "expected a FAIL result line on stdout: {stdout}"
+    );
 }
 
 /// Two independently-identified environments (Track 2) never collide on

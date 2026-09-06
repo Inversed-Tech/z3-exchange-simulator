@@ -149,6 +149,8 @@ mod tests {
             error_code: None,
             error_message: None,
             phase: crate::data_model::Phase::Unknown,
+            intent_id: None,
+            attempt_number: 1,
         };
         std::fs::write(
             dir.join("rpc_calls.jsonl"),
@@ -164,6 +166,7 @@ mod tests {
             error: None,
             timeout_context: None,
             recorded_at: Utc::now(),
+            failure_class: None,
         };
         let mut intents_content = format!("{}\n", serde_json::to_string(&intent).unwrap());
         if corrupt_intents_line {

@@ -32,3 +32,13 @@ activity_profiles:
 amounts:
   min_zatoshis: 10000
   max_zatoshis: 1000000
+
+
+# Baselined against run 20260905T151815Z-health-t2z: attempted 25, confirmed 11,
+# failed 14 (all mempool_conflict — concurrent deposits racing the same
+# input), timed_out 0 (see experiments/runs/20260905T151815Z-health-t2z/).
+expectations:
+  min_confirmed: 9
+  max_terminal_failures: 17
+  max_timeouts: 0
+  allowed_error_classes: []

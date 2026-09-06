@@ -232,7 +232,8 @@ fn resolve_address(
 mod tests {
     use super::*;
     use crate::data_model::{
-        ActivityProfileConfig, AmountRangeConfig, FlowConfig, ObservabilityConfig, ScenarioConfig,
+        ActivityProfileConfig, AmountRangeConfig, ExpectationsConfig, FlowConfig,
+        ObservabilityConfig, ScenarioConfig,
     };
     use crate::synthetic::SyntheticPopulation;
 
@@ -270,6 +271,7 @@ mod tests {
             config_hash: String::new(),
             source_path: String::new(),
             warmup_blocks: 10,
+            expectations: ExpectationsConfig::default(),
         }
     }
 

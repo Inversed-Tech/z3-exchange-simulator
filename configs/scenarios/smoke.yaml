@@ -32,3 +32,11 @@ activity_profiles:
 amounts:
   min_zatoshis: 10000     # 0.0001 ZEC — minimum realistic transaction size
   max_zatoshis: 10000000  # 0.1 ZEC   — small amounts suitable for smoke testing
+
+# Client's own smoke-test acceptance criteria: 60 intents (1 TPS x 60s),
+# zero tolerated terminal failures or timeouts.
+expectations:
+  min_confirmed: 60
+  max_terminal_failures: 0
+  max_timeouts: 0
+  allowed_error_classes: []

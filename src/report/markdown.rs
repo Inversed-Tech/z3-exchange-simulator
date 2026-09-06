@@ -1053,6 +1053,8 @@ mod tests {
                     error_code: None,
                     error_message: None,
                     phase: crate::data_model::Phase::Load,
+                    intent_id: None,
+                    attempt_number: 1,
                 },
                 RpcCall {
                     call_id: "c2".into(),
@@ -1067,6 +1069,8 @@ mod tests {
                     error_code: Some(-20),
                     error_message: Some("WalletDb::get_memo failed".into()),
                     phase: crate::data_model::Phase::Load,
+                    intent_id: None,
+                    attempt_number: 1,
                 },
             ],
             intents: vec![
@@ -1078,6 +1082,7 @@ mod tests {
                     error: None,
                     timeout_context: None,
                     recorded_at: Utc::now(),
+                    failure_class: None,
                 },
                 IntentRecord {
                     run_id: "r".into(),
@@ -1087,6 +1092,7 @@ mod tests {
                     error: Some("insufficient balance".into()),
                     timeout_context: None,
                     recorded_at: Utc::now(),
+                    failure_class: Some(crate::data_model::IntentFailureClass::InsufficientBalance),
                 },
             ],
             metrics: Vec::new(),
@@ -1158,6 +1164,7 @@ mod tests {
             error: None,
             timeout_context: None,
             recorded_at: Utc::now(),
+            failure_class: None,
         }];
         let md = render_report(&[run]);
         assert!(md.contains("No candidates flagged"));
@@ -1202,6 +1209,8 @@ mod tests {
             error_code: None,
             error_message: None,
             phase: Phase::Unknown,
+            intent_id: None,
+            attempt_number: 1,
         });
         let md = render_report(&[run]);
         assert!(
@@ -1294,6 +1303,8 @@ mod tests {
             error_code: None,
             error_message: None,
             phase: Phase::Funding,
+            intent_id: None,
+            attempt_number: 1,
         });
         let md = render_report(&[run]);
         assert!(

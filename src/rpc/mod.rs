@@ -526,6 +526,34 @@ fn routing_table() -> HashMap<&'static str, Backend> {
 /// recorded in the run manifest instead of duplicated as a magic number.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Links a recorded `RpcCall` to the transaction intent it was issued on
+/// behalf of, and which attempt of that intent's retry sequence this is.
+/// `Default` is the unlinked case (`intent_id: None, attempt_number: 1`) —
+/// what every public `RpcClient` method except `z_send_many_attempt` passes.
+#[derive(Clone)]
+struct RetryContext {
+    intent_id: Option<String>,
+    attempt_number: u32,
+}
+
+impl Default for RetryContext {
+    fn default() -> Self {
+        Self {
+            intent_id: None,
+            attempt_number: 1,
+        }
+    }
+}
+
+impl RetryContext {
+    fn linked(intent_id: &str, attempt_number: u32) -> Self {
+        Self {
+            intent_id: Some(intent_id.to_string()),
+            attempt_number,
+        }
+    }
+}
+
 pub struct RpcClient {
     http: reqwest::Client,
     base_url: String,
@@ -646,11 +674,27 @@ impl RpcClient {
     /// Send one JSON-RPC call, parse the result, and record an RpcCall entry.
     ///
     /// This is the single chokepoint all public methods go through — timing,
-    /// error classification, and metrics recording all happen here.
+    /// error classification, and metrics recording all happen here. Thin
+    /// wrapper over `call_attempt` passing the default (unlinked) retry
+    /// context — see that method's doc comment.
     async fn call<T: for<'de> Deserialize<'de>>(
         &self,
         method: &'static str,
         params: serde_json::Value,
+    ) -> Result<T, RpcError> {
+        self.call_attempt(method, params, RetryContext::default())
+            .await
+    }
+
+    /// Like `call`, but tags the recorded `RpcCall` with `attempt`'s
+    /// intent/attempt-number linkage instead of the unlinked default. Used by
+    /// `RpcClient::z_send_many_attempt` — the only public method that needs
+    /// this linkage today (see `scenarios::exchange::send_many_with_anchor_retries`).
+    async fn call_attempt<T: for<'de> Deserialize<'de>>(
+        &self,
+        method: &'static str,
+        params: serde_json::Value,
+        attempt: RetryContext,
     ) -> Result<T, RpcError> {
         let n = self.call_counter.fetch_add(1, Ordering::Relaxed);
         let call_id = format!("{method}-{n}");
@@ -711,6 +755,8 @@ impl RpcClient {
                 error_code,
                 error_message,
                 phase: self.phase(),
+                intent_id: attempt.intent_id,
+                attempt_number: attempt.attempt_number,
             });
         }
 
@@ -779,6 +825,8 @@ impl RpcClient {
                 error_code,
                 error_message,
                 phase: self.phase(),
+                intent_id: None,
+                attempt_number: 1,
             });
         }
 
@@ -1137,6 +1185,34 @@ impl RpcClient {
         self.call(
             "z_sendmany",
             serde_json::json!([from, recipients, null, null, privacy_policy]),
+        )
+        .await
+    }
+
+    /// Like `z_send_many`/`z_send_many_with_policy`, but tags the recorded
+    /// `RpcCall` with `intent_id` and `attempt_number` — used by
+    /// `scenarios::exchange::send_many_with_anchor_retries` so a retried
+    /// intent's attempts can be collapsed to one terminal outcome in the
+    /// RPC compatibility matrix instead of each attempt counting as a
+    /// separate call (see `report::rpc_matrix::build_matrix`).
+    /// `privacy_policy: None` omits the policy argument, matching
+    /// `z_send_many`; `Some(p)` matches `z_send_many_with_policy`.
+    pub async fn z_send_many_attempt(
+        &self,
+        from: &str,
+        recipients: &[Recipient],
+        privacy_policy: Option<&str>,
+        intent_id: &str,
+        attempt_number: u32,
+    ) -> Result<String, RpcError> {
+        let params = match privacy_policy {
+            Some(p) => serde_json::json!([from, recipients, null, null, p]),
+            None => serde_json::json!([from, recipients, null, null]),
+        };
+        self.call_attempt(
+            "z_sendmany",
+            params,
+            RetryContext::linked(intent_id, attempt_number),
         )
         .await
     }
@@ -2042,6 +2118,62 @@ mod tests {
             .z_send_many("uuid-1234", &recipients)
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn z_send_many_attempt_tags_recorded_call_with_intent_and_attempt_number() {
+        use wiremock::{matchers, Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(matchers::method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": "opid-abcdef", "error": null, "id": 1
+            })))
+            .mount(&server)
+            .await;
+        let recipients = vec![Recipient {
+            address: "u1dest".into(),
+            amount: 0.5,
+            memo: None,
+        }];
+        let recorder = MockRecorder::new();
+        let op_id = client_with_recorder(&server.uri(), recorder.clone())
+            .z_send_many_attempt("uuid-1234", &recipients, None, "intent-42", 3)
+            .await
+            .unwrap();
+        assert_eq!(op_id, "opid-abcdef");
+
+        let calls = recorder.recorded_calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].method, "z_sendmany");
+        assert_eq!(calls[0].intent_id.as_deref(), Some("intent-42"));
+        assert_eq!(calls[0].attempt_number, 3);
+    }
+
+    #[tokio::test]
+    async fn z_send_many_via_plain_call_is_unlinked() {
+        use wiremock::{matchers, Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(matchers::method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": "opid-abcdef", "error": null, "id": 1
+            })))
+            .mount(&server)
+            .await;
+        let recipients = vec![Recipient {
+            address: "u1dest".into(),
+            amount: 0.5,
+            memo: None,
+        }];
+        let recorder = MockRecorder::new();
+        client_with_recorder(&server.uri(), recorder.clone())
+            .z_send_many("uuid-1234", &recipients)
+            .await
+            .unwrap();
+
+        let calls = recorder.recorded_calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].intent_id, None);
+        assert_eq!(calls[0].attempt_number, 1);
     }
 
     #[tokio::test]

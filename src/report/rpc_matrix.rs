@@ -14,9 +14,118 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::data_model::Phase;
+use crate::data_model::{Phase, RpcCall};
 
 use super::loader::RunData;
+
+/// Collapses same-`(run, intent)` retry groups within one method's calls down
+/// to a single representative call each — the attempt with the highest
+/// `attempt_number`, whose `success` is that retry sequence's terminal
+/// outcome. Without this, aggregating N attempts of one intent's `z_sendmany`
+/// (e.g. two anchor-confirmation retries that failed before a third attempt
+/// succeeded) counts N-1 spurious failures alongside the one call that
+/// actually mattered — reproducing the client's own "101 calls, 28 failed
+/// retries → 27.7%" artifact. Calls with `intent_id: None` (not tied to a
+/// specific intent — health checks, warmup polling, the funding-phase
+/// fan-out, background mining, ...) pass through unchanged, one row each.
+///
+/// `calls` must already be filtered to one method and one phase scope by the
+/// caller; the `run_id` alongside each call keys the grouping so intents from
+/// different runs (which may reuse the same intent_id value) never collapse
+/// into each other.
+fn representative_calls<'a>(
+    calls: impl Iterator<Item = (&'a str, &'a RpcCall)>,
+) -> Vec<&'a RpcCall> {
+    let mut grouped: HashMap<(&'a str, &'a str), &'a RpcCall> = HashMap::new();
+    let mut unlinked: Vec<&'a RpcCall> = Vec::new();
+    for (run_id, call) in calls {
+        match call.intent_id.as_deref() {
+            Some(intent_id) => {
+                grouped
+                    .entry((run_id, intent_id))
+                    .and_modify(|existing| {
+                        if call.attempt_number > existing.attempt_number {
+                            *existing = call;
+                        }
+                    })
+                    .or_insert(call);
+            }
+            None => unlinked.push(call),
+        }
+    }
+    let mut out: Vec<&RpcCall> = grouped.into_values().collect();
+    out.extend(unlinked);
+    out
+}
+
+/// Aggregate statistics over an already-deduplicated slice of calls (see
+/// `representative_calls`), shared by both `build_matrix` (roster methods)
+/// and `build_unlisted` (off-roster methods) so the two never compute status/
+/// percentile logic two different ways.
+struct CallAggregate {
+    status: MatrixStatus,
+    calls: u64,
+    successes: u64,
+    observed_backends: Vec<String>,
+    error_codes: Vec<i64>,
+    p50_ms: Option<f64>,
+    p95_ms: Option<f64>,
+    p99_ms: Option<f64>,
+}
+
+fn aggregate(calls: &[&RpcCall]) -> CallAggregate {
+    let total = calls.len() as u64;
+    let successes = calls.iter().filter(|c| c.success).count() as u64;
+    let mut backends: HashSet<String> = HashSet::new();
+    let mut error_codes: HashSet<i64> = HashSet::new();
+    let mut latencies: Vec<u64> = Vec::new();
+    for call in calls {
+        backends.insert(format!("{:?}", call.backend));
+        if let Some(code) = call.error_code {
+            error_codes.insert(code);
+        }
+        if let Some(ms) = call.latency_ms {
+            latencies.push(ms);
+        }
+    }
+
+    let status = if total == 0 {
+        MatrixStatus::NotTested
+    } else if successes == total {
+        MatrixStatus::ExercisedAllSuccess
+    } else if successes == 0 {
+        MatrixStatus::ExercisedAllFailed
+    } else {
+        MatrixStatus::ExercisedPartialFailure
+    };
+
+    let (p50, p95, p99) = if latencies.is_empty() {
+        (None, None, None)
+    } else {
+        latencies.sort_unstable();
+        (
+            Some(percentile_value(&latencies, 0.50)),
+            Some(percentile_value(&latencies, 0.95)),
+            Some(percentile_value(&latencies, 0.99)),
+        )
+    };
+
+    let mut observed_backends: Vec<String> = backends.into_iter().collect();
+    observed_backends.sort();
+    let mut error_codes: Vec<i64> = error_codes.into_iter().collect();
+    error_codes.sort_unstable();
+
+    CallAggregate {
+        status,
+        calls: total,
+        successes,
+        observed_backends,
+        error_codes,
+        p50_ms: p50,
+        p95_ms: p95,
+        p99_ms: p99,
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Category {
@@ -467,72 +576,27 @@ pub fn build_matrix(runs: &[RunData], phase_filter: impl Fn(Phase) -> bool) -> V
     IN_SCOPE_METHODS
         .iter()
         .map(|entry| {
-            let mut calls = 0u64;
-            let mut successes = 0u64;
-            let mut backends: HashSet<String> = HashSet::new();
-            let mut error_codes: HashSet<i64> = HashSet::new();
-            let mut latencies: Vec<u64> = Vec::new();
-
-            for run in runs {
-                for call in &run.rpc_calls {
-                    if call.method != entry.method {
-                        continue;
-                    }
-                    if !phase_filter(call.phase) {
-                        continue;
-                    }
-                    calls += 1;
-                    if call.success {
-                        successes += 1;
-                    }
-                    backends.insert(format!("{:?}", call.backend));
-                    if let Some(code) = call.error_code {
-                        error_codes.insert(code);
-                    }
-                    if let Some(ms) = call.latency_ms {
-                        latencies.push(ms);
-                    }
-                }
-            }
-
-            let status = if calls == 0 {
-                MatrixStatus::NotTested
-            } else if successes == calls {
-                MatrixStatus::ExercisedAllSuccess
-            } else if successes == 0 {
-                MatrixStatus::ExercisedAllFailed
-            } else {
-                MatrixStatus::ExercisedPartialFailure
-            };
-
-            let (p50, p95, p99) = if latencies.is_empty() {
-                (None, None, None)
-            } else {
-                latencies.sort_unstable();
-                (
-                    Some(percentile_value(&latencies, 0.50)),
-                    Some(percentile_value(&latencies, 0.95)),
-                    Some(percentile_value(&latencies, 0.99)),
-                )
-            };
-
-            let mut observed_backends: Vec<String> = backends.into_iter().collect();
-            observed_backends.sort();
-            let mut error_codes: Vec<i64> = error_codes.into_iter().collect();
-            error_codes.sort_unstable();
+            let filtered = runs.iter().flat_map(|run| {
+                run.rpc_calls
+                    .iter()
+                    .filter(|call| call.method == entry.method && phase_filter(call.phase))
+                    .map(move |call| (run.manifest.run_id.as_str(), call))
+            });
+            let reps = representative_calls(filtered);
+            let agg = aggregate(&reps);
 
             MatrixRow {
                 method: entry.method,
                 backend_label: entry.backend_label,
                 category: entry.category,
-                status,
-                calls,
-                successes,
-                observed_backends,
-                error_codes,
-                p50_ms: p50,
-                p95_ms: p95,
-                p99_ms: p99,
+                status: agg.status,
+                calls: agg.calls,
+                successes: agg.successes,
+                observed_backends: agg.observed_backends,
+                error_codes: agg.error_codes,
+                p50_ms: agg.p50_ms,
+                p95_ms: agg.p95_ms,
+                p99_ms: agg.p99_ms,
             }
         })
         .collect()
@@ -568,16 +632,7 @@ pub struct UnlistedRow {
 pub fn build_unlisted(runs: &[RunData], phase_filter: impl Fn(Phase) -> bool) -> Vec<UnlistedRow> {
     let roster: HashSet<&str> = IN_SCOPE_METHODS.iter().map(|e| e.method).collect();
 
-    #[derive(Default)]
-    struct Agg {
-        calls: u64,
-        successes: u64,
-        backends: HashSet<String>,
-        error_codes: HashSet<i64>,
-        latencies: Vec<u64>,
-    }
-    let mut by_method: HashMap<String, Agg> = HashMap::new();
-
+    let mut by_method: HashMap<&str, Vec<(&str, &RpcCall)>> = HashMap::new();
     for run in runs {
         for call in &run.rpc_calls {
             if roster.contains(call.method.as_str()) {
@@ -586,63 +641,93 @@ pub fn build_unlisted(runs: &[RunData], phase_filter: impl Fn(Phase) -> bool) ->
             if !phase_filter(call.phase) {
                 continue;
             }
-            let entry = by_method.entry(call.method.clone()).or_default();
-            entry.calls += 1;
-            if call.success {
-                entry.successes += 1;
-            }
-            entry.backends.insert(format!("{:?}", call.backend));
-            if let Some(code) = call.error_code {
-                entry.error_codes.insert(code);
-            }
-            if let Some(ms) = call.latency_ms {
-                entry.latencies.push(ms);
-            }
+            by_method
+                .entry(call.method.as_str())
+                .or_default()
+                .push((run.manifest.run_id.as_str(), call));
         }
     }
 
     let mut out: Vec<UnlistedRow> = by_method
         .into_iter()
-        .map(|(method, agg)| {
-            let status = if agg.calls == 0 {
-                MatrixStatus::NotTested
-            } else if agg.successes == agg.calls {
-                MatrixStatus::ExercisedAllSuccess
-            } else if agg.successes == 0 {
-                MatrixStatus::ExercisedAllFailed
-            } else {
-                MatrixStatus::ExercisedPartialFailure
-            };
-            let mut latencies = agg.latencies;
-            let (p50, p95, p99) = if latencies.is_empty() {
-                (None, None, None)
-            } else {
-                latencies.sort_unstable();
-                (
-                    Some(percentile_value(&latencies, 0.50)),
-                    Some(percentile_value(&latencies, 0.95)),
-                    Some(percentile_value(&latencies, 0.99)),
-                )
-            };
-            let mut observed_backends: Vec<String> = agg.backends.into_iter().collect();
-            observed_backends.sort();
-            let mut error_codes: Vec<i64> = agg.error_codes.into_iter().collect();
-            error_codes.sort_unstable();
+        .map(|(method, calls)| {
+            let reps = representative_calls(calls.into_iter());
+            let agg = aggregate(&reps);
             UnlistedRow {
-                method,
-                status,
+                method: method.to_string(),
+                status: agg.status,
                 calls: agg.calls,
                 successes: agg.successes,
-                observed_backends,
-                error_codes,
-                p50_ms: p50,
-                p95_ms: p95,
-                p99_ms: p99,
+                observed_backends: agg.observed_backends,
+                error_codes: agg.error_codes,
+                p50_ms: agg.p50_ms,
+                p95_ms: agg.p95_ms,
+                p99_ms: agg.p99_ms,
             }
         })
         .collect();
     out.sort_by(|a, b| a.method.cmp(&b.method));
     out
+}
+
+/// Per-method distribution of how many attempts a load/drain-phase intent
+/// needed before its terminal `z_sendmany`-style outcome — the "Retry detail
+/// by method" appendix data. Only intents linked via `intent_id` are
+/// represented; a group's representative call's own `attempt_number` (see
+/// `representative_calls`) already equals how many attempts that intent
+/// needed, since attempts are numbered 1..N.
+///
+/// Computed here (Track 3), rendered by Track 5's appendix restructuring
+/// (moving the RPC matrix out of the main report body) — see the Cross-Track
+/// Review's "Shared changes" note on this mechanism. `#[allow(dead_code)]`
+/// until that rendering call site lands and reads this data.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetryDetail {
+    pub method: &'static str,
+    pub single_attempt: u64,
+    pub two_to_three_attempts: u64,
+    pub four_plus_attempts: u64,
+}
+
+#[allow(dead_code)]
+pub fn build_retry_detail(
+    runs: &[RunData],
+    phase_filter: impl Fn(Phase) -> bool,
+) -> Vec<RetryDetail> {
+    IN_SCOPE_METHODS
+        .iter()
+        .filter_map(|entry| {
+            let filtered = runs.iter().flat_map(|run| {
+                run.rpc_calls
+                    .iter()
+                    .filter(|call| call.method == entry.method && phase_filter(call.phase))
+                    .map(move |call| (run.manifest.run_id.as_str(), call))
+            });
+            let reps = representative_calls(filtered);
+            let linked: Vec<&RpcCall> =
+                reps.into_iter().filter(|c| c.intent_id.is_some()).collect();
+            if linked.is_empty() {
+                return None;
+            }
+            let mut single_attempt = 0u64;
+            let mut two_to_three_attempts = 0u64;
+            let mut four_plus_attempts = 0u64;
+            for call in &linked {
+                match call.attempt_number {
+                    0 | 1 => single_attempt += 1,
+                    2 | 3 => two_to_three_attempts += 1,
+                    _ => four_plus_attempts += 1,
+                }
+            }
+            Some(RetryDetail {
+                method: entry.method,
+                single_attempt,
+                two_to_three_attempts,
+                four_plus_attempts,
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -696,6 +781,8 @@ mod tests {
             error_code,
             error_message: None,
             phase: crate::data_model::Phase::Load,
+            intent_id: None,
+            attempt_number: 1,
         }
     }
 
@@ -703,6 +790,19 @@ mod tests {
         RpcCall {
             phase,
             ..call(method, success, Some(5), None)
+        }
+    }
+
+    fn call_attempt(method: &str, success: bool, intent_id: &str, attempt_number: u32) -> RpcCall {
+        RpcCall {
+            intent_id: Some(intent_id.to_string()),
+            attempt_number,
+            ..call(
+                method,
+                success,
+                Some(5),
+                if success { None } else { Some(-4) },
+            )
         }
     }
 
@@ -818,6 +918,79 @@ mod tests {
         let row = matrix.iter().find(|r| r.method == "getblockcount").unwrap();
         assert_eq!(row.calls, 2);
         assert_eq!(row.p50_ms, Some(15.0));
+    }
+
+    #[test]
+    fn test_retry_attempts_do_not_inflate_failure_rate() {
+        // One intent's z_sendmany retry sequence: attempts 1-2 fail with
+        // "Insufficient balance", attempt 3 succeeds — the exact shape
+        // send_many_with_anchor_retries produces. Plus 3 more unlinked,
+        // successful calls (health checks / other intents). The computed
+        // failure rate for the method must be 0/4 (four terminal outcomes,
+        // zero failures) — not 2/6 (six raw attempts, two of them failed).
+        let run = run_with_calls(vec![
+            call_attempt("z_sendmany", false, "i1", 1),
+            call_attempt("z_sendmany", false, "i1", 2),
+            call_attempt("z_sendmany", true, "i1", 3),
+            call("z_sendmany", true, Some(5), None),
+            call("z_sendmany", true, Some(5), None),
+            call("z_sendmany", true, Some(5), None),
+        ]);
+        let matrix = build_matrix(&[run], Phase::is_workload);
+        let row = matrix.iter().find(|r| r.method == "z_sendmany").unwrap();
+        assert_eq!(
+            row.calls, 4,
+            "6 raw attempts must collapse to 4 terminal outcomes"
+        );
+        assert_eq!(row.successes, 4);
+        assert_eq!(row.status, MatrixStatus::ExercisedAllSuccess);
+    }
+
+    #[test]
+    fn build_matrix_representative_call_is_the_highest_attempt_number_not_first_or_last_seen() {
+        // Regression guard: the representative must be selected by
+        // attempt_number, not by insertion order — feed the terminal
+        // (successful) attempt first to rule out "last write wins" being
+        // coincidentally correct only because it's also the highest attempt.
+        let run = run_with_calls(vec![
+            call_attempt("z_sendmany", true, "i1", 3),
+            call_attempt("z_sendmany", false, "i1", 1),
+            call_attempt("z_sendmany", false, "i1", 2),
+        ]);
+        let matrix = build_matrix(&[run], Phase::is_workload);
+        let row = matrix.iter().find(|r| r.method == "z_sendmany").unwrap();
+        assert_eq!(row.calls, 1);
+        assert_eq!(row.status, MatrixStatus::ExercisedAllSuccess);
+    }
+
+    #[test]
+    fn build_retry_detail_buckets_by_terminal_attempt_number() {
+        let run = run_with_calls(vec![
+            // 1 attempt.
+            call_attempt("z_sendmany", true, "i1", 1),
+            // 2-3 attempts.
+            call_attempt("z_sendmany", false, "i2", 1),
+            call_attempt("z_sendmany", true, "i2", 2),
+            // 4+ attempts.
+            call_attempt("z_sendmany", false, "i3", 1),
+            call_attempt("z_sendmany", false, "i3", 2),
+            call_attempt("z_sendmany", false, "i3", 3),
+            call_attempt("z_sendmany", true, "i3", 4),
+            // Unlinked call — must not appear in any bucket.
+            call("z_sendmany", true, Some(5), None),
+        ]);
+        let detail = build_retry_detail(&[run], Phase::is_workload);
+        let row = detail.iter().find(|r| r.method == "z_sendmany").unwrap();
+        assert_eq!(row.single_attempt, 1);
+        assert_eq!(row.two_to_three_attempts, 1);
+        assert_eq!(row.four_plus_attempts, 1);
+    }
+
+    #[test]
+    fn build_retry_detail_omits_methods_with_no_linked_intents() {
+        let run = run_with_calls(vec![call("getblockcount", true, Some(5), None)]);
+        let detail = build_retry_detail(&[run], Phase::is_workload);
+        assert!(detail.iter().all(|r| r.method != "getblockcount"));
     }
 
     #[test]

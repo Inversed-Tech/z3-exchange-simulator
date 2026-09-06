@@ -126,12 +126,23 @@ async fn send_many_with_anchor_retries(
     from: &str,
     recipients: &[Recipient],
     policy: Option<&str>,
+    intent_id: Option<&str>,
 ) -> Result<String, RpcError> {
     let mut last_err: Option<RpcError> = None;
-    for _ in 0..SEND_RETRIES {
-        let result = match policy {
-            Some(p) => rpc.z_send_many_with_policy(from, recipients, p).await,
-            None => rpc.z_send_many(from, recipients).await,
+    for attempt in 1..=SEND_RETRIES {
+        let result = match intent_id {
+            // Linked: every attempt of this intent's z_sendmany sequence is
+            // tagged so the RPC compatibility matrix can collapse them to one
+            // terminal outcome (see report::rpc_matrix::build_matrix) instead
+            // of counting each retry as a separate call.
+            Some(id) => {
+                rpc.z_send_many_attempt(from, recipients, policy, id, attempt)
+                    .await
+            }
+            None => match policy {
+                Some(p) => rpc.z_send_many_with_policy(from, recipients, p).await,
+                None => rpc.z_send_many(from, recipients).await,
+            },
         };
         match result {
             Ok(opid) => return Ok(opid),
@@ -298,6 +309,7 @@ pub async fn run_deposit(
     privacy_policy: &str,
     amount_zatoshis: u64,
     required_confirmations: u64,
+    intent_id: Option<&str>,
     run_id: &str,
     metrics: Option<Arc<dyn MetricsRecorder>>,
     polling: &PollingConfig,
@@ -325,9 +337,15 @@ pub async fn run_deposit(
         amount: zat_to_zec(amount_zatoshis),
         memo: None,
     }];
-    let op_id = send_many_with_anchor_retries(rpc, from_account, &recipients, Some(privacy_policy))
-        .await
-        .map_err(ExchangeError::Rpc)?;
+    let op_id = send_many_with_anchor_retries(
+        rpc,
+        from_account,
+        &recipients,
+        Some(privacy_policy),
+        intent_id,
+    )
+    .await
+    .map_err(ExchangeError::Rpc)?;
 
     // Wait for ZK proving to complete and extract the txid.
     let op = poll_operation_until_complete(rpc, &op_id, polling).await?;
@@ -413,9 +431,15 @@ pub async fn run_withdrawal(
 
     withdrawal.status = WithdrawalStatus::Processing;
 
-    let op_id = send_many_with_anchor_retries(rpc, from_account, &recipients, Some(privacy_policy))
-        .await
-        .map_err(ExchangeError::Rpc)?;
+    let op_id = send_many_with_anchor_retries(
+        rpc,
+        from_account,
+        &recipients,
+        Some(privacy_policy),
+        intent_id,
+    )
+    .await
+    .map_err(ExchangeError::Rpc)?;
 
     // Measure proving time from the accepted call to operation completion —
     // excludes any anchor-confirmation retries above, which are wait time,
@@ -479,11 +503,13 @@ pub async fn run_withdrawal(
 /// The sent amount is the sum of all discovered notes minus `SWEEP_FEE_BUFFER_ZAT`
 /// to leave headroom for the ZIP-317 fee. Returns an error if no confirmed notes
 /// are found for the account. Emits `sweep_time_ms` to the metrics recorder.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_sweep(
     rpc: &RpcClient,
     from_account: &str,
     from_address: &str,
     hot_wallet_address: &str,
+    intent_id: Option<&str>,
     run_id: &str,
     metrics: Option<Arc<dyn MetricsRecorder>>,
     polling: &PollingConfig,
@@ -558,7 +584,7 @@ pub async fn run_sweep(
         memo: None,
     }];
 
-    let op_id = send_many_with_anchor_retries(rpc, from_address, &recipients, None)
+    let op_id = send_many_with_anchor_retries(rpc, from_address, &recipients, None, intent_id)
         .await
         .map_err(ExchangeError::Rpc)?;
 
@@ -1088,6 +1114,7 @@ mod tests {
             "FullPrivacy",
             1_000_000,
             3,
+            Some("intent-1"),
             "run-1",
             Some(rec.clone() as Arc<dyn MetricsRecorder>),
             &instant_polling(),
@@ -1156,6 +1183,7 @@ mod tests {
             "FullPrivacy",
             999_999_999_999,
             3,
+            Some("intent-1"),
             "run-1",
             None,
             &instant_polling(),
@@ -1441,6 +1469,7 @@ mod tests {
             "sweep-account",
             "u1sweepfrom",
             "u1hotwallet",
+            Some("intent-1"),
             "run-1",
             Some(rec.clone() as Arc<dyn MetricsRecorder>),
             &instant_polling(),
@@ -1529,6 +1558,7 @@ mod tests {
             "sweep-account",
             "u1sweepfrom",
             "u1hotwallet",
+            Some("intent-1"),
             "run-1",
             None,
             &instant_polling(),
@@ -1561,6 +1591,7 @@ mod tests {
             "empty-account",
             "u1sweepfrom",
             "u1hotwallet",
+            Some("intent-1"),
             "run-1",
             None,
             &instant_polling(),
@@ -1595,6 +1626,7 @@ mod tests {
             "my-account",
             "u1sweepfrom",
             "u1hotwallet",
+            Some("intent-1"),
             "run-1",
             None,
             &instant_polling(),
@@ -1667,6 +1699,7 @@ mod tests {
             "my-account",
             "u1sweepfrom",
             "u1hotwallet",
+            Some("intent-1"),
             "run-1",
             None,
             &instant_polling(),
@@ -1730,6 +1763,7 @@ mod tests {
             "my-account",
             "u1sweepfrom",
             "u1hotwallet",
+            Some("intent-1"),
             "run-1",
             None,
             &instant_polling(),

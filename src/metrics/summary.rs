@@ -425,6 +425,8 @@ mod tests {
             error_code: None,
             error_message: None,
             phase: crate::data_model::Phase::Load,
+            intent_id: None,
+            attempt_number: 1,
         });
         std::fs::write(rd.metrics_path(), "").unwrap();
 
@@ -740,6 +742,8 @@ mod tests {
             error_code: Some(-3),
             error_message: Some("invalid tx".into()),
             phase: crate::data_model::Phase::Load,
+            intent_id: None,
+            attempt_number: 1,
         });
         drop(rwriter);
 
@@ -802,6 +806,8 @@ mod tests {
             error_code,
             error_message: None,
             phase,
+            intent_id: None,
+            attempt_number: 1,
         };
 
         let writer = JsonlWriter::<RpcCall>::open(&rd.rpc_calls_path()).unwrap();
@@ -862,6 +868,7 @@ mod tests {
             error: None,
             timeout_context: None,
             recorded_at: Utc::now(),
+            failure_class: None,
         });
         iwriter.write_record(&IntentRecord {
             run_id: rd.run_id.clone(),
@@ -871,6 +878,7 @@ mod tests {
             error: None,
             timeout_context: Some("operation op-1 did not complete within the deadline".into()),
             recorded_at: Utc::now(),
+            failure_class: Some(crate::data_model::IntentFailureClass::Timeout),
         });
         iwriter.write_record(&IntentRecord {
             run_id: rd.run_id.clone(),
@@ -882,6 +890,7 @@ mod tests {
                 "tx abc did not reach 3 confirmations within the deadline".into(),
             ),
             recorded_at: Utc::now(),
+            failure_class: Some(crate::data_model::IntentFailureClass::Timeout),
         });
         drop(iwriter);
 

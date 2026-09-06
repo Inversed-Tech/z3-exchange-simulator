@@ -186,6 +186,13 @@ pub enum CliError {
     /// `print-versions` failed to resolve the environment, bootstrap the
     /// wallet, bring the stack up, or query its running images.
     Z3(Z3Error),
+    /// The run completed (no infrastructure error) but failed its scenario's
+    /// `expectations` — a "the tool worked, the workload didn't pass"
+    /// outcome, distinct from `RunnerError`. Carries every violated
+    /// threshold's message (see `AssertionOutcome::violations`); triggers
+    /// exit code 2 in `main.rs`, distinct from the generic `FAILURE` (1)
+    /// every other `CliError` variant maps to.
+    AssertionFailed(Vec<String>),
 }
 
 impl std::fmt::Display for CliError {
@@ -209,6 +216,17 @@ impl std::fmt::Display for CliError {
             CliError::Io(e) => write!(f, "{e}"),
             CliError::Interrupted => write!(f, "interrupted"),
             CliError::Z3(e) => write!(f, "{e}"),
+            CliError::AssertionFailed(violations) => {
+                write!(
+                    f,
+                    "scenario assertions failed ({} violation(s)):",
+                    violations.len()
+                )?;
+                for v in violations {
+                    write!(f, "\n  {v}")?;
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -545,7 +563,16 @@ async fn run_command(
     println!("Confirmed: {}", r.stats.confirmed);
     println!("Failed   : {}", r.stats.failed);
     println!("Timed out: {}", r.stats.timed_out);
-    Ok(())
+    if r.assertion.passed {
+        println!("Result   : PASS");
+        Ok(())
+    } else {
+        println!(
+            "Result   : FAIL — {}; see report for full list",
+            r.assertion.violations[0]
+        );
+        Err(CliError::AssertionFailed(r.assertion.violations.clone()))
+    }
 }
 
 // ── dispatch ──────────────────────────────────────────────────────────────────
@@ -597,6 +624,10 @@ observability:
   record_component_logs: true
   metric_sampling_interval_secs: 5
   mempool_saturation_threshold: 500
+expectations:
+  min_confirmed: 0
+  max_terminal_failures: 0
+  max_timeouts: 0
 "#;
         let mut f = NamedTempFile::new().unwrap();
         f.write_all(yaml).unwrap();
@@ -1073,6 +1104,10 @@ observability:
   record_component_logs: true
   metric_sampling_interval_secs: 5
   mempool_saturation_threshold: 500
+expectations:
+  min_confirmed: 0
+  max_terminal_failures: 0
+  max_timeouts: 0
 "#;
         let mut f = NamedTempFile::new().unwrap();
         f.write_all(yaml).unwrap();

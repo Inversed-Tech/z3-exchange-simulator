@@ -190,7 +190,8 @@ pub fn print_dry_run_summary(config: &ScenarioConfig, opts: &RunOptions, plan: &
 mod tests {
     use super::*;
     use crate::data_model::{
-        ActivityProfileConfig, AmountRangeConfig, FlowConfig, ObservabilityConfig, ScenarioConfig,
+        ActivityProfileConfig, AmountRangeConfig, ExpectationsConfig, FlowConfig,
+        ObservabilityConfig, ScenarioConfig,
     };
     use std::io::Write;
     use tempfile::NamedTempFile;
@@ -229,6 +230,12 @@ mod tests {
             config_hash: String::new(),
             source_path: String::new(),
             warmup_blocks: 110,
+            expectations: ExpectationsConfig {
+                min_confirmed: 60,
+                max_terminal_failures: 0,
+                max_timeouts: 0,
+                allowed_error_classes: vec![],
+            },
         }
     }
 
@@ -369,7 +376,7 @@ mod tests {
 
     #[test]
     fn load_scenario_computes_config_hash() {
-        let yaml = b"name: test\ndescription: t\nseed: 1\naccounts_count: 10\naccounts_active_fraction: 0.5\nload_duration_seconds: 60\nload_target_tps: 1.0\nflows:\n  transparent_to_transparent: 1.0\n  transparent_to_shielded: 0.0\n  shielded_to_transparent: 0.0\n  shielded_to_shielded: 0.0\nactivity_profiles:\n  low_fraction: 0.50\n  medium_fraction: 0.35\n  high_fraction: 0.15\namounts:\n  min_zatoshis: 10000\n  max_zatoshis: 10000000\nconfirmations_deposit_required: 1\nobservability:\n  record_rpc_calls: true\n  record_component_logs: true\n  metric_sampling_interval_secs: 5\n  mempool_saturation_threshold: 500\n";
+        let yaml = b"name: test\ndescription: t\nseed: 1\naccounts_count: 10\naccounts_active_fraction: 0.5\nload_duration_seconds: 60\nload_target_tps: 1.0\nflows:\n  transparent_to_transparent: 1.0\n  transparent_to_shielded: 0.0\n  shielded_to_transparent: 0.0\n  shielded_to_shielded: 0.0\nactivity_profiles:\n  low_fraction: 0.50\n  medium_fraction: 0.35\n  high_fraction: 0.15\namounts:\n  min_zatoshis: 10000\n  max_zatoshis: 10000000\nconfirmations_deposit_required: 1\nobservability:\n  record_rpc_calls: true\n  record_component_logs: true\n  metric_sampling_interval_secs: 5\n  mempool_saturation_threshold: 500\nexpectations:\n  min_confirmed: 0\n  max_terminal_failures: 0\n  max_timeouts: 0\n";
         let mut tmp = NamedTempFile::new().unwrap();
         tmp.write_all(yaml).unwrap();
 
@@ -381,7 +388,7 @@ mod tests {
 
     #[test]
     fn load_scenario_sets_source_path() {
-        let yaml = b"name: test\ndescription: t\nseed: 1\naccounts_count: 10\naccounts_active_fraction: 0.5\nload_duration_seconds: 60\nload_target_tps: 1.0\nflows:\n  transparent_to_transparent: 1.0\n  transparent_to_shielded: 0.0\n  shielded_to_transparent: 0.0\n  shielded_to_shielded: 0.0\nactivity_profiles:\n  low_fraction: 0.50\n  medium_fraction: 0.35\n  high_fraction: 0.15\namounts:\n  min_zatoshis: 10000\n  max_zatoshis: 10000000\nconfirmations_deposit_required: 1\nobservability:\n  record_rpc_calls: true\n  record_component_logs: true\n  metric_sampling_interval_secs: 5\n  mempool_saturation_threshold: 500\n";
+        let yaml = b"name: test\ndescription: t\nseed: 1\naccounts_count: 10\naccounts_active_fraction: 0.5\nload_duration_seconds: 60\nload_target_tps: 1.0\nflows:\n  transparent_to_transparent: 1.0\n  transparent_to_shielded: 0.0\n  shielded_to_transparent: 0.0\n  shielded_to_shielded: 0.0\nactivity_profiles:\n  low_fraction: 0.50\n  medium_fraction: 0.35\n  high_fraction: 0.15\namounts:\n  min_zatoshis: 10000\n  max_zatoshis: 10000000\nconfirmations_deposit_required: 1\nobservability:\n  record_rpc_calls: true\n  record_component_logs: true\n  metric_sampling_interval_secs: 5\n  mempool_saturation_threshold: 500\nexpectations:\n  min_confirmed: 0\n  max_terminal_failures: 0\n  max_timeouts: 0\n";
         let mut tmp = NamedTempFile::new().unwrap();
         tmp.write_all(yaml).unwrap();
 
@@ -406,6 +413,19 @@ mod tests {
     fn validate_scenario_rejects_invalid_yaml() {
         let mut tmp = NamedTempFile::new().unwrap();
         tmp.write_all(b"key: [unclosed bracket").unwrap();
+        let err = load_scenario(tmp.path()).unwrap_err();
+        assert!(matches!(err, ConfigError::Parse(_)));
+    }
+
+    #[test]
+    fn expectations_field_is_mandatory_in_schema() {
+        // Same fixture as load_scenario_computes_config_hash, with the
+        // `expectations:` block removed — a scenario YAML that omits it must
+        // fail to parse (ConfigError::Parse), not silently default to a
+        // permissive/absent pass-fail criterion.
+        let yaml = b"name: test\ndescription: t\nseed: 1\naccounts_count: 10\naccounts_active_fraction: 0.5\nload_duration_seconds: 60\nload_target_tps: 1.0\nflows:\n  transparent_to_transparent: 1.0\n  transparent_to_shielded: 0.0\n  shielded_to_transparent: 0.0\n  shielded_to_shielded: 0.0\nactivity_profiles:\n  low_fraction: 0.50\n  medium_fraction: 0.35\n  high_fraction: 0.15\namounts:\n  min_zatoshis: 10000\n  max_zatoshis: 10000000\nconfirmations_deposit_required: 1\nobservability:\n  record_rpc_calls: true\n  record_component_logs: true\n  metric_sampling_interval_secs: 5\n  mempool_saturation_threshold: 500\n";
+        let mut tmp = NamedTempFile::new().unwrap();
+        tmp.write_all(yaml).unwrap();
         let err = load_scenario(tmp.path()).unwrap_err();
         assert!(matches!(err, ConfigError::Parse(_)));
     }

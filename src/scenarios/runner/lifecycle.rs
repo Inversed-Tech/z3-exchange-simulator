@@ -360,7 +360,8 @@ fn compute_funding_plan(scenario: &ScenarioConfig, active_count: usize) -> fundi
 mod funding_plan_tests {
     use super::compute_funding_plan;
     use crate::data_model::{
-        ActivityProfileConfig, AmountRangeConfig, FlowConfig, ObservabilityConfig, ScenarioConfig,
+        ActivityProfileConfig, AmountRangeConfig, ExpectationsConfig, FlowConfig,
+        ObservabilityConfig, ScenarioConfig,
     };
 
     fn scenario_with(
@@ -402,6 +403,7 @@ mod funding_plan_tests {
             config_hash: String::new(),
             source_path: String::new(),
             warmup_blocks: 0,
+            expectations: ExpectationsConfig::default(),
         }
     }
 

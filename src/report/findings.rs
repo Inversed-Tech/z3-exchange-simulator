@@ -489,6 +489,8 @@ mod tests {
             error_code,
             error_message: None,
             phase: crate::data_model::Phase::Load,
+            intent_id: None,
+            attempt_number: 1,
         }
     }
 
@@ -501,6 +503,7 @@ mod tests {
             error: None,
             timeout_context: timeout_context.map(String::from),
             recorded_at: Utc::now(),
+            failure_class: None,
         }
     }
 

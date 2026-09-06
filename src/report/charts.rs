@@ -252,6 +252,8 @@ mod tests {
             error_code: None,
             error_message: None,
             phase: crate::data_model::Phase::Unknown,
+            intent_id: None,
+            attempt_number: 1,
         }
     }
 

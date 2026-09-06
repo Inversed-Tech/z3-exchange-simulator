@@ -191,6 +191,12 @@ pub async fn run(scenario: ScenarioConfig, opts: RunOptions) -> Result<RunResult
             dry_run: true,
             stats: RunStats::default(),
             outcomes: vec![],
+            // Dry runs never execute a load phase, so there is nothing to
+            // evaluate — trivially "passing" is the only sensible value.
+            assertion: result::AssertionOutcome {
+                passed: true,
+                violations: vec![],
+            },
         });
     }
 
@@ -330,11 +336,12 @@ pub async fn run(scenario: ScenarioConfig, opts: RunOptions) -> Result<RunResult
     // this after teardown (as an earlier version of this code did) meant
     // summary.md was always generated before any intent was recorded, so its
     // "Outcomes by flow type" section silently never appeared.
-    let stats = if let Ok((total_attempted, outcomes)) = &load_result {
+    let stats_and_assertion = if let Ok((total_attempted, outcomes)) = &load_result {
         let mut stats = RunStats {
             total_attempted: *total_attempted,
             ..Default::default()
         };
+        let mut intent_records = Vec::with_capacity(outcomes.len());
         for o in outcomes {
             match o {
                 IntentOutcome::WithdrawalOk { .. } | IntentOutcome::DepositOk { .. } => {
@@ -343,9 +350,13 @@ pub async fn run(scenario: ScenarioConfig, opts: RunOptions) -> Result<RunResult
                 IntentOutcome::Failed { .. } => stats.failed += 1,
                 IntentOutcome::TimedOut { .. } => stats.timed_out += 1,
             }
-            recorder.record_intent(crate::data_model::IntentRecord::from_outcome(o, &run_id));
+            let record = crate::data_model::IntentRecord::from_outcome(o, &run_id);
+            recorder.record_intent(record.clone());
+            intent_records.push(record);
         }
-        Some(stats)
+        let failures_by_class = result::terminal_failures_by_class(&intent_records);
+        let assertion = stats.evaluate(&scenario.expectations, &failures_by_class);
+        Some((stats, assertion))
     } else {
         None
     };
@@ -367,12 +378,15 @@ pub async fn run(scenario: ScenarioConfig, opts: RunOptions) -> Result<RunResult
     match load_result {
         Ok((_, outcomes)) => {
             teardown_result?;
+            let (stats, assertion) = stats_and_assertion
+                .expect("stats/assertion computed above whenever load_result is Ok");
             Ok(RunResult {
                 run_id,
                 output_dir: Some(run_dir.path.clone()),
                 dry_run: false,
-                stats: stats.expect("stats computed above whenever load_result is Ok"),
+                stats,
                 outcomes,
+                assertion,
             })
         }
         Err(e) => Err(e),

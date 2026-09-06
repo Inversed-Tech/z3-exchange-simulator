@@ -270,8 +270,8 @@ mod tests {
     use wiremock::{matchers, Mock, MockServer, ResponseTemplate};
 
     use crate::data_model::{
-        ActivityProfileConfig, AmountRangeConfig, FlowConfig, MetricSample, ObservabilityConfig,
-        RpcCall, ScenarioConfig,
+        ActivityProfileConfig, AmountRangeConfig, ExpectationsConfig, FlowConfig, MetricSample,
+        ObservabilityConfig, RpcCall, ScenarioConfig,
     };
     use crate::metrics::{MetricsRecorder, NullRecorder};
     use crate::rpc::RpcClient;
@@ -314,6 +314,7 @@ mod tests {
             config_hash: String::new(),
             source_path: String::new(),
             warmup_blocks: 0,
+            expectations: ExpectationsConfig::default(),
         }
     }
 
