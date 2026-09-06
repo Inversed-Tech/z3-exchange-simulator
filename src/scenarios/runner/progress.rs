@@ -17,12 +17,22 @@ use crate::data_model::Phase;
 
 pub struct ProgressLine {
     is_tty: bool,
+    /// Counts `update()` calls so a caller-side regression test (e.g.
+    /// `funding.rs`'s `wait_operation` test) can assert progress actually
+    /// fired repeatedly during a multi-iteration wait, without needing to
+    /// intercept the real `eprint!`/`tracing::info!` output — see
+    /// `progress.rs`'s own tests for why capturing that output directly
+    /// isn't pursued here.
+    #[cfg(test)]
+    update_count: std::sync::atomic::AtomicUsize,
 }
 
 impl ProgressLine {
     pub fn new() -> Self {
         Self {
             is_tty: std::io::stderr().is_terminal(),
+            #[cfg(test)]
+            update_count: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -30,6 +40,9 @@ impl ProgressLine {
     /// alongside `elapsed` so a reader can see how much budget remains, not
     /// just how much time has passed.
     pub fn update(&self, phase: Phase, detail: &str, elapsed: Duration, timeout: Option<Duration>) {
+        #[cfg(test)]
+        self.update_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let line = format!(
             "{phase:?}: {detail} (elapsed {}{})",
             format_duration(elapsed),
@@ -55,9 +68,23 @@ impl ProgressLine {
         }
     }
 
+    /// Test-only constructor with an injected `is_tty`, for determinism —
+    /// used both by this module's own tests and by other modules' tests
+    /// (e.g. `funding.rs`) that need a `ProgressLine` without depending on
+    /// the real terminal check.
     #[cfg(test)]
-    fn with_tty(is_tty: bool) -> Self {
-        Self { is_tty }
+    pub(crate) fn with_tty(is_tty: bool) -> Self {
+        Self {
+            is_tty,
+            update_count: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    /// Number of `update()` calls observed so far — see the `update_count`
+    /// field doc comment.
+    #[cfg(test)]
+    pub(crate) fn update_count(&self) -> usize {
+        self.update_count.load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
@@ -97,10 +124,19 @@ mod tests {
         assert_eq!(format_duration(Duration::from_secs(65)), "1m05s");
     }
 
-    // No capture seam exists for eprint!/tracing output here, so these guard
-    // only that each code path (tty vs. non-tty) is reachable without
-    // panicking — is_tty's actual routing is exercised end-to-end by the
-    // lifecycle/load-phase call sites in live-stack testing.
+    // Deliberate, explicit decision (not an oversight): `eprint!` writes
+    // directly to the process's real stderr file descriptor, which a normal
+    // `#[test]` cannot intercept on stable Rust without either an OS-level fd
+    // redirection (a new dependency, e.g. `gag`) or restructuring this
+    // module around an injectable sink — disproportionate engineering for a
+    // single-branch `if self.is_tty { .. } else { .. }` that is easy to
+    // verify correct by inspection and has no history of regressing. These
+    // tests therefore only guard that each code path is reachable without
+    // panicking; `update_count()` (test-only) lets *callers* of
+    // `ProgressLine` (e.g. `funding::wait_operation`'s tests) assert
+    // `update()` was actually invoked an expected number of times, which is
+    // the property those call sites' own regression tests need — without
+    // requiring output capture at all.
     #[test]
     fn non_tty_progress_line_update_and_finish_do_not_panic() {
         let p = ProgressLine::with_tty(false);
@@ -118,5 +154,14 @@ mod tests {
             Some(Duration::from_secs(30)),
         );
         p.finish();
+    }
+
+    #[test]
+    fn update_count_reflects_the_number_of_update_calls() {
+        let p = ProgressLine::with_tty(false);
+        assert_eq!(p.update_count(), 0);
+        p.update(Phase::Funding, "a", Duration::from_secs(1), None);
+        p.update(Phase::Funding, "b", Duration::from_secs(2), None);
+        assert_eq!(p.update_count(), 2);
     }
 }

@@ -1017,6 +1017,14 @@ impl RpcClient {
                 match self.generate(chunk).await {
                     Ok(_) => break,
                     Err(RpcError::Transport(_)) if attempts < max_attempts_per_chunk => {
+                        // Re-report the last completed chunk's progress here
+                        // too, not only once the current chunk finishes: a
+                        // chunk stuck retrying (up to
+                        // `max_attempts_per_chunk * retry_interval`) would
+                        // otherwise leave the caller's progress line frozen
+                        // for that whole stretch instead of showing a fresh
+                        // elapsed time every `retry_interval`.
+                        on_chunk(mined, total_blocks);
                         tokio::time::sleep(retry_interval).await;
                     }
                     Err(e) => return Err(e),
@@ -2540,6 +2548,58 @@ mod tests {
             requests.len(),
             2,
             "expected the timed-out attempt plus one retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn generate_in_chunks_reports_progress_during_a_retry_not_only_on_chunk_completion() {
+        use wiremock::{matchers, Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        // Two client-side timeouts before the chunk finally succeeds — a
+        // single chunk stuck retrying, the scenario `on_chunk` must not stay
+        // silent through.
+        Mock::given(matchers::method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"result": [], "error": null, "id": 1}))
+                    .set_delay(Duration::from_millis(200)),
+            )
+            .up_to_n_times(2)
+            .mount(&server)
+            .await;
+        Mock::given(matchers::method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [], "error": null, "id": 1
+            })))
+            .mount(&server)
+            .await;
+
+        let short_timeout_client = RpcClient::new(
+            server.uri(),
+            "test-run",
+            None,
+            Some(Duration::from_millis(20)),
+        );
+
+        let progress = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(u64, u64)>::new()));
+        let progress_clone = progress.clone();
+        short_timeout_client
+            .generate_in_chunks_with_retry_policy(5, 5, 3, Duration::from_millis(1), move |m, t| {
+                progress_clone.lock().unwrap().push((m, t));
+            })
+            .await
+            .unwrap();
+
+        let calls = progress.lock().unwrap().clone();
+        assert!(
+            calls.len() >= 2,
+            "expected at least one progress call during the retries plus one on completion, \
+             got: {calls:?}"
+        );
+        assert_eq!(
+            calls.last(),
+            Some(&(5, 5)),
+            "the final call must still report the chunk as complete"
         );
     }
 

@@ -6,6 +6,7 @@
 use std::path::{Path, PathBuf};
 
 use z3_exchange_simulator::cli::{dispatch, Cli, CliError, Commands, PrintVersionsArgs};
+use z3_exchange_simulator::metrics::read_manifest;
 use z3_exchange_simulator::scenarios::runner::{
     load_scenario, run, validate_scenario, IntentOutcome, RunOptions,
 };
@@ -55,6 +56,48 @@ async fn test_smoke_scenario_via_runner() {
             );
         }
     }
+
+    // Regression guard for Track 6's manifest-completeness promise: every
+    // field runner::run() assembles from live introspection (image_digests,
+    // compose_config_hash, host_cpu_count, state) must actually reach the
+    // written manifest.json, not just the helpers that produce them in
+    // isolation — a reordering of stack.stop()/image_digests(), or a typo in
+    // which branch sets which field, would previously have stayed green
+    // through every existing unit test.
+    let run_dir = result
+        .output_dir
+        .as_ref()
+        .expect("a non-dry-run must produce an output directory");
+    let manifest = read_manifest(&run_dir.join("manifest.json"))
+        .expect("manifest.json must be readable after a completed run");
+    assert!(
+        !manifest.image_digests.is_empty(),
+        "expected at least one running image digest in the manifest"
+    );
+    assert!(
+        !manifest.compose_config_hash.is_empty(),
+        "expected a non-empty compose config hash in the manifest"
+    );
+    assert_eq!(
+        manifest.host_cpu_count,
+        std::thread::available_parallelism()
+            .map(|n| n.get() as u32)
+            .unwrap_or(0),
+        "manifest host_cpu_count must match this host's actual parallelism"
+    );
+    // Both non-zero proves `StateIdentifier` was actually populated from live
+    // RPC calls (chain_height_at_start from get_block_count, balance from
+    // warmup's own funded-balance check) rather than silently left at
+    // `StateIdentifier::default()`'s all-zero value, which `freshness` alone
+    // can't distinguish (Fresh is also `default()`'s own classification).
+    assert!(
+        manifest.state.chain_height_at_start > 0,
+        "expected a real chain height captured at run start, got 0 (default)"
+    );
+    assert!(
+        manifest.state.hot_wallet_balance_at_start_zat > 0,
+        "expected a real hot-wallet balance captured after warmup, got 0 (default)"
+    );
 }
 
 /// A scenario whose `expectations.min_confirmed` is set above what the stack

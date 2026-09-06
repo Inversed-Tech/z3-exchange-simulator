@@ -112,22 +112,25 @@ pub struct RunArgs {
     #[arg(long)]
     pub fresh_env: bool,
     /// Test-only overrides for `RunOptions::{compose_dir, env_id_cache_path,
-    /// run_lock_dir}` — never real CLI flags (`#[arg(skip)]`, so no such
-    /// flags exist and these are always `None` for anything parsed from the
-    /// actual command line). Let a unit test exercising this dispatch path
-    /// fully sandbox where `setup()` reads/writes: `compose_dir` pointed at
-    /// a path guaranteed not to exist fails fast (see
+    /// run_lock_dir, reset_epoch_dir}` — never real CLI flags (`#[arg(skip)]`,
+    /// so no such flags exist and these are always `None` for anything parsed
+    /// from the actual command line). Let a unit test exercising this dispatch
+    /// path fully sandbox where `setup()` reads/writes: `compose_dir` pointed
+    /// at a path guaranteed not to exist fails fast (see
     /// `z3::Z3Config::check_preconditions`) instead of reaching a real
     /// `external/z3` checkout and real Docker/bootstrap-script state that
     /// might happen to already be configured on the machine running tests;
-    /// `env_id_cache_path`/`run_lock_dir` pointed at a tempdir keep the same
-    /// test from writing into the real checkout's `configs/local/`.
+    /// `env_id_cache_path`/`run_lock_dir`/`reset_epoch_dir` pointed at a
+    /// tempdir keep the same test from reading or writing the real checkout's
+    /// `configs/local/`.
     #[arg(skip)]
     pub compose_dir: Option<PathBuf>,
     #[arg(skip)]
     pub env_id_cache_path: Option<PathBuf>,
     #[arg(skip)]
     pub run_lock_dir: Option<PathBuf>,
+    #[arg(skip)]
+    pub reset_epoch_dir: Option<PathBuf>,
 }
 
 #[derive(clap::Args, Default)]
@@ -489,6 +492,9 @@ fn apply_test_path_overrides(opts: &mut RunOptions, args: &RunArgs) {
     if let Some(dir) = &args.run_lock_dir {
         opts.run_lock_dir = dir.clone();
     }
+    if let Some(dir) = &args.reset_epoch_dir {
+        opts.reset_epoch_dir = dir.clone();
+    }
 }
 
 async fn run_command(
@@ -651,6 +657,7 @@ expectations:
             compose_dir: None,
             env_id_cache_path: None,
             run_lock_dir: None,
+            reset_epoch_dir: None,
         }
     }
 
@@ -660,12 +667,13 @@ expectations:
     /// `external/z3` checkout or touch real Docker/bootstrap-script state,
     /// regardless of what happens to be configured on the machine running
     /// the tests — see `z3::Z3Config::check_preconditions`), and
-    /// `env_id_cache_path`/`run_lock_dir` are pinned inside `output_base`
-    /// (the caller's own tempdir) so this never reads or writes the real
-    /// checkout's `configs/local/` either.
+    /// `env_id_cache_path`/`run_lock_dir`/`reset_epoch_dir` are pinned inside
+    /// `output_base` (the caller's own tempdir) so this never reads or writes
+    /// the real checkout's `configs/local/` either.
     fn live_run_args(scenario: PathBuf, output_base: PathBuf) -> RunArgs {
         let env_id_cache_path = Some(output_base.join("env-id"));
         let run_lock_dir = Some(output_base.clone());
+        let reset_epoch_dir = Some(output_base.clone());
         RunArgs {
             scenario,
             dry_run: false,
@@ -684,6 +692,7 @@ expectations:
             )),
             env_id_cache_path,
             run_lock_dir,
+            reset_epoch_dir,
         }
     }
 
@@ -878,6 +887,7 @@ expectations:
             compose_dir: None,
             env_id_cache_path: None,
             run_lock_dir: None,
+            reset_epoch_dir: None,
         };
         let err = build_load_shape(&args).unwrap_err();
         assert!(

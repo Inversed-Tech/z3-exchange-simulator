@@ -307,8 +307,21 @@ pub async fn resolve_receivers(
 }
 
 /// Poll an async wallet operation to completion and return its txid.
-pub async fn wait_operation(rpc: &RpcClient, opid: &str) -> Result<String, FundingError> {
-    let deadline = tokio::time::Instant::now() + OPERATION_TIMEOUT;
+///
+/// Reports progress once per poll iteration (every 2s) via `progress`/
+/// `detail`, the same cadence `warmup`'s balance-check loop uses — a single
+/// operation can take most of [`OPERATION_TIMEOUT`] (anchor-confirmation or
+/// wallet-scan lag), and without a per-iteration update the caller's own
+/// once-per-round progress line would otherwise go silent for up to that
+/// long.
+pub async fn wait_operation(
+    rpc: &RpcClient,
+    opid: &str,
+    progress: &ProgressLine,
+    detail: &str,
+) -> Result<String, FundingError> {
+    let start = tokio::time::Instant::now();
+    let deadline = start + OPERATION_TIMEOUT;
     loop {
         let statuses =
             rpc.z_get_operation_status(&[opid])
@@ -370,6 +383,12 @@ pub async fn wait_operation(rpc: &RpcClient, opid: &str) -> Result<String, Fundi
                 detail: format!("operation {opid} did not complete within {OPERATION_TIMEOUT:?}"),
             });
         }
+        progress.update(
+            Phase::Funding,
+            detail,
+            start.elapsed(),
+            Some(OPERATION_TIMEOUT),
+        );
         sleep(Duration::from_secs(2)).await;
     }
 }
@@ -493,7 +512,13 @@ pub async fn fund_accounts(
                 step: "z_shieldcoinbase",
                 source: e,
             })?;
-        wait_operation(rpc, &shield.opid).await?;
+        wait_operation(
+            rpc,
+            &shield.opid,
+            progress,
+            "waiting for coinbase shielding to confirm",
+        )
+        .await?;
         // The shielding tx itself needs anchor confirmations before the notes
         // it created are spendable.
         mine_chunked(rpc, ANCHOR_CONFIRMATIONS as u64).await?;
@@ -559,7 +584,18 @@ pub async fn fund_accounts(
         let opid =
             send_with_anchor_retries(rpc, &source.address, &recipients, "AllowRevealedRecipients")
                 .await?;
-        last_txid = Some(wait_operation(rpc, &opid).await?);
+        last_txid = Some(
+            wait_operation(
+                rpc,
+                &opid,
+                progress,
+                &format!(
+                    "funding round {}/{rounds} — waiting for confirmation",
+                    round + 1
+                ),
+            )
+            .await?,
+        );
     }
     progress.finish();
 
@@ -575,6 +611,7 @@ mod tests {
 
     use super::{is_expiry_race, wait_operation, FundingError};
     use crate::rpc::{AccountInfo, RpcClient};
+    use crate::scenarios::runner::progress::ProgressLine;
 
     fn account(uuid: &str, addrs: &[(u64, &str)]) -> AccountInfo {
         let json = serde_json::json!({
@@ -663,7 +700,10 @@ mod tests {
         .await;
 
         let rpc = RpcClient::new(&server.uri(), "test-run", None, None);
-        let err = wait_operation(&rpc, "op-1").await.unwrap_err();
+        let progress = ProgressLine::with_tty(false);
+        let err = wait_operation(&rpc, "op-1", &progress, "test wait")
+            .await
+            .unwrap_err();
 
         let FundingError::Failed { step, detail } = err else {
             panic!("expected FundingError::Failed, got {err:?}");
@@ -689,11 +729,72 @@ mod tests {
         .await;
 
         let rpc = RpcClient::new(&server.uri(), "test-run", None, None);
-        let err = wait_operation(&rpc, "op-1").await.unwrap_err();
+        let progress = ProgressLine::with_tty(false);
+        let err = wait_operation(&rpc, "op-1", &progress, "test wait")
+            .await
+            .unwrap_err();
 
         let FundingError::Failed { detail, .. } = err else {
             panic!("expected FundingError::Failed, got {err:?}");
         };
         assert_eq!(detail, "code -6: Insufficient funds");
+    }
+
+    #[tokio::test]
+    async fn wait_operation_reports_progress_on_every_poll_iteration_not_only_at_the_start() {
+        // Regression guard for the funding-round silence gap: an operation
+        // that stays "executing" across several poll cycles before
+        // completing must not leave the caller's progress line frozen for
+        // the whole wait — `wait_operation` must call `progress.update` on
+        // every 2s iteration, not only once at the caller's round-start.
+        let server = MockServer::start().await;
+        let executing = serde_json::json!({
+            "result": [{"id": "op-1", "status": "executing", "result": null, "error": null}],
+            "error": null,
+            "id": 1
+        });
+        let success = serde_json::json!({
+            "result": [{
+                "id": "op-1", "status": "success",
+                "result": {"txid": "abc123"}, "error": null
+            }],
+            "error": null,
+            "id": 1
+        });
+        Mock::given(matchers::method("POST"))
+            .and(matchers::body_partial_json(serde_json::json!({
+                "method": "z_getoperationstatus",
+                "params": [["op-1"]],
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(executing))
+            .up_to_n_times(2)
+            .mount(&server)
+            .await;
+        Mock::given(matchers::method("POST"))
+            .and(matchers::body_partial_json(serde_json::json!({
+                "method": "z_getoperationstatus",
+                "params": [["op-1"]],
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(success))
+            .mount(&server)
+            .await;
+
+        let rpc = RpcClient::new(&server.uri(), "test-run", None, None);
+        let progress = ProgressLine::with_tty(false);
+        let txid = wait_operation(&rpc, "op-1", &progress, "test wait")
+            .await
+            .unwrap();
+
+        assert_eq!(txid, "abc123");
+        // Two "executing" iterations, each followed by a progress update
+        // before the 2s sleep — the terminal iteration returns before
+        // updating again, so the count is exactly the number of
+        // non-terminal polls observed, not one (the round-start call this
+        // test never makes) and not zero.
+        assert_eq!(
+            progress.update_count(),
+            2,
+            "expected one progress update per non-terminal poll iteration"
+        );
     }
 }
