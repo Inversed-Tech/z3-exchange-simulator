@@ -238,7 +238,8 @@ the method's routing table.
 | `confirmed_txs_total` | `flow_type` | Cumulative confirmed transactions |
 | `failed_txs_total` | `flow_type`, `reason` | Cumulative failed transactions |
 | `deposit_confirmation_time_ms` | — | Time from deposit detection to credit |
-| `proving_time_ms` | — | ZK proof generation time for shielded txs |
+| `shielded_proving_time_ms` | `account_id`, `flow_type` | ZK spend/output proof generation time for a withdrawal whose flow touches a shielded pool on either end (`FlowType::is_shielded()` — t2z, z2t, z2z, not only fully-shielded z2z) |
+| `wallet_operation_time_ms` | `account_id`, `flow_type` | The same measured window (accepted `z_sendmany` call through operation completion) for a purely transparent (t2t) withdrawal, where no ZK proof is generated — kept as a separate metric name so this time is never mislabeled as shielded proving time |
 | `active_accounts` | — | Accounts actively transacting at sample time |
 | `block_height` | — | Current chain height |
 | `scheduled_dispatch_rate` | — | Intents dispatched per second of actual load-phase elapsed time (not the configured duration) — a scheduler-behavior figure, not a confirmed-transaction rate |
@@ -250,6 +251,19 @@ the method's routing table.
 Metric sampling interval: **5 seconds** by default, configurable per-scenario via
 `observability.metric_sampling_interval_secs` in the scenario YAML. Use 1s for burst
 scenarios where fine-grained mempool data is needed; 15s for long steady-state runs.
+
+### Known limitations in the findings report
+
+The findings report (`src/report/findings.rs`) never surfaces a pre-approved, already
+documented defect as a fresh `High`-severity `RpcFailure` candidate. A small explicit table,
+`KNOWN_LIMITATIONS`, names each such defect by RPC method, the lifecycle phase (see `Phase`
+above) it is known to occur in, and a substring of its actual error message — a candidate call
+must match all three fields to be excluded from ordinary rate-based scoring and instead
+rendered as a `Low`-severity `KnownLimitation` finding. Matching on method or phase alone is
+deliberately insufficient: `z_listunspent`, for example, is called both from an unfiltered,
+known-defective site during warmup and from a filtered, defect-avoiding site during the load
+phase's sweep flow, under the identical method name — only the phase-and-error-substring
+combination distinguishes the tolerated case from a genuinely new failure.
 
 ---
 
@@ -336,6 +350,9 @@ mixed into the workload table.
 - ...
 
 ## Shielded transaction proving times
+- P50: <ms>, P95: <ms>, P99: <ms>
+
+## Wallet operation times (no shielded proof)
 - P50: <ms>, P95: <ms>, P99: <ms>
 ```
 

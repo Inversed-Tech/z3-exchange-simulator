@@ -53,7 +53,17 @@ pub struct SystemHealth {
     /// saturation threshold (see the mempool watcher in
     /// `src/scenarios/exchange.rs`).
     pub saturation_events: u64,
-    pub proving_time: Option<ProvingTimeStats>,
+    /// From `shielded_proving_time_ms` samples — ZK spend/output proof
+    /// generation, emitted only when a withdrawal's flow touches a shielded
+    /// pool on either end (`FlowType::is_shielded()`). `None` for a run with
+    /// no such withdrawals, or none emitted.
+    pub shielded_proving_time: Option<ProvingTimeStats>,
+    /// From `wallet_operation_time_ms` samples — the same measured window
+    /// (accepted `z_sendmany` call through operation completion) for a
+    /// purely transparent withdrawal, where no ZK proof is generated. Kept
+    /// separate from `shielded_proving_time` so a transparent-only run's
+    /// wallet-operation latency is never mislabeled as proving time.
+    pub wallet_operation_time: Option<ProvingTimeStats>,
     /// Sorted by process name for deterministic report output (`metrics`
     /// iteration order is file order, not grouped by process).
     pub process_peaks: Vec<ProcessResourcePeak>,
@@ -62,7 +72,7 @@ pub struct SystemHealth {
 /// Computes one run's system-health figures from its `metrics.jsonl`
 /// samples. Every field degrades to `None`/empty/zero rather than erroring
 /// when a metric was never emitted (e.g. a run with no shielded sends has no
-/// `withdrawal_proving_time_ms` samples) — this is supplementary context on
+/// `shielded_proving_time_ms` samples) — this is supplementary context on
 /// top of the RPC-log-derived sections, not something a run can fail to
 /// produce.
 pub fn compute_system_health(run: &RunData) -> SystemHealth {
@@ -71,7 +81,8 @@ pub fn compute_system_health(run: &RunData) -> SystemHealth {
     let mut peak_mempool_tx_count: Option<f64> = None;
     let mut peak_mempool_bytes: Option<f64> = None;
     let mut saturation_events = 0u64;
-    let mut proving_samples: Vec<f64> = Vec::new();
+    let mut shielded_proving_samples: Vec<f64> = Vec::new();
+    let mut wallet_operation_samples: Vec<f64> = Vec::new();
     let mut process_cpu: HashMap<String, f64> = HashMap::new();
     let mut process_mem: HashMap<String, f64> = HashMap::new();
 
@@ -91,7 +102,8 @@ pub fn compute_system_health(run: &RunData) -> SystemHealth {
                     saturation_events += 1;
                 }
             }
-            "withdrawal_proving_time_ms" => proving_samples.push(sample.value),
+            "shielded_proving_time_ms" => shielded_proving_samples.push(sample.value),
+            "wallet_operation_time_ms" => wallet_operation_samples.push(sample.value),
             "process_cpu_percent" => {
                 if let Some(process) = sample.labels.get("process") {
                     let entry = process_cpu.entry(process.clone()).or_insert(sample.value);
@@ -108,17 +120,20 @@ pub fn compute_system_health(run: &RunData) -> SystemHealth {
         }
     }
 
-    let proving_time = if proving_samples.is_empty() {
-        None
-    } else {
-        proving_samples.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
+    fn stats_from(mut samples: Vec<f64>) -> Option<ProvingTimeStats> {
+        if samples.is_empty() {
+            return None;
+        }
+        samples.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
         Some(ProvingTimeStats {
-            p50_ms: percentile_value(&proving_samples, 0.50),
-            p95_ms: percentile_value(&proving_samples, 0.95),
-            p99_ms: percentile_value(&proving_samples, 0.99),
-            samples: proving_samples.len(),
+            p50_ms: percentile_value(&samples, 0.50),
+            p95_ms: percentile_value(&samples, 0.95),
+            p99_ms: percentile_value(&samples, 0.99),
+            samples: samples.len(),
         })
-    };
+    }
+    let shielded_proving_time = stats_from(shielded_proving_samples);
+    let wallet_operation_time = stats_from(wallet_operation_samples);
 
     let mut processes: Vec<String> = process_cpu
         .keys()
@@ -142,7 +157,8 @@ pub fn compute_system_health(run: &RunData) -> SystemHealth {
         peak_mempool_tx_count,
         peak_mempool_bytes,
         saturation_events,
-        proving_time,
+        shielded_proving_time,
+        wallet_operation_time,
         process_peaks,
     }
 }
@@ -176,6 +192,7 @@ mod tests {
                 host_cpu_count: 0,
                 host_memory_limit_bytes: None,
                 state: StateIdentifier::default(),
+                assertion: None,
             },
             rpc_calls: Vec::new(),
             intents: Vec::new(),
@@ -203,7 +220,8 @@ mod tests {
         assert!(h.scheduled_dispatch_rate.is_none());
         assert!(h.confirmed_tx_throughput.is_none());
         assert!(h.peak_mempool_tx_count.is_none());
-        assert!(h.proving_time.is_none());
+        assert!(h.shielded_proving_time.is_none());
+        assert!(h.wallet_operation_time.is_none());
         assert!(h.process_peaks.is_empty());
         assert_eq!(h.saturation_events, 0);
     }
@@ -252,14 +270,31 @@ mod tests {
     }
 
     #[test]
-    fn proving_time_percentiles_from_samples() {
+    fn shielded_proving_time_percentiles_from_samples() {
         let samples: Vec<MetricSample> = (1..=10)
-            .map(|i| sample("withdrawal_proving_time_ms", (i * 100) as f64, &[]))
+            .map(|i| sample("shielded_proving_time_ms", (i * 100) as f64, &[]))
             .collect();
         let h = compute_system_health(&run_with_metrics(samples));
-        let p = h.proving_time.expect("expected proving time stats");
+        let p = h
+            .shielded_proving_time
+            .expect("expected shielded proving time stats");
         assert_eq!(p.samples, 10);
         assert_eq!(p.p50_ms, 600.0);
+        assert!(h.wallet_operation_time.is_none());
+    }
+
+    #[test]
+    fn wallet_operation_time_percentiles_from_samples_and_is_distinct_from_shielded() {
+        let samples: Vec<MetricSample> = (1..=10)
+            .map(|i| sample("wallet_operation_time_ms", (i * 100) as f64, &[]))
+            .collect();
+        let h = compute_system_health(&run_with_metrics(samples));
+        let p = h
+            .wallet_operation_time
+            .expect("expected wallet operation time stats");
+        assert_eq!(p.samples, 10);
+        assert_eq!(p.p50_ms, 600.0);
+        assert!(h.shielded_proving_time.is_none());
     }
 
     #[test]

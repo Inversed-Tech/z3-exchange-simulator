@@ -672,16 +672,11 @@ pub fn build_unlisted(runs: &[RunData], phase_filter: impl Fn(Phase) -> bool) ->
 
 /// Per-method distribution of how many attempts a load/drain-phase intent
 /// needed before its terminal `z_sendmany`-style outcome — the "Retry detail
-/// by method" appendix data. Only intents linked via `intent_id` are
-/// represented; a group's representative call's own `attempt_number` (see
-/// `representative_calls`) already equals how many attempts that intent
-/// needed, since attempts are numbered 1..N.
-///
-/// Computed here (Track 3), rendered by Track 5's appendix restructuring
-/// (moving the RPC matrix out of the main report body) — see the Cross-Track
-/// Review's "Shared changes" note on this mechanism. `#[allow(dead_code)]`
-/// until that rendering call site lands and reads this data.
-#[allow(dead_code)]
+/// by method" appendix data (see `markdown::render_retry_detail`, Appendix
+/// A). Only intents linked via `intent_id` are represented; a group's
+/// representative call's own `attempt_number` (see `representative_calls`)
+/// already equals how many attempts that intent needed, since attempts are
+/// numbered 1..N.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RetryDetail {
     pub method: &'static str,
@@ -690,7 +685,6 @@ pub struct RetryDetail {
     pub four_plus_attempts: u64,
 }
 
-#[allow(dead_code)]
 pub fn build_retry_detail(
     runs: &[RunData],
     phase_filter: impl Fn(Phase) -> bool,
@@ -759,6 +753,7 @@ mod tests {
                 host_cpu_count: 0,
                 host_memory_limit_bytes: None,
                 state: StateIdentifier::default(),
+                assertion: None,
             },
             rpc_calls: calls,
             intents: Vec::<IntentRecord>::new(),

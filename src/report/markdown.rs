@@ -7,7 +7,9 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use crate::data_model::{Phase, RpcCall};
+use crate::data_model::{IntentRecord, Phase, RpcCall};
+use crate::metrics::StateFreshness;
+use crate::scenarios::runner::result::terminal_failures_by_class;
 
 use super::charts::{render_latency_chart, render_tps_chart};
 use super::findings::{
@@ -22,7 +24,7 @@ use super::load_curve::{
 };
 use super::loader::RunData;
 use super::rpc_matrix::{
-    build_matrix, build_unlisted, load_parity_annotations, Category, ParityInfo,
+    build_matrix, build_retry_detail, build_unlisted, load_parity_annotations, Category, ParityInfo,
 };
 use super::system_health::{compute_system_health, SystemHealth};
 
@@ -71,11 +73,13 @@ fn render_table(headers: &[&str], rows: &[Vec<String>], md: &mut String) {
 }
 
 /// Executive summary up top: the digest a reader should be able to stop at
-/// if they only have a minute — run/scenario counts, overall load results,
-/// and a severity-ranked list of the findings that matter most. Everything
-/// here is also fully spelled out later in the report; this section exists
-/// purely to make the report skimmable, per the project's explicit ask that
-/// the report be "comprehensive, easy to read, and already digested."
+/// if they only have a minute. Answers five questions, in the order the
+/// client asked for, before any per-run detail table below: (1) did the run
+/// pass or fail its scenario assertions, (2) what component versions ran,
+/// (3) was the starting chain state fresh or reused, (4) what terminal
+/// intent failures occurred, and (5) which candidate findings need
+/// attention. Everything here is also fully spelled out later in the
+/// report; this section exists purely to make the report skimmable.
 fn render_executive_summary(runs: &[RunData], findings: &[Finding], md: &mut String) {
     md.push_str("## Executive summary\n\n");
 
@@ -89,10 +93,83 @@ fn render_executive_summary(runs: &[RunData], findings: &[Finding], md: &mut Str
         v
     };
     md.push_str(&format!(
-        "- **Runs included:** {} (scenario(s): {})\n",
+        "- **Runs included:** {} (scenario(s): {})\n\n",
         runs.len(),
         scenarios.join(", ")
     ));
+
+    md.push_str("### 1. Assertion result\n\n");
+    for run in runs {
+        match &run.manifest.assertion {
+            Some(a) if a.passed => md.push_str(&format!("- **{}**: PASS\n", run.manifest.run_id)),
+            Some(a) => {
+                md.push_str(&format!("- **{}**: FAIL\n", run.manifest.run_id));
+                for v in &a.violations {
+                    md.push_str(&format!("  - {v}\n"));
+                }
+            }
+            None => md.push_str(&format!(
+                "- **{}**: no assertion recorded (predates scenario expectations, or the run \
+                 never reached evaluation)\n",
+                run.manifest.run_id
+            )),
+        }
+    }
+    md.push('\n');
+
+    md.push_str("### 2. Component versions\n\n");
+    for run in runs {
+        if run.manifest.image_digests.is_empty() {
+            md.push_str(&format!(
+                "- **{}**: no image digests recorded (predates this field)\n",
+                run.manifest.run_id
+            ));
+            continue;
+        }
+        md.push_str(&format!("- **{}**:\n", run.manifest.run_id));
+        for img in &run.manifest.image_digests {
+            md.push_str(&format!(
+                "  - {}: {} (image id {})\n",
+                img.service, img.image, img.id
+            ));
+        }
+    }
+    md.push('\n');
+
+    md.push_str("### 3. State freshness\n\n");
+    for run in runs {
+        let s = &run.manifest.state;
+        let desc = match s.freshness {
+            StateFreshness::Fresh => "fresh".to_string(),
+            StateFreshness::Reused => format!(
+                "reused (reset epoch {}, chain height {})",
+                s.reset_epoch, s.chain_height_at_start
+            ),
+        };
+        md.push_str(&format!("- **{}**: {desc}\n", run.manifest.run_id));
+    }
+    md.push('\n');
+
+    md.push_str("### 4. Intent-level failures\n\n");
+    let all_intents: Vec<IntentRecord> = runs
+        .iter()
+        .flat_map(|r| r.intents.iter().cloned())
+        .collect();
+    let failures_by_class = terminal_failures_by_class(&all_intents);
+    let total_terminal_failures: u64 = failures_by_class.values().sum();
+    if total_terminal_failures == 0 {
+        md.push_str("- No terminal failures recorded.\n\n");
+    } else {
+        let mut parts: Vec<String> = failures_by_class
+            .iter()
+            .map(|(class, count)| format!("{count} {}", class.as_str()))
+            .collect();
+        parts.sort();
+        md.push_str(&format!(
+            "- **{total_terminal_failures} terminal failure(s)** — {}\n\n",
+            parts.join(", ")
+        ));
+    }
 
     let attempted: usize = runs.iter().map(|r| r.intents.len()).sum();
     let confirmed: usize = runs
@@ -115,6 +192,8 @@ fn render_executive_summary(runs: &[RunData], findings: &[Finding], md: &mut Str
     } else {
         0.0
     };
+
+    md.push_str("### 5. Actionable findings\n\n");
     md.push_str(&format!(
         "- **Intents attempted:** {attempted} — **confirmed {confirmed} ({confirmed_pct:.0}%)**, \
          failed {failed}, timed out {timed_out}\n"
@@ -174,7 +253,7 @@ fn render_executive_summary(runs: &[RunData], findings: &[Finding], md: &mut Str
     if high_findings.is_empty() {
         md.push_str("No High-severity candidates flagged.\n\n");
     } else {
-        md.push_str("### High-severity candidates\n\n");
+        md.push_str("#### High-severity candidates\n\n");
         const MAX_SHOWN: usize = 10;
         for f in high_findings.iter().take(MAX_SHOWN) {
             md.push_str(&format!("- **[{}]** {}\n", f.category, f.summary));
@@ -493,16 +572,22 @@ fn render_system_health(runs: &[RunData], health: &[SystemHealth], md: &mut Stri
             )),
         }
 
-        match &h.proving_time {
-            Some(p) => md.push_str(&format!(
-                "- **Shielded withdrawal proving time:** P50 {:.0}ms, P95 {:.0}ms, P99 {:.0}ms \
-                 over {} sample(s).\n",
+        // Each line renders only when its own sample set is non-empty — a
+        // transparent-only run's report must never even mention "shielded
+        // proving," not merely avoid mislabeling its data as such.
+        if let Some(p) = &h.shielded_proving_time {
+            md.push_str(&format!(
+                "- **Shielded proving time:** P50 {:.0}ms, P95 {:.0}ms, P99 {:.0}ms over {} \
+                 sample(s).\n",
                 p.p50_ms, p.p95_ms, p.p99_ms, p.samples
-            )),
-            None => md.push_str(
-                "- **Shielded withdrawal proving time:** no samples recorded (no shielded \
-                 withdrawals observed, or the metric was not emitted).\n",
-            ),
+            ));
+        }
+        if let Some(p) = &h.wallet_operation_time {
+            md.push_str(&format!(
+                "- **Wallet operation time (no shielded proof):** P50 {:.0}ms, P95 {:.0}ms, P99 \
+                 {:.0}ms over {} sample(s).\n",
+                p.p50_ms, p.p95_ms, p.p99_ms, p.samples
+            ));
         }
 
         if h.process_peaks.is_empty() {
@@ -534,7 +619,7 @@ fn render_system_health(runs: &[RunData], health: &[SystemHealth], md: &mut Stri
 }
 
 fn render_rpc_matrix(runs: &[RunData], md: &mut String) {
-    md.push_str("## RPC compatibility matrix\n\n");
+    md.push_str("## Appendix A — RPC compatibility matrix\n\n");
     md.push_str(
         "Derived mechanically from the `rpc_calls.jsonl` of every run listed above, scoped to \
          `Load`/`Drain`-phase calls only — the measured workload. Setup-phase activity \
@@ -606,6 +691,38 @@ fn render_rpc_matrix(runs: &[RunData], md: &mut String) {
     render_unlisted_rpc_calls(runs, md);
 }
 
+/// Per-method breakdown of how many attempts a load/drain-phase intent
+/// needed before its terminal outcome — the evidence behind the client's
+/// "101 calls, 28 failed retries" observation, broken out so a reader can
+/// see retry volume without it inflating `rpc_failure_candidates`' own rate
+/// computation (which counts terminal outcomes only, via `IntentRecord`, not
+/// raw call volume).
+fn render_retry_detail(runs: &[RunData], md: &mut String) {
+    let detail = build_retry_detail(runs, Phase::is_workload);
+    if detail.is_empty() {
+        return;
+    }
+    md.push_str("### Retry detail by method\n\n");
+    md.push_str(
+        "How many attempts a Load/Drain-phase intent needed before its terminal outcome, for \
+         methods with at least one intent-linked call. A method absent here had no \
+         intent-linked calls in this scope.\n\n",
+    );
+    let headers = ["Method", "1 attempt", "2-3 attempts", "4+ attempts"];
+    let rows: Vec<Vec<String>> = detail
+        .iter()
+        .map(|row| {
+            vec![
+                breakable(row.method, 8),
+                row.single_attempt.to_string(),
+                row.two_to_three_attempts.to_string(),
+                row.four_plus_attempts.to_string(),
+            ]
+        })
+        .collect();
+    render_table(&headers, &rows, md);
+}
+
 /// RPC calls observed during these runs whose method is not part of the
 /// tracked roster — see [`build_unlisted`]'s doc comment for why this
 /// exists as a separate section instead of silently dropping them, as
@@ -666,7 +783,7 @@ fn render_unlisted_rpc_calls(runs: &[RunData], md: &mut String) {
 /// context on setup behavior (including funding's own anchor-confirmation
 /// retries), not a workload finding.
 fn render_setup_phase_rpc_activity(runs: &[RunData], md: &mut String) {
-    md.push_str("## Setup-phase RPC activity\n\n");
+    md.push_str("## Appendix B — Setup-phase RPC activity\n\n");
     md.push_str(
         "Informational only — never scored as a candidate finding. Covers every RPC call \
          issued before the measured workload began: stack bootstrap, hot-wallet readiness \
@@ -881,6 +998,7 @@ fn render_findings(findings: &[Finding], md: &mut String) {
         FindingCategory::FlowTypeDisparity,
         FindingCategory::LoadDegradation,
         FindingCategory::DataCompleteness,
+        FindingCategory::KnownLimitation,
     ] {
         let mut items: Vec<&Finding> = findings.iter().filter(|f| f.category == category).collect();
         if items.is_empty() {
@@ -889,7 +1007,13 @@ fn render_findings(findings: &[Finding], md: &mut String) {
         items.sort_by_key(|f| f.severity);
         md.push_str(&format!("### {category}\n\n"));
         for item in items {
-            md.push_str(&format!("- **[{}]** {}\n", item.severity, item.summary));
+            match &item.context {
+                Some(ctx) => md.push_str(&format!(
+                    "- **[{}]** {} ({ctx})\n",
+                    item.severity, item.summary
+                )),
+                None => md.push_str(&format!("- **[{}]** {}\n", item.severity, item.summary)),
+            }
             for ev in &item.evidence {
                 md.push_str(&format!("  - {ev}\n"));
             }
@@ -932,7 +1056,7 @@ fn render_limitations(runs: &[RunData], md: &mut String) {
 /// "High"/"Medium"/"Low" in the report above can be checked against a
 /// precise definition rather than taken on faith.
 fn render_severity_appendix(md: &mut String) {
-    md.push_str("## Appendix: severity tier definitions\n\n");
+    md.push_str("## Appendix C — Severity tier definitions\n\n");
     md.push_str(
         "Severity is assigned mechanically from simple rate/ratio thresholds — a triage \
          aid for this list, not a human severity assessment. Exact rule per category:\n\n",
@@ -974,7 +1098,13 @@ fn render_severity_appendix(md: &mut String) {
     ));
     md.push_str(
         "- **Data completeness** — always **Low**. Flags incomplete evidence (malformed \
-         input lines), not a claim about the system under test.\n\n",
+         input lines), not a claim about the system under test.\n",
+    );
+    md.push_str(
+        "- **Known limitation** — always **Low**. A pre-approved, documented defect matched \
+         on method, phase, and error signature (see `KNOWN_LIMITATIONS` in `findings.rs`); any \
+         other failure for the same method or phase alone is still scored normally, not \
+         masked by this category.\n\n",
     );
 }
 
@@ -990,11 +1120,16 @@ fn render_report_impl(runs: &[RunData], assets_dir: Option<&Path>) -> String {
     render_load_curve(runs, &health, assets_dir, &mut md);
     render_system_health(runs, &health, &mut md);
     render_setup_phase_timing(runs, &mut md);
-    render_rpc_matrix(runs, &mut md);
-    render_setup_phase_rpc_activity(runs, &mut md);
-    render_unknown_phase_advisory(runs, &mut md);
     render_findings(&findings, &mut md);
     render_limitations(runs, &mut md);
+    // ── Appendix ── moved out of the main report body per the client's
+    // explicit ask: the full RPC matrix and retry distributions are
+    // reference detail, not what a reader needs to judge pass/fail.
+    md.push_str("# Appendix\n\n");
+    render_rpc_matrix(runs, &mut md);
+    render_retry_detail(runs, &mut md);
+    render_setup_phase_rpc_activity(runs, &mut md);
+    render_unknown_phase_advisory(runs, &mut md);
     render_severity_appendix(&mut md);
     md
 }
@@ -1043,6 +1178,7 @@ mod tests {
                 host_cpu_count: 0,
                 host_memory_limit_bytes: None,
                 state: StateIdentifier::default(),
+                assertion: None,
             },
             rpc_calls: vec![
                 RpcCall {
@@ -1141,7 +1277,7 @@ mod tests {
     #[test]
     fn render_report_includes_rpc_matrix_with_status() {
         let md = render_report(&[sample_run()]);
-        assert!(md.contains("## RPC compatibility matrix"));
+        assert!(md.contains("## Appendix A — RPC compatibility matrix"));
         assert!(md.contains("z_listun")); // method name may carry break hints past this point
         assert!(md.contains("Failed"));
     }
@@ -1186,7 +1322,7 @@ mod tests {
     #[test]
     fn render_report_includes_severity_appendix() {
         let md = render_report(&[sample_run()]);
-        assert!(md.contains("## Appendix: severity tier definitions"));
+        assert!(md.contains("## Appendix C — Severity tier definitions"));
         assert!(md.contains("RPC failure"));
         assert!(md.contains("Load degradation"));
     }
@@ -1238,7 +1374,7 @@ mod tests {
     fn render_report_includes_setup_phase_sections() {
         let md = render_report(&[sample_run()]);
         assert!(md.contains("## Setup phase timing"));
-        assert!(md.contains("## Setup-phase RPC activity"));
+        assert!(md.contains("## Appendix B — Setup-phase RPC activity"));
     }
 
     #[test]
@@ -1272,7 +1408,9 @@ mod tests {
 
         let md = render_report(&[run]);
         let section = &md[md.find("## Setup phase timing").unwrap()..];
-        let section = &section[..section.find("## RPC compatibility matrix").unwrap()];
+        let section = &section[..section
+            .find("## Appendix A — RPC compatibility matrix")
+            .unwrap()];
 
         assert!(
             section.contains("Drain") && section.contains("| 10s |"),
@@ -1366,5 +1504,99 @@ mod tests {
         assert!(!assets.exists());
         render_report_with_assets(&[sample_run()], &assets);
         assert!(assets.exists());
+    }
+
+    #[test]
+    fn executive_summary_answers_five_questions_in_order_before_any_per_run_table() {
+        let md = render_report(&[sample_run()]);
+        let summary_end = md.find("## Runs included in this report").unwrap();
+        let summary = &md[..summary_end];
+
+        let headers = [
+            "### 1. Assertion result",
+            "### 2. Component versions",
+            "### 3. State freshness",
+            "### 4. Intent-level failures",
+            "### 5. Actionable findings",
+        ];
+        let mut last_pos = 0;
+        for h in headers {
+            let pos = summary.find(h).unwrap_or_else(|| {
+                panic!("expected header {h:?} in executive summary:\n{summary}")
+            });
+            assert!(
+                pos >= last_pos,
+                "header {h:?} appeared out of order in executive summary:\n{summary}"
+            );
+            last_pos = pos;
+        }
+    }
+
+    #[test]
+    fn executive_summary_shows_assertion_versions_and_freshness() {
+        let mut run = sample_run();
+        run.manifest.assertion = Some(crate::scenarios::runner::result::AssertionOutcome {
+            passed: false,
+            violations: vec!["confirmed 1 < min_confirmed 2".to_string()],
+        });
+        run.manifest.image_digests = vec![crate::z3::ImageInfo {
+            service: "zebra".into(),
+            image: "zfnd/zebra:6.0.0".into(),
+            id: "sha256:abc123".into(),
+        }];
+        run.manifest.state = crate::metrics::StateIdentifier {
+            reset_epoch: 3,
+            chain_height_at_start: 42,
+            hot_wallet_balance_at_start_zat: 0,
+            freshness: crate::metrics::StateFreshness::Reused,
+        };
+        let md = render_report(&[run]);
+        assert!(md.contains("FAIL"));
+        assert!(md.contains("confirmed 1 < min_confirmed 2"));
+        assert!(md.contains("zfnd/zebra:6.0.0"));
+        assert!(md.contains("reused (reset epoch 3, chain height 42)"));
+        // sample_run() carries exactly one failed intent, classified
+        // InsufficientBalance.
+        assert!(md.contains("**1 terminal failure(s)** — 1 insufficient_balance"));
+    }
+
+    #[test]
+    fn rpc_matrix_and_retry_detail_and_setup_activity_appear_only_in_the_appendix() {
+        let md = render_report(&[sample_run()]);
+        let appendix_start = md.find("# Appendix").expect("expected an Appendix section");
+        let (before, after) = md.split_at(appendix_start);
+
+        for heading in [
+            "## Appendix A — RPC compatibility matrix",
+            "## Appendix B — Setup-phase RPC activity",
+            "## Appendix C — Severity tier definitions",
+        ] {
+            assert_eq!(
+                before.matches(heading).count(),
+                0,
+                "{heading:?} must not appear before the Appendix section"
+            );
+            assert_eq!(
+                after.matches(heading).count(),
+                1,
+                "{heading:?} must appear exactly once, inside the Appendix section"
+            );
+        }
+        // "Candidate findings" (the full list) must come before the appendix,
+        // not after — the executive summary's condensed High-severity list
+        // is a separate, earlier occurrence of similar wording, so anchor on
+        // the full section's own heading instead.
+        assert!(before.contains("## Candidate findings"));
+        assert!(!after.contains("## Candidate findings"));
+    }
+
+    #[test]
+    fn candidate_findings_disclaimer_text_is_unchanged() {
+        let md = render_report(&[sample_run()]);
+        assert!(md.contains(
+            "**These are flagged candidates, not finished findings.** Each is a mechanically \
+             detected statistical outlier or observed failure, stated with only what the data \
+             shows."
+        ));
     }
 }

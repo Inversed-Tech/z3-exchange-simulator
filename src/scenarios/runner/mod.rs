@@ -309,6 +309,7 @@ pub async fn run(scenario: ScenarioConfig, opts: RunOptions) -> Result<RunResult
         host_cpu_count: host_cpu_count(),
         host_memory_limit_bytes: host_memory_limit_bytes(),
         state: StateIdentifier::default(),
+        assertion: None,
     };
     write_manifest(&run_dir.manifest_path(), &manifest)
         .map_err(|e| RunnerError::Metrics(e.to_string()))?;
@@ -467,6 +468,7 @@ pub async fn run(scenario: ScenarioConfig, opts: RunOptions) -> Result<RunResult
     let load_succeeded = load_result.is_ok();
     manifest.phase_boundaries = phase_tracker.boundaries();
     manifest.load_and_drain_completed_at = Some(load_and_drain_completed_at);
+    manifest.assertion = stats_and_assertion.as_ref().map(|(_, a)| a.clone());
     let teardown_result = teardown(
         stack,
         &run_dir,

@@ -20,7 +20,14 @@ struct MetricAgg {
     confirmed_total: f64,
     failed_total: f64,
     saturation_events: u64,
-    proving_ms: Vec<u64>,
+    /// `shielded_proving_time_ms` samples only — ZK spend/output proof
+    /// generation. Kept separate from `wallet_operation_ms` so a purely
+    /// transparent run's wallet-operation latency is never rendered under
+    /// the "Shielded transaction proving times" heading.
+    shielded_proving_ms: Vec<u64>,
+    /// `wallet_operation_time_ms` samples — the same measured window for a
+    /// withdrawal with no shielded leg, where no ZK proof is generated.
+    wallet_operation_ms: Vec<u64>,
     scheduled_dispatch_rate: Option<f64>,
     confirmed_tx_throughput: Option<f64>,
 }
@@ -146,7 +153,8 @@ pub fn generate_summary(run_dir: &RunDir, manifest: &RunManifest) -> Result<Stri
         confirmed_total: 0.0,
         failed_total: 0.0,
         saturation_events: 0,
-        proving_ms: vec![],
+        shielded_proving_ms: vec![],
+        wallet_operation_ms: vec![],
         scheduled_dispatch_rate: None,
         confirmed_tx_throughput: None,
     };
@@ -173,8 +181,11 @@ pub fn generate_summary(run_dir: &RunDir, manifest: &RunManifest) -> Result<Stri
                             magg.saturation_events += 1;
                         }
                     }
-                    "withdrawal_proving_time_ms" => {
-                        magg.proving_ms.push(sample.value as u64);
+                    "shielded_proving_time_ms" => {
+                        magg.shielded_proving_ms.push(sample.value as u64);
+                    }
+                    "wallet_operation_time_ms" => {
+                        magg.wallet_operation_ms.push(sample.value as u64);
                     }
                     "scheduled_dispatch_rate" => magg.scheduled_dispatch_rate = Some(sample.value),
                     "confirmed_tx_throughput" => magg.confirmed_tx_throughput = Some(sample.value),
@@ -331,10 +342,24 @@ pub fn generate_summary(run_dir: &RunDir, manifest: &RunManifest) -> Result<Stri
     ));
 
     md.push_str("## Shielded transaction proving times\n");
-    if magg.proving_ms.is_empty() {
+    if magg.shielded_proving_ms.is_empty() {
         md.push_str("- P50: N/A ms, P95: N/A ms, P99: N/A ms\n\n");
     } else {
-        let mut sorted = magg.proving_ms.clone();
+        let mut sorted = magg.shielded_proving_ms.clone();
+        sorted.sort_unstable();
+        md.push_str(&format!(
+            "- P50: {:.0} ms, P95: {:.0} ms, P99: {:.0} ms\n\n",
+            percentile_value(&sorted, 0.50),
+            percentile_value(&sorted, 0.95),
+            percentile_value(&sorted, 0.99),
+        ));
+    }
+
+    md.push_str("## Wallet operation times (no shielded proof)\n");
+    if magg.wallet_operation_ms.is_empty() {
+        md.push_str("- P50: N/A ms, P95: N/A ms, P99: N/A ms\n\n");
+    } else {
+        let mut sorted = magg.wallet_operation_ms.clone();
         sorted.sort_unstable();
         md.push_str(&format!(
             "- P50: {:.0} ms, P95: {:.0} ms, P99: {:.0} ms\n\n",
@@ -449,6 +474,7 @@ mod tests {
             host_cpu_count: 0,
             host_memory_limit_bytes: None,
             state: StateIdentifier::default(),
+            assertion: None,
         };
 
         generate_summary(&rd, &manifest).unwrap();
@@ -528,6 +554,7 @@ mod tests {
             host_cpu_count: 0,
             host_memory_limit_bytes: None,
             state: StateIdentifier::default(),
+            assertion: None,
         };
         generate_summary(&rd, &manifest).unwrap();
         let md = std::fs::read_to_string(rd.summary_path()).unwrap();
@@ -571,6 +598,7 @@ mod tests {
             host_cpu_count: 0,
             host_memory_limit_bytes: None,
             state: StateIdentifier::default(),
+            assertion: None,
         };
         generate_summary(&rd, &manifest).unwrap();
         assert!(rd.summary_path().exists());
@@ -606,6 +634,7 @@ mod tests {
             host_cpu_count: 0,
             host_memory_limit_bytes: None,
             state: StateIdentifier::default(),
+            assertion: None,
         };
         generate_summary(&rd, &manifest).unwrap();
         assert!(rd.summary_path().exists());
@@ -637,6 +666,7 @@ mod tests {
             host_cpu_count: 0,
             host_memory_limit_bytes: None,
             state: StateIdentifier::default(),
+            assertion: None,
         };
         let md = generate_summary(&rd, &manifest).unwrap();
         assert!(
@@ -646,7 +676,7 @@ mod tests {
     }
 
     #[test]
-    fn generate_summary_proving_times_non_na_when_samples_present() {
+    fn generate_summary_shielded_proving_times_non_na_when_samples_present() {
         use chrono::Utc;
         let base = tempfile::tempdir().unwrap();
         let rd = RunDir::create(base.path(), "proving").unwrap();
@@ -657,7 +687,7 @@ mod tests {
             mwriter.write_record(&MetricSample {
                 run_id: rd.run_id.clone(),
                 timestamp: Utc::now(),
-                metric_name: "withdrawal_proving_time_ms".into(),
+                metric_name: "shielded_proving_time_ms".into(),
                 value: ms as f64,
                 labels: HashMap::new(),
             });
@@ -683,16 +713,29 @@ mod tests {
             host_cpu_count: 0,
             host_memory_limit_bytes: None,
             state: StateIdentifier::default(),
+            assertion: None,
         };
         let md = generate_summary(&rd, &manifest).unwrap();
+        let shielded_section = md
+            .split("## Shielded transaction proving times")
+            .nth(1)
+            .expect("shielded section must be present");
         assert!(
-            !md.contains("P50: N/A"),
-            "proving times must not be N/A when samples are present"
+            !shielded_section.starts_with("\n- P50: N/A"),
+            "shielded proving times must not be N/A when samples are present"
         );
         // sorted=[100,200,300,400,500] n=5; p50: idx floor(0.5*5)=2 → 300
         assert!(
-            md.contains("300"),
+            shielded_section.contains("300"),
             "p50 of [100..500] must be 300; summary:\n{md}"
+        );
+        let wallet_section = md
+            .split("## Wallet operation times (no shielded proof)")
+            .nth(1)
+            .expect("wallet operation section must be present");
+        assert!(
+            wallet_section.starts_with("\n- P50: N/A"),
+            "wallet operation times must be N/A when no such samples were recorded"
         );
     }
 
@@ -743,6 +786,7 @@ mod tests {
             host_cpu_count: 0,
             host_memory_limit_bytes: None,
             state: StateIdentifier::default(),
+            assertion: None,
         };
         let md = generate_summary(&rd, &manifest).unwrap();
         assert!(
@@ -801,6 +845,7 @@ mod tests {
             host_cpu_count: 0,
             host_memory_limit_bytes: None,
             state: StateIdentifier::default(),
+            assertion: None,
         };
         let md = generate_summary(&rd, &manifest).unwrap();
         assert!(
@@ -875,6 +920,7 @@ mod tests {
             host_cpu_count: 0,
             host_memory_limit_bytes: None,
             state: StateIdentifier::default(),
+            assertion: None,
         };
         let md = generate_summary(&rd, &manifest).unwrap();
 
@@ -958,6 +1004,7 @@ mod tests {
             host_cpu_count: 0,
             host_memory_limit_bytes: None,
             state: StateIdentifier::default(),
+            assertion: None,
         };
         let md = generate_summary(&rd, &manifest).unwrap();
         assert!(
@@ -1002,6 +1049,7 @@ mod tests {
             host_cpu_count: 0,
             host_memory_limit_bytes: None,
             state: StateIdentifier::default(),
+            assertion: None,
         };
         let returned = generate_summary(&rd, &manifest).unwrap();
         let on_disk = std::fs::read_to_string(rd.summary_path()).unwrap();
@@ -1037,6 +1085,7 @@ mod tests {
             host_cpu_count: 0,
             host_memory_limit_bytes: None,
             state: StateIdentifier::default(),
+            assertion: None,
         };
         let md = generate_summary(&rd, &manifest).unwrap();
         assert!(
@@ -1072,6 +1121,7 @@ mod tests {
             host_cpu_count: 0,
             host_memory_limit_bytes: None,
             state: StateIdentifier::default(),
+            assertion: None,
         };
         // Must not panic or return Err.
         let md = generate_summary(&rd, &manifest).unwrap();

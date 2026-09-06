@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 
 use chrono::Utc;
+use serde::{Deserialize, Serialize};
 
 use crate::data_model::{
     Deposit, ExpectationsConfig, FlowType, IntentFailureClass, IntentRecord, Withdrawal,
@@ -96,7 +97,12 @@ impl IntentRecord {
 
 /// The result of evaluating a run's `RunStats` against its scenario's
 /// `ExpectationsConfig`. Empty `violations` iff `passed`.
-#[derive(Debug, Clone)]
+///
+/// Serializable so it can be persisted on `RunManifest` (see
+/// `metrics::manifest::RunManifest::assertion`) and read back by the
+/// findings-report pipeline, which loads runs from disk rather than from the
+/// in-memory `RunResult` a single `z3sim run` invocation returns.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AssertionOutcome {
     pub passed: bool,
     /// One line per violated expectation, e.g. `"confirmed 56 < min_confirmed

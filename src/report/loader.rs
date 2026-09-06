@@ -134,6 +134,7 @@ mod tests {
             host_cpu_count: 0,
             host_memory_limit_bytes: None,
             state: StateIdentifier::default(),
+            assertion: None,
         };
         std::fs::write(
             dir.join("manifest.json"),

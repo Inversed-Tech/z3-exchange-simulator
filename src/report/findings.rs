@@ -23,6 +23,7 @@ pub enum FindingCategory {
     FlowTypeDisparity,
     LoadDegradation,
     DataCompleteness,
+    KnownLimitation,
 }
 
 impl std::fmt::Display for FindingCategory {
@@ -34,6 +35,7 @@ impl std::fmt::Display for FindingCategory {
             FindingCategory::FlowTypeDisparity => write!(f, "Flow-type disparity"),
             FindingCategory::LoadDegradation => write!(f, "Load degradation"),
             FindingCategory::DataCompleteness => write!(f, "Data completeness"),
+            FindingCategory::KnownLimitation => write!(f, "Known limitation"),
         }
     }
 }
@@ -86,6 +88,12 @@ pub struct Finding {
     pub severity: Severity,
     pub summary: String,
     pub evidence: Vec<String>,
+    /// A short label distinguishing this finding from what its category
+    /// would otherwise suggest — currently used only for a regtest
+    /// block-generation latency finding, so a reader cannot mistake it for a
+    /// production-relevant latency signal (see `uniformly_slow_candidates`).
+    /// `None` for every other finding.
+    pub context: Option<String>,
 }
 
 pub(crate) const TAIL_LATENCY_MULTIPLE: f64 = 5.0;
@@ -166,6 +174,7 @@ fn rpc_failure_candidates(runs: &[RunData]) -> Vec<Finding> {
                         "failed in {runs_with_failure}/{runs_with_call} run(s) that called this method"
                     ),
                 ],
+                context: None,
             }
         })
         .collect()
@@ -221,6 +230,7 @@ fn timeout_candidates(runs: &[RunData]) -> Vec<Finding> {
                     format!("flow_type={flow}, stage={stage}, count={count}, of_total={total}"),
                     format!("observed in {} run(s)", contributing_runs.len()),
                 ],
+                context: None,
             }
         })
         .collect();
@@ -268,6 +278,7 @@ fn latency_outlier_candidates(runs: &[RunData]) -> Vec<Finding> {
                         ),
                         format!("observed across {runs_with_call} run(s)"),
                     ],
+                    context: None,
                 })
             }
             _ => None,
@@ -311,6 +322,17 @@ fn uniformly_slow_candidates(runs: &[RunData]) -> Vec<Finding> {
                 }
             }
             let (runs_with_call, _) = run_occurrence(runs, row.method);
+            // Regtest-control methods (`generate` and friends) are the one
+            // place this function *includes* rather than excludes the
+            // category — a slow `generate` is a real operational signal
+            // (see docs/concurrent-generate-pileup.md), but it is not a
+            // production latency signal, and a reader must not mistake it
+            // for one.
+            let context = (row.category == Category::RegtestControl).then(|| {
+                "regtest block-generation latency (not a production latency signal — see \
+                 docs/concurrent-generate-pileup.md)"
+                    .to_string()
+            });
             Some(Finding {
                 category: FindingCategory::LatencyOutlier,
                 severity: Severity::High,
@@ -332,6 +354,7 @@ fn uniformly_slow_candidates(runs: &[RunData]) -> Vec<Finding> {
                     ),
                     format!("observed across {runs_with_call} run(s)"),
                 ],
+                context,
             })
         })
         .collect()
@@ -387,6 +410,7 @@ fn flow_type_disparity_candidates(runs: &[RunData]) -> Vec<Finding> {
                         "flow_type={flow} confirmed={confirmed} total={total} overall_rate={:.3}",
                         overall_rate
                     )],
+                    context: None,
                 })
             } else {
                 None
@@ -413,6 +437,87 @@ fn data_completeness_candidates(runs: &[RunData]) -> Vec<Finding> {
                 r.parse_warnings.len()
             ),
             evidence: r.parse_warnings.clone(),
+            context: None,
+        })
+        .collect()
+}
+
+/// One known, harness-tolerated defect that must never surface as a fresh
+/// `RpcFailure` finding. Matching on method name alone is deliberately not
+/// enough: `z_listunspent` is issued from two call sites with materially
+/// different risk profiles — the unfiltered call in `lifecycle::warmup`
+/// (the actual known defect below) and `z_list_unspent_for_addresses`'s
+/// filtered call in `run_sweep` (added specifically to *avoid* that
+/// defect), both recorded under the identical method string. A candidate
+/// call must match all three of `method`, `phase`, and `error_substring` to
+/// be excluded from ordinary scoring — a method-only or phase-only match
+/// still flows into `rpc_failure_candidates` unaffected, so a genuinely new
+/// failure sharing just the method or the phase is never masked.
+///
+/// Add to this list only when a defect is (a) already tolerated in runner
+/// code, (b) documented in `docs/`, and (c) precise enough that a call
+/// matching all three fields is unambiguously *this* known defect.
+struct KnownLimitation {
+    method: &'static str,
+    phase: Phase,
+    error_substring: &'static str,
+    explanation: &'static str,
+}
+
+const KNOWN_LIMITATIONS: &[KnownLimitation] = &[KnownLimitation {
+    method: "z_listunspent",
+    phase: Phase::Warmup,
+    error_substring: "get_memo",
+    explanation: "non-UTF8 shielded-coinbase memo bytes fail WalletDb::get_memo wallet-wide \
+                  during warmup — the account fan-out that follows still proves spendability; \
+                  see docs/regtest-funding-plan.md",
+}];
+
+/// Flags every `KNOWN_LIMITATIONS` entry actually observed in the provided
+/// runs as a `Low`-severity `KnownLimitation` finding, so the defect is
+/// surfaced explicitly rather than silently absent from the report — never
+/// as a fresh `High`-severity `RpcFailure` candidate. Operates directly on
+/// raw `RpcCall` rows (not `build_matrix`'s aggregates), since matching
+/// requires the per-call error message `MatrixRow` does not retain.
+fn known_limitation_findings(runs: &[RunData]) -> Vec<Finding> {
+    KNOWN_LIMITATIONS
+        .iter()
+        .filter_map(|limitation| {
+            let mut matching_calls = 0u64;
+            let mut matching_runs: HashSet<&str> = HashSet::new();
+            for run in runs {
+                for call in &run.rpc_calls {
+                    if call.method != limitation.method || call.phase != limitation.phase {
+                        continue;
+                    }
+                    let Some(msg) = &call.error_message else {
+                        continue;
+                    };
+                    if msg.contains(limitation.error_substring) {
+                        matching_calls += 1;
+                        matching_runs.insert(run.manifest.run_id.as_str());
+                    }
+                }
+            }
+            if matching_calls == 0 {
+                return None;
+            }
+            Some(Finding {
+                category: FindingCategory::KnownLimitation,
+                severity: Severity::Low,
+                summary: format!(
+                    "{}: {matching_calls} known, tolerated {:?}-phase failure(s) — {}",
+                    limitation.method, limitation.phase, limitation.explanation
+                ),
+                evidence: vec![format!(
+                    "observed in {} run(s), matched on method={}, phase={:?}, error substring=\"{}\"",
+                    matching_runs.len(),
+                    limitation.method,
+                    limitation.phase,
+                    limitation.error_substring
+                )],
+                context: None,
+            })
         })
         .collect()
 }
@@ -431,6 +536,7 @@ pub fn flag_candidates(runs: &[RunData]) -> Vec<Finding> {
     out.extend(flow_type_disparity_candidates(runs));
     out.extend(load_degradation_candidates(runs));
     out.extend(data_completeness_candidates(runs));
+    out.extend(known_limitation_findings(runs));
     out
 }
 
@@ -461,6 +567,7 @@ mod tests {
             host_cpu_count: 0,
             host_memory_limit_bytes: None,
             state: StateIdentifier::default(),
+            assertion: None,
         }
     }
 
@@ -494,6 +601,29 @@ mod tests {
             error_code,
             error_message: None,
             phase: crate::data_model::Phase::Load,
+            intent_id: None,
+            attempt_number: 1,
+        }
+    }
+
+    fn call_with_phase_and_error(
+        method: &str,
+        phase: crate::data_model::Phase,
+        error_message: &str,
+    ) -> RpcCall {
+        RpcCall {
+            call_id: "c".into(),
+            run_id: "r".into(),
+            method: method.to_string(),
+            backend: Backend::Zallet,
+            params_hash: None,
+            request_at: Utc::now(),
+            response_at: Some(Utc::now()),
+            latency_ms: None,
+            success: false,
+            error_code: Some(-20),
+            error_message: Some(error_message.to_string()),
+            phase,
             intent_id: None,
             attempt_number: 1,
         }
@@ -587,6 +717,81 @@ mod tests {
         assert!(!findings
             .iter()
             .any(|f| f.category == FindingCategory::RpcFailure));
+    }
+
+    #[test]
+    fn known_z_listunspent_warmup_error_produces_low_severity_known_limitation_not_high_rpc_failure(
+    ) {
+        let r = run(
+            "r1",
+            vec![call_with_phase_and_error(
+                "z_listunspent",
+                crate::data_model::Phase::Warmup,
+                "WalletDb::get_memo failed / Invalid UTF-8: invalid utf-8 sequence",
+            )],
+            vec![],
+        );
+        let findings = flag_candidates(&[r]);
+        let known = findings
+            .iter()
+            .find(|f| f.category == FindingCategory::KnownLimitation)
+            .expect("expected a KnownLimitation finding");
+        assert_eq!(known.severity, Severity::Low);
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.category == FindingCategory::RpcFailure
+                    && f.summary.contains("z_listunspent")),
+            "the known warmup defect must not also surface as an RpcFailure finding"
+        );
+    }
+
+    #[test]
+    fn load_phase_z_listunspent_failure_is_not_masked_as_known_limitation() {
+        // Same method, but Phase::Load (as run_sweep's filtered call would
+        // be) with an unrelated error — must flow into ordinary RpcFailure
+        // scoring, not be silently downgraded to a known limitation.
+        let r = run(
+            "r1",
+            vec![call_with_phase_and_error(
+                "z_listunspent",
+                crate::data_model::Phase::Load,
+                "connection refused",
+            )],
+            vec![],
+        );
+        let findings = flag_candidates(&[r]);
+        assert!(!findings
+            .iter()
+            .any(|f| f.category == FindingCategory::KnownLimitation));
+        assert!(findings
+            .iter()
+            .any(|f| f.category == FindingCategory::RpcFailure
+                && f.summary.contains("z_listunspent")));
+    }
+
+    #[test]
+    fn load_phase_z_listunspent_failure_with_the_known_error_substring_is_still_not_masked() {
+        // Phase alone must disqualify a match even when the error substring
+        // happens to coincide — all three of method, phase, and error
+        // substring are required together.
+        let r = run(
+            "r1",
+            vec![call_with_phase_and_error(
+                "z_listunspent",
+                crate::data_model::Phase::Load,
+                "WalletDb::get_memo failed / Invalid UTF-8: invalid utf-8 sequence",
+            )],
+            vec![],
+        );
+        let findings = flag_candidates(&[r]);
+        assert!(!findings
+            .iter()
+            .any(|f| f.category == FindingCategory::KnownLimitation));
+        assert!(findings
+            .iter()
+            .any(|f| f.category == FindingCategory::RpcFailure
+                && f.summary.contains("z_listunspent")));
     }
 
     #[test]
@@ -712,6 +917,42 @@ mod tests {
         assert!(findings.iter().any(|f| {
             f.category == FindingCategory::LatencyOutlier && f.summary.contains("generate")
         }));
+    }
+
+    #[test]
+    fn generate_latency_finding_carries_regtest_context_label() {
+        let calls = vec![call("generate", true, Some(15000), None); 6];
+        let r = run("r1", calls, vec![]);
+        let findings = flag_candidates(&[r]);
+        let f = findings
+            .iter()
+            .find(|f| {
+                f.category == FindingCategory::LatencyOutlier && f.summary.contains("generate")
+            })
+            .expect("expected a latency outlier finding for generate");
+        let ctx = f
+            .context
+            .as_deref()
+            .expect("a regtest-control latency finding must carry a context label");
+        assert!(
+            ctx.contains("not a production latency signal"),
+            "context: {ctx}"
+        );
+    }
+
+    #[test]
+    fn non_regtest_control_latency_findings_carry_no_context() {
+        let mut calls = vec![call("z_sendmany", true, Some(1200), None); 5];
+        calls.push(call("z_sendmany", true, Some(15000), None));
+        let r = run("r1", calls, vec![]);
+        let findings = flag_candidates(&[r]);
+        let f = findings
+            .iter()
+            .find(|f| {
+                f.category == FindingCategory::LatencyOutlier && f.summary.contains("z_sendmany")
+            })
+            .expect("expected a latency outlier finding for z_sendmany");
+        assert!(f.context.is_none());
     }
 
     #[test]

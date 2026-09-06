@@ -51,6 +51,17 @@ impl FlowType {
     pub fn is_shielded(&self) -> bool {
         matches!(self, FlowType::TToZ | FlowType::ZToT | FlowType::ZToZ)
     }
+
+    /// The snake_case name used both as this enum's serde representation and
+    /// as a metric label value — the single source of truth for that name.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            FlowType::TToT => "t_to_t",
+            FlowType::TToZ => "t_to_z",
+            FlowType::ZToT => "z_to_t",
+            FlowType::ZToZ => "z_to_z",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

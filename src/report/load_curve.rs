@@ -266,6 +266,7 @@ pub fn load_degradation_candidates(runs: &[RunData]) -> Vec<Finding> {
                 fmt_ms(d.p99_ms),
                 fmt_ms(d.baseline_p99_ms),
             )],
+            context: None,
         });
     }
     out
@@ -357,6 +358,7 @@ mod tests {
                 host_cpu_count: 0,
                 host_memory_limit_bytes: None,
                 state: StateIdentifier::default(),
+                assertion: None,
             },
             rpc_calls: calls,
             intents: Vec::new(),

@@ -79,6 +79,14 @@ pub struct RunManifest {
     /// existed.
     #[serde(default)]
     pub state: StateIdentifier,
+    /// The scenario's pass/fail evaluation (see
+    /// `scenarios::runner::result::AssertionOutcome`), persisted so the
+    /// findings-report pipeline — which loads runs from disk, not from the
+    /// in-memory `RunResult` a single invocation returns — can render it.
+    /// `None` when the run never reached assertion evaluation (setup
+    /// failed) or predates this field.
+    #[serde(default)]
+    pub assertion: Option<crate::scenarios::runner::result::AssertionOutcome>,
 }
 
 /// One lifecycle phase's start time, as recorded by
@@ -273,6 +281,7 @@ mod tests {
             host_cpu_count: 0,
             host_memory_limit_bytes: None,
             state: StateIdentifier::default(),
+            assertion: None,
         };
         write_manifest(&path, &m).unwrap();
         let back = read_manifest(&path).unwrap();
@@ -389,6 +398,7 @@ overrides:
                 host_cpu_count: 0,
                 host_memory_limit_bytes: None,
                 state: StateIdentifier::default(),
+                assertion: None,
             },
         )
         .unwrap();
@@ -456,6 +466,7 @@ overrides:
             host_cpu_count: 0,
             host_memory_limit_bytes: None,
             state: StateIdentifier::default(),
+            assertion: None,
         };
         write_manifest(&path, &m).unwrap();
         let partial = read_manifest(&path).unwrap();
@@ -496,6 +507,7 @@ overrides:
             host_cpu_count: 0,
             host_memory_limit_bytes: None,
             state: StateIdentifier::default(),
+            assertion: None,
         };
         write_manifest(&path, &m).unwrap();
         let back = read_manifest(&path).unwrap();
