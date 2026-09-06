@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::task::JoinHandle;
@@ -514,6 +515,40 @@ impl Z3Stack {
         )
     }
 
+    /// SHA-256 hex digest of this run's effective, merged `docker compose
+    /// config` — images, env vars, ports, network layout, container-side
+    /// paths — with checkout-location-dependent bind-mount source paths
+    /// stripped first (see [`strip_bind_mount_sources`]). Two checkouts of
+    /// identical logical configuration cloned to different filesystem paths
+    /// produce the same hash; a real configuration change (a different
+    /// image tag, a different port) changes it.
+    ///
+    /// Unlike [`Z3Stack::image_digests`], this does not require the project
+    /// to already have running containers — `docker compose config` reads
+    /// the compose files and env file directly.
+    pub async fn compose_config_hash(&self) -> Result<String, Z3Error> {
+        let args = ["config", "--format", "json"];
+        let full_args = compose_base_args(&self.config.compose_project, &args);
+        let output = Command::new("docker")
+            .args(&full_args)
+            .envs(self.config.compose_env_overrides.iter().cloned())
+            .current_dir(&self.config.compose_dir)
+            .output()
+            .await
+            .map_err(|e| Z3Error::ComposeCommand {
+                args: args.join(" "),
+                stderr: e.to_string(),
+            })?;
+
+        if !output.status.success() {
+            return Err(Z3Error::ComposeCommand {
+                args: args.join(" "),
+                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            });
+        }
+        compute_compose_config_hash(&String::from_utf8_lossy(&output.stdout))
+    }
+
     /// Abort background tasks and bring the Docker Compose stack down.
     ///
     /// Must be called explicitly before dropping — `Drop` aborts background
@@ -791,6 +826,65 @@ fn parse_compose_images(json: &str, project: &str) -> Result<Vec<ImageInfo>, Z3E
             .unwrap_or(usize::MAX)
     });
     Ok(out)
+}
+
+/// Strips each service's bind-mount `source` path (an absolute, checkout-
+/// specific path, e.g. `${Z3_CONFIG_DIR}`-rooted config file mounts) from a
+/// parsed `docker compose config --format json` value, leaving named-volume
+/// sources (`chain`, `zallet-data`, ...) untouched — those are just a
+/// volume name, not a filesystem path, and are exactly what
+/// [`compute_compose_config_hash`] wants to keep: they identify runtime
+/// configuration, not where on disk this checkout happens to live. A
+/// volume entry is a bind mount when its own `type` field says so, or —
+/// belt and suspenders, in case a future Compose version omits `type` for
+/// the default case — when its `source` value looks like an absolute path.
+fn strip_bind_mount_sources(config: &mut serde_json::Value) {
+    let Some(services) = config.get_mut("services").and_then(|s| s.as_object_mut()) else {
+        return;
+    };
+    for service in services.values_mut() {
+        let Some(volumes) = service.get_mut("volumes").and_then(|v| v.as_array_mut()) else {
+            continue;
+        };
+        for volume in volumes.iter_mut() {
+            let is_bind = volume.get("type").and_then(|t| t.as_str()) == Some("bind")
+                || volume
+                    .get("source")
+                    .and_then(|s| s.as_str())
+                    .is_some_and(|s| s.starts_with('/'));
+            if is_bind {
+                if let Some(obj) = volume.as_object_mut() {
+                    obj.remove("source");
+                }
+            }
+        }
+    }
+}
+
+/// Computes [`Z3Stack::compose_config_hash`] from `docker compose config
+/// --format json`'s raw output: parse, strip bind-mount source paths (see
+/// [`strip_bind_mount_sources`]), re-serialize, then SHA-256 the result.
+///
+/// Re-serializing is what makes the hash stable regardless of key order in
+/// the source JSON: `serde_json::Map` is a `BTreeMap` by default (this
+/// crate does not enable the `preserve_order` feature), so
+/// `serde_json::to_string` on a parsed `Value` always emits object keys in
+/// the same sorted order — no separate normalization pass is needed beyond
+/// the bind-mount stripping above.
+fn compute_compose_config_hash(json: &str) -> Result<String, Z3Error> {
+    let mut value: serde_json::Value =
+        serde_json::from_str(json).map_err(|e| Z3Error::ComposeCommand {
+            args: "config --format json".to_string(),
+            stderr: format!("could not parse `docker compose config` output: {e}"),
+        })?;
+    strip_bind_mount_sources(&mut value);
+    let normalized = serde_json::to_string(&value).map_err(|e| Z3Error::ComposeCommand {
+        args: "config --format json".to_string(),
+        stderr: format!("could not re-serialize normalized compose config: {e}"),
+    })?;
+    let mut hasher = Sha256::new();
+    hasher.update(normalized.as_bytes());
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 /// Whether a `docker stats` container name belongs to the given Compose project.
@@ -1571,6 +1665,83 @@ networks:
     #[test]
     fn parse_compose_images_rejects_malformed_json() {
         let err = parse_compose_images("not json", "z3-sim-9387ad5f").unwrap_err();
+        assert!(matches!(err, Z3Error::ComposeCommand { .. }));
+    }
+
+    // ── compose_config_hash ──────────────────────────────────────────────────
+
+    fn sample_compose_config(config_dir: &str) -> String {
+        format!(
+            r#"{{
+                "name": "z3-sim-9387ad5f",
+                "services": {{
+                    "zallet": {{
+                        "image": "z3sim/zallet:beta.2-local",
+                        "volumes": [
+                            {{"type": "bind", "source": "{config_dir}/zallet.toml", "target": "/etc/zallet/zallet.toml"}},
+                            {{"type": "volume", "source": "zallet-data", "target": "/var/lib/zallet"}}
+                        ]
+                    }}
+                }}
+            }}"#
+        )
+    }
+
+    #[test]
+    fn compose_config_hash_is_stable_for_identical_config() {
+        let json = sample_compose_config("/home/dev/checkout-a/external/z3");
+        let a = compute_compose_config_hash(&json).unwrap();
+        let b = compute_compose_config_hash(&json).unwrap();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn compose_config_hash_changes_when_config_changes() {
+        let a =
+            compute_compose_config_hash(&sample_compose_config("/home/dev/checkout-a/z3")).unwrap();
+        let mut changed: serde_json::Value =
+            serde_json::from_str(&sample_compose_config("/home/dev/checkout-a/z3")).unwrap();
+        changed["services"]["zallet"]["image"] = serde_json::json!("z3sim/zallet:beta.3-local");
+        let b = compute_compose_config_hash(&changed.to_string()).unwrap();
+        assert_ne!(a, b, "a different image tag must change the hash");
+    }
+
+    #[test]
+    fn compose_config_hash_is_stable_across_different_checkout_paths() {
+        // The regression guard proving strip_bind_mount_sources actually
+        // decouples the hash from checkout location: two logically
+        // identical configs whose only difference is the bind-mount's
+        // absolute source path must hash identically.
+        let a =
+            compute_compose_config_hash(&sample_compose_config("/home/dev/checkout-a/external/z3"))
+                .unwrap();
+        let b = compute_compose_config_hash(&sample_compose_config(
+            "/var/ci/runner-7/work/z3-exchange-simulator/external/z3",
+        ))
+        .unwrap();
+        assert_eq!(
+            a, b,
+            "identical logical config at different filesystem paths must hash identically"
+        );
+    }
+
+    #[test]
+    fn compose_config_hash_leaves_named_volume_sources_intact() {
+        let mut value: serde_json::Value =
+            serde_json::from_str(&sample_compose_config("/home/dev/z3")).unwrap();
+        strip_bind_mount_sources(&mut value);
+        assert_eq!(
+            value["services"]["zallet"]["volumes"][1]["source"],
+            "zallet-data"
+        );
+        assert!(value["services"]["zallet"]["volumes"][0]
+            .get("source")
+            .is_none());
+    }
+
+    #[test]
+    fn compose_config_hash_rejects_malformed_json() {
+        let err = compute_compose_config_hash("not json").unwrap_err();
         assert!(matches!(err, Z3Error::ComposeCommand { .. }));
     }
 }

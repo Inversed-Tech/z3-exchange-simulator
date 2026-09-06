@@ -734,7 +734,7 @@ pub fn build_retry_detail(
 mod tests {
     use super::*;
     use crate::data_model::{Backend, IntentRecord, RpcCall};
-    use crate::metrics::{RunManifest, RunTimeouts};
+    use crate::metrics::{RunManifest, RunTimeouts, StateIdentifier};
     use chrono::Utc;
 
     fn run_with_calls(calls: Vec<RpcCall>) -> RunData {
@@ -754,6 +754,11 @@ mod tests {
                 timeouts: RunTimeouts::default(),
                 phase_boundaries: Vec::new(),
                 load_and_drain_completed_at: None,
+                compose_config_hash: String::new(),
+                image_digests: Vec::new(),
+                host_cpu_count: 0,
+                host_memory_limit_bytes: None,
+                state: StateIdentifier::default(),
             },
             rpc_calls: calls,
             intents: Vec::<IntentRecord>::new(),

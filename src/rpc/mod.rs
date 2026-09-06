@@ -969,6 +969,21 @@ impl RpcClient {
         total_blocks: u64,
         chunk_size: u32,
     ) -> Result<(), RpcError> {
+        self.generate_in_chunks_with_progress(total_blocks, chunk_size, |_mined, _total| {})
+            .await
+    }
+
+    /// [`Self::generate_in_chunks`], additionally invoking `on_chunk(mined,
+    /// total_blocks)` after each chunk completes — the seam
+    /// `scenarios::runner::lifecycle::mine_blocks` uses to report warmup
+    /// mining progress without duplicating this function's chunking/retry
+    /// logic.
+    pub async fn generate_in_chunks_with_progress(
+        &self,
+        total_blocks: u64,
+        chunk_size: u32,
+        on_chunk: impl FnMut(u64, u64),
+    ) -> Result<(), RpcError> {
         const MAX_ATTEMPTS_PER_CHUNK: u32 = 12;
         const RETRY_INTERVAL: Duration = Duration::from_secs(5);
         self.generate_in_chunks_with_retry_policy(
@@ -976,6 +991,7 @@ impl RpcClient {
             chunk_size,
             MAX_ATTEMPTS_PER_CHUNK,
             RETRY_INTERVAL,
+            on_chunk,
         )
         .await
     }
@@ -989,8 +1005,10 @@ impl RpcClient {
         chunk_size: u32,
         max_attempts_per_chunk: u32,
         retry_interval: Duration,
+        mut on_chunk: impl FnMut(u64, u64),
     ) -> Result<(), RpcError> {
         let mut remaining = total_blocks;
+        let mut mined = 0u64;
         while remaining > 0 {
             let chunk = remaining.min(chunk_size as u64) as u32;
             let mut attempts = 0u32;
@@ -1005,6 +1023,8 @@ impl RpcClient {
                 }
             }
             remaining -= chunk as u64;
+            mined += chunk as u64;
+            on_chunk(mined, total_blocks);
         }
         Ok(())
     }
@@ -2434,6 +2454,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn generate_in_chunks_with_progress_reports_cumulative_mined_per_chunk() {
+        use wiremock::{matchers, Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(matchers::method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [], "error": null, "id": 1
+            })))
+            .mount(&server)
+            .await;
+
+        let progress = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(u64, u64)>::new()));
+        let progress_clone = progress.clone();
+        client(&server.uri())
+            .generate_in_chunks_with_progress(12, 5, move |mined, total| {
+                progress_clone.lock().unwrap().push((mined, total));
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(*progress.lock().unwrap(), vec![(5, 12), (10, 12), (12, 12)]);
+    }
+
+    #[tokio::test]
     async fn generate_in_chunks_propagates_non_transport_error_immediately() {
         use wiremock::{matchers, Mock, MockServer, ResponseTemplate};
         let server = MockServer::start().await;
@@ -2488,7 +2531,7 @@ mod tests {
         );
 
         short_timeout_client
-            .generate_in_chunks_with_retry_policy(5, 5, 3, Duration::from_millis(1))
+            .generate_in_chunks_with_retry_policy(5, 5, 3, Duration::from_millis(1), |_, _| {})
             .await
             .unwrap();
 
@@ -2507,7 +2550,7 @@ mod tests {
         drop(listener);
 
         let err = client(&format!("http://{addr}"))
-            .generate_in_chunks_with_retry_policy(5, 5, 1, Duration::from_millis(1))
+            .generate_in_chunks_with_retry_policy(5, 5, 1, Duration::from_millis(1), |_, _| {})
             .await
             .unwrap_err();
         assert!(matches!(err, RpcError::Transport(_)));

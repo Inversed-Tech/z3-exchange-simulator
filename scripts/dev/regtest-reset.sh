@@ -46,6 +46,15 @@
 # scenario attempts against the same environment (the accumulation is
 # monotonic — it never resolves itself by running more scenarios).
 #
+# It also records this reset generation at
+# configs/local/reset-epoch-<env_id> (an incrementing epoch counter plus the
+# chain height observed right after this reset), gitignored alongside
+# env-id and scoped per env_id the same way run-<env_id>.lock is — so a
+# --fresh-env environment and the stable one never share reset provenance —
+# read by the simulator into a run's manifest (StateIdentifier, Track 6) so
+# a run can be told "freshly reset" apart from "reused since the last
+# reset."
+#
 # Environment:
 #   Z3_RPC_HOST            Forwarded to regtest-miner-setup.sh (see that script).
 #   COMPOSE_PROJECT_NAME   Compose project to reset. Defaults to this
@@ -71,22 +80,36 @@ die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 [ -d "$Z3_DIR" ] || die "Z3 stack not found at $Z3_DIR — run scripts/dev/clone-z3.sh first."
 [ -f "$ENV_FILE" ] || die "Missing $ENV_FILE — run external/z3/scripts/regtest-init.sh first."
 
-# Mirrors env_id::compose_project_for_env's "z3-sim-<env_id>" naming exactly
-# (src/z3/env_id.rs) — the only part of that module duplicated here, since a
-# single format string is a trivial, low-drift-risk duplication compared to
-# re-deriving the full port/subnet formulas in shell.
-default_project_name() {
+# This checkout's cached environment id (src/z3/env_id.rs's resolve_env_id
+# cache), or empty if none has been cached yet (no z3sim run has happened
+# here). Shared by default_project_name() below and by the reset-epoch
+# filename further down, so both name the SAME environment consistently.
+resolved_env_id() {
     local env_id_file="${REPO_ROOT}/configs/local/env-id" id
     if [ -f "$env_id_file" ]; then
         id="$(tr -d '[:space:]' < "$env_id_file")"
         case "$id" in
             [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f])
-                printf 'z3-sim-%s' "$id"
+                printf '%s' "$id"
                 return 0
                 ;;
         esac
     fi
-    printf 'z3-regtest'
+    printf ''
+}
+
+# Mirrors env_id::compose_project_for_env's "z3-sim-<env_id>" naming exactly
+# (src/z3/env_id.rs) — the only part of that module duplicated here, since a
+# single format string is a trivial, low-drift-risk duplication compared to
+# re-deriving the full port/subnet formulas in shell.
+default_project_name() {
+    local id
+    id="$(resolved_env_id)"
+    if [ -n "$id" ]; then
+        printf 'z3-sim-%s' "$id"
+    else
+        printf 'z3-regtest'
+    fi
 }
 
 COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-$(default_project_name)}"
@@ -144,7 +167,16 @@ log "==> Wiping the regtest stack (containers and volumes)..."
 # side — otherwise regtest-init.sh always (re-)initializes z3-regtest
 # regardless of which project this script just wiped.
 if grep -q '^COMPOSE_PROJECT_NAME=' "$ENV_FILE"; then
-    sed -i "s|^COMPOSE_PROJECT_NAME=.*|COMPOSE_PROJECT_NAME=${COMPOSE_PROJECT_NAME}|" "$ENV_FILE"
+    # `-i.bak` (extension attached directly to `-i`, no space) is the one
+    # `sed -i` spelling both BSD sed (macOS's default /usr/bin/sed — which
+    # otherwise requires an extension argument and, without one, parses the
+    # very next word as a file path instead of an extension, crashing with
+    # "invalid command code") and GNU sed accept identically. Portable, so
+    # this needs no GNU-sed dependency check the way
+    # scripts/dev/regtest-overrides/apply.sh's own (genuinely GNU-only)
+    # `sed -i` calls do (see scripts/dev/bootstrap.sh's dependency check).
+    sed -i.bak "s|^COMPOSE_PROJECT_NAME=.*|COMPOSE_PROJECT_NAME=${COMPOSE_PROJECT_NAME}|" "$ENV_FILE"
+    rm -f "${ENV_FILE}.bak"
 else
     printf 'COMPOSE_PROJECT_NAME=%s\n' "$COMPOSE_PROJECT_NAME" >> "$ENV_FILE"
 fi
@@ -157,6 +189,100 @@ bash "${REPO_ROOT}/scripts/dev/regtest-miner-setup.sh"
 
 log "==> Bringing the stack back up..."
 (cd "$Z3_DIR" && $COMPOSE up -d)
+
+# Record this reset generation for the manifest's state/snapshot provenance
+# (StateIdentifier, Track 6): reset-epoch holds two whitespace-separated
+# fields, "{epoch} {height_at_reset}" — incremented and re-queried on every
+# reset so a run's manifest can tell "freshly reset" apart from "reused since
+# the last reset" (see metrics::manifest::read_reset_state /
+# StateFreshness::classify). Best-effort: a failure here does not fail the
+# reset itself, since the chain/wallet are already usable at this point —
+# it only means the next run's manifest falls back to reset_epoch 0.
+#
+# Scoped by env_id (reset-epoch-<env_id>, mirroring src/z3/env_id.rs's
+# reset_epoch_path — the shell-side duplicate of that exact filename format,
+# same low-drift-risk tradeoff as default_project_name() above), NOT a
+# single checkout-wide file: two environments on this checkout (the stable
+# one and a --fresh-env one) must never read or write each other's reset
+# provenance.
+#
+# Derived from the AUTHORITATIVE ${COMPOSE_PROJECT_NAME} actually used above
+# — NOT by re-reading resolved_env_id()/the env-id cache file a second time
+# — so this stays correct even when a caller overrode COMPOSE_PROJECT_NAME
+# directly rather than letting default_project_name() derive it from the
+# cache: the reset-epoch file must always match whatever project this
+# invocation actually reset, not whatever env_id happens to be cached right
+# now. A project name that isn't the z3-sim-<env_id> shape (the pre-Track-2
+# z3-regtest literal, or some other manual override) has no env_id-scoped
+# identity to key this off, so it falls back to the shared legacy filename.
+case "$COMPOSE_PROJECT_NAME" in
+    z3-sim-????????)
+        ENV_ID="${COMPOSE_PROJECT_NAME#z3-sim-}"
+        ;;
+    *)
+        ENV_ID=""
+        ;;
+esac
+if [ -n "$ENV_ID" ]; then
+    RESET_EPOCH_FILE="${REPO_ROOT}/configs/local/reset-epoch-${ENV_ID}"
+else
+    RESET_EPOCH_FILE="${REPO_ROOT}/configs/local/reset-epoch"
+fi
+PREV_EPOCH="0"
+if [ -f "$RESET_EPOCH_FILE" ]; then
+    PREV_EPOCH="$(awk '{print $1}' "$RESET_EPOCH_FILE" 2>/dev/null || true)"
+    case "$PREV_EPOCH" in
+        ''|*[!0-9]*) PREV_EPOCH="0" ;;
+    esac
+fi
+NEXT_EPOCH=$((PREV_EPOCH + 1))
+
+ROUTER_PORT="$(grep -E '^Z3_REGTEST_RPC_ROUTER_HOST_PORT=' "$ENV_FILE" | cut -d= -f2)"
+ROUTER_PORT="${ROUTER_PORT:-8181}"
+ROUTER_URL="http://${Z3_RPC_HOST:-127.0.0.1}:${ROUTER_PORT}"
+
+# `docker compose up -d` above returns once containers report "started," not
+# once a freshly-(re)started container's own process is actually accepting
+# connections — the same race regtest-miner-setup.sh already retries around
+# after its own `up -d` (see that script's "Waiting for the RPC router..."
+# loop, which this mirrors). Bounded here, unlike that script's unbounded
+# wait, because this step is best-effort evidence, not a prerequisite the
+# rest of the reset depends on — a router that never comes up within the
+# budget below falls through to "leaving reset-epoch unwritten," not a
+# script failure. Every step is explicitly `|| true`-guarded (or run outside
+# a pipeline) so a connection-refused/non-2xx/malformed response degrades to
+# an empty result under `set -e`/`pipefail` instead of aborting this
+# already-successful reset outright.
+HEIGHT_AT_RESET=""
+ROUTER_WAIT_ATTEMPTS=20
+attempt=0
+while [ "$attempt" -lt "$ROUTER_WAIT_ATTEMPTS" ]; do
+    attempt=$((attempt + 1))
+    RESPONSE="$(curl -sf -u zebra:zebra -X POST -H "Content-Type: application/json" \
+        -d '{"jsonrpc":"2.0","method":"getblockcount","params":[],"id":1}' \
+        "$ROUTER_URL" 2>/dev/null || true)"
+    HEIGHT_AT_RESET="$(printf '%s' "$RESPONSE" | jq -r '.result // empty' 2>/dev/null || true)"
+    case "$HEIGHT_AT_RESET" in
+        ''|*[!0-9]*)
+            HEIGHT_AT_RESET=""
+            [ "$attempt" -lt "$ROUTER_WAIT_ATTEMPTS" ] && sleep 3
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
+
+case "$HEIGHT_AT_RESET" in
+    ''|*[!0-9]*)
+        log "==> Router did not report a chain height after ${ROUTER_WAIT_ATTEMPTS} attempts — leaving reset-epoch unwritten."
+        ;;
+    *)
+        mkdir -p "$(dirname "$RESET_EPOCH_FILE")"
+        printf '%s %s\n' "$NEXT_EPOCH" "$HEIGHT_AT_RESET" > "$RESET_EPOCH_FILE"
+        log "==> Recorded reset epoch ${NEXT_EPOCH} at chain height ${HEIGHT_AT_RESET} (${RESET_EPOCH_FILE##*/})."
+        ;;
+esac
 
 log ""
 log "Done. The regtest environment is now a fresh chain with a funded"

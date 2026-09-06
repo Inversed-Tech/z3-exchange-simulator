@@ -399,7 +399,7 @@ pub fn generate_summary(run_dir: &RunDir, manifest: &RunManifest) -> Result<Stri
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::metrics::manifest::{RunManifest, RunTimeouts};
+    use crate::metrics::manifest::{RunManifest, RunTimeouts, StateIdentifier};
     use crate::metrics::run_dir::RunDir;
     use crate::metrics::writers::JsonlWriter;
 
@@ -444,6 +444,11 @@ mod tests {
             timeouts: RunTimeouts::default(),
             phase_boundaries: Vec::new(),
             load_and_drain_completed_at: None,
+            compose_config_hash: String::new(),
+            image_digests: Vec::new(),
+            host_cpu_count: 0,
+            host_memory_limit_bytes: None,
+            state: StateIdentifier::default(),
         };
 
         generate_summary(&rd, &manifest).unwrap();
@@ -518,6 +523,11 @@ mod tests {
             timeouts: RunTimeouts::default(),
             phase_boundaries: Vec::new(),
             load_and_drain_completed_at: None,
+            compose_config_hash: String::new(),
+            image_digests: Vec::new(),
+            host_cpu_count: 0,
+            host_memory_limit_bytes: None,
+            state: StateIdentifier::default(),
         };
         generate_summary(&rd, &manifest).unwrap();
         let md = std::fs::read_to_string(rd.summary_path()).unwrap();
@@ -556,6 +566,11 @@ mod tests {
             timeouts: RunTimeouts::default(),
             phase_boundaries: Vec::new(),
             load_and_drain_completed_at: None,
+            compose_config_hash: String::new(),
+            image_digests: Vec::new(),
+            host_cpu_count: 0,
+            host_memory_limit_bytes: None,
+            state: StateIdentifier::default(),
         };
         generate_summary(&rd, &manifest).unwrap();
         assert!(rd.summary_path().exists());
@@ -586,6 +601,11 @@ mod tests {
             timeouts: RunTimeouts::default(),
             phase_boundaries: Vec::new(),
             load_and_drain_completed_at: None,
+            compose_config_hash: String::new(),
+            image_digests: Vec::new(),
+            host_cpu_count: 0,
+            host_memory_limit_bytes: None,
+            state: StateIdentifier::default(),
         };
         generate_summary(&rd, &manifest).unwrap();
         assert!(rd.summary_path().exists());
@@ -612,6 +632,11 @@ mod tests {
             timeouts: RunTimeouts::default(),
             phase_boundaries: Vec::new(),
             load_and_drain_completed_at: None,
+            compose_config_hash: String::new(),
+            image_digests: Vec::new(),
+            host_cpu_count: 0,
+            host_memory_limit_bytes: None,
+            state: StateIdentifier::default(),
         };
         let md = generate_summary(&rd, &manifest).unwrap();
         assert!(
@@ -653,6 +678,11 @@ mod tests {
             timeouts: RunTimeouts::default(),
             phase_boundaries: Vec::new(),
             load_and_drain_completed_at: None,
+            compose_config_hash: String::new(),
+            image_digests: Vec::new(),
+            host_cpu_count: 0,
+            host_memory_limit_bytes: None,
+            state: StateIdentifier::default(),
         };
         let md = generate_summary(&rd, &manifest).unwrap();
         assert!(
@@ -708,6 +738,11 @@ mod tests {
             timeouts: RunTimeouts::default(),
             phase_boundaries: Vec::new(),
             load_and_drain_completed_at: None,
+            compose_config_hash: String::new(),
+            image_digests: Vec::new(),
+            host_cpu_count: 0,
+            host_memory_limit_bytes: None,
+            state: StateIdentifier::default(),
         };
         let md = generate_summary(&rd, &manifest).unwrap();
         assert!(
@@ -761,6 +796,11 @@ mod tests {
             timeouts: RunTimeouts::default(),
             phase_boundaries: Vec::new(),
             load_and_drain_completed_at: None,
+            compose_config_hash: String::new(),
+            image_digests: Vec::new(),
+            host_cpu_count: 0,
+            host_memory_limit_bytes: None,
+            state: StateIdentifier::default(),
         };
         let md = generate_summary(&rd, &manifest).unwrap();
         assert!(
@@ -830,6 +870,11 @@ mod tests {
             timeouts: RunTimeouts::default(),
             phase_boundaries: Vec::new(),
             load_and_drain_completed_at: None,
+            compose_config_hash: String::new(),
+            image_digests: Vec::new(),
+            host_cpu_count: 0,
+            host_memory_limit_bytes: None,
+            state: StateIdentifier::default(),
         };
         let md = generate_summary(&rd, &manifest).unwrap();
 
@@ -908,6 +953,11 @@ mod tests {
             timeouts: RunTimeouts::default(),
             phase_boundaries: Vec::new(),
             load_and_drain_completed_at: None,
+            compose_config_hash: String::new(),
+            image_digests: Vec::new(),
+            host_cpu_count: 0,
+            host_memory_limit_bytes: None,
+            state: StateIdentifier::default(),
         };
         let md = generate_summary(&rd, &manifest).unwrap();
         assert!(
@@ -947,6 +997,11 @@ mod tests {
             timeouts: RunTimeouts::default(),
             phase_boundaries: Vec::new(),
             load_and_drain_completed_at: None,
+            compose_config_hash: String::new(),
+            image_digests: Vec::new(),
+            host_cpu_count: 0,
+            host_memory_limit_bytes: None,
+            state: StateIdentifier::default(),
         };
         let returned = generate_summary(&rd, &manifest).unwrap();
         let on_disk = std::fs::read_to_string(rd.summary_path()).unwrap();
@@ -977,6 +1032,11 @@ mod tests {
             timeouts: RunTimeouts::default(),
             phase_boundaries: Vec::new(),
             load_and_drain_completed_at: None,
+            compose_config_hash: String::new(),
+            image_digests: Vec::new(),
+            host_cpu_count: 0,
+            host_memory_limit_bytes: None,
+            state: StateIdentifier::default(),
         };
         let md = generate_summary(&rd, &manifest).unwrap();
         assert!(
@@ -1007,6 +1067,11 @@ mod tests {
             timeouts: RunTimeouts::default(),
             phase_boundaries: Vec::new(),
             load_and_drain_completed_at: None,
+            compose_config_hash: String::new(),
+            image_digests: Vec::new(),
+            host_cpu_count: 0,
+            host_memory_limit_bytes: None,
+            state: StateIdentifier::default(),
         };
         // Must not panic or return Err.
         let md = generate_summary(&rd, &manifest).unwrap();

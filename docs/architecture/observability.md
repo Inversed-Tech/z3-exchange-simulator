@@ -46,7 +46,22 @@ scenario configuration used. Required for any finding to be reportable.
     { "phase": "load", "started_at": "2026-06-02T14:00:55Z" },
     { "phase": "drain", "started_at": "2026-06-02T14:01:00Z" }
   ],
-  "load_and_drain_completed_at": "2026-06-02T14:01:02Z"
+  "load_and_drain_completed_at": "2026-06-02T14:01:02Z",
+  "compose_config_hash": "sha256:<hash of the effective, merged docker compose config>",
+  "image_digests": [
+    { "service": "zebra", "image": "zfnd/zebra:6.0.0", "id": "sha256:ab12cd..." },
+    { "service": "zaino", "image": "zingodevops/zainod:0.6.0", "id": "sha256:34ef56..." },
+    { "service": "zallet", "image": "z3sim/zallet:beta.2-local", "id": "sha256:78gh90..." },
+    { "service": "rpc-router", "image": "z3sim/rpc-router:local", "id": "sha256:12ij34..." }
+  ],
+  "host_cpu_count": 8,
+  "host_memory_limit_bytes": null,
+  "state": {
+    "reset_epoch": 3,
+    "chain_height_at_start": 1245,
+    "hot_wallet_balance_at_start_zat": 5000000000,
+    "freshness": "reused"
+  }
 }
 ```
 
@@ -89,6 +104,60 @@ run time.
 **`timeouts`** records the RPC transport timeout and the confirmation/operation
 polling patience actually in effect for the run, so a low confirmation rate can be
 distinguished from an impatient client.
+
+**`compose_config_hash`** is the SHA-256 hex digest of this run's effective, merged
+`docker compose config` (images, env vars, ports, network layout, container-side
+paths), computed by `z3::Z3Stack::compose_config_hash`. Checkout-location-dependent
+bind-mount source paths (`${Z3_CONFIG_DIR}`-rooted config file mounts) are stripped
+before hashing, so two checkouts of identical logical configuration cloned to
+different filesystem paths produce the same hash — a real configuration change (a
+different image tag, a different port) still changes it. Empty on a manifest
+predating this field, or when the hash could not be computed (this is evidence, not
+a correctness dependency, so a failure here degrades to a warning rather than
+failing the run).
+
+**`image_digests`** is the image (`repository:tag`) and local content-addressed
+image ID Docker actually ran for each stack component, from `docker compose images
+--format json` (`z3::Z3Stack::image_digests`, the same helper `z3sim print-versions`
+uses — see Track 1). Labeled `id`, not `digest`, deliberately: it is not guaranteed
+to equal a pullable registry manifest digest (storage-driver dependent), and the
+locally-built Zallet/RPC Router images have no registry digest to compare against
+at all — it remains a unique, reproducible content hash of the image bytes that ran.
+
+**`host_cpu_count`** / **`host_memory_limit_bytes`** record the number of logical
+CPUs available to the `z3sim` process (`std::thread::available_parallelism()`) and,
+when running under a constrained Linux cgroup (a containerized CI runner, for
+instance), its memory limit in bytes — `null` on an unconstrained bare-metal or VM
+host, which is the common case for where `z3sim` itself runs (only the Z3 stack's
+own containers are resource-constrained by design).
+
+**`state`** records this run's starting chain-state provenance: `reset_epoch`
+(incremented once per `scripts/dev/regtest-reset.sh` execution against this run's
+specific environment, persisted at `configs/local/reset-epoch-<env_id>` — scoped per
+environment id, like `run-<env_id>.lock`, so a `--fresh-env` run never reads another
+environment's reset provenance; `0` if this specific environment has never been
+reset), `chain_height_at_start` (observed immediately after the RPC client is constructed,
+before any warmup mining), `hot_wallet_balance_at_start_zat` (the hot wallet's total
+balance once `warmup()` confirms it funded), and `freshness` — `"fresh"` when this
+run is the first to observe chain state since the last reset, `"reused"` when a
+prior run already advanced the chain since then. This is deliberately cheap rather
+than exact (no Docker-volume content hash): it distinguishes fresh/reused/which-reset-
+generation without needing to reconstruct that judgment from raw numbers. Defaulted
+(`reset_epoch: 0`, `freshness: "fresh"`) on a manifest predating this field.
+
+---
+
+## Console progress
+
+Every multi-minute phase with a known total (warmup block-mining, the hot-wallet
+balance wait, funding rounds, the load phase's dispatch loop) reports visible
+progress via `scenarios::runner::progress::ProgressLine`: current phase, a short
+detail string ("N/total blocks mined", "funding round N/total", ...), elapsed time,
+and — where a ceiling is known — the timeout budget. On a real terminal this
+redraws one line in place (`\r`); when stderr is not a TTY (piped, redirected, CI)
+it falls back to one `tracing::info!` line per update instead. This supersedes the
+warmup balance-check loop's old every-30-second `eprintln!` — the mechanism is now
+one line, updated continuously, rather than a periodic diagnostic print.
 
 ---
 

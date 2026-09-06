@@ -335,7 +335,7 @@ mod tests {
     }
 
     fn run_with_calls(run_id: &str, calls: Vec<RpcCall>) -> RunData {
-        use crate::metrics::{RunManifest, RunTimeouts};
+        use crate::metrics::{RunManifest, RunTimeouts, StateIdentifier};
         RunData {
             run_dir: format!("/tmp/{run_id}").into(),
             manifest: RunManifest {
@@ -352,6 +352,11 @@ mod tests {
                 timeouts: RunTimeouts::default(),
                 phase_boundaries: Vec::new(),
                 load_and_drain_completed_at: None,
+                compose_config_hash: String::new(),
+                image_digests: Vec::new(),
+                host_cpu_count: 0,
+                host_memory_limit_bytes: None,
+                state: StateIdentifier::default(),
             },
             rpc_calls: calls,
             intents: Vec::new(),

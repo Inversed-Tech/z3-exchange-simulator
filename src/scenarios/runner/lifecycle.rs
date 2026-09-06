@@ -2,6 +2,7 @@
 
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Instant;
 
 use chrono::Utc;
 use tokio::time::{sleep, Duration};
@@ -13,6 +14,7 @@ use crate::metrics::{
 use crate::rpc::{RpcClient, RpcError};
 use crate::scenarios::runner::funding::{self, FundedAccount, ANCHOR_CONFIRMATIONS};
 use crate::scenarios::runner::phase::PhaseTracker;
+use crate::scenarios::runner::progress::ProgressLine;
 use crate::scenarios::runner::provisioner::{provision, ProvisionedPopulation};
 use crate::scenarios::runner::RunOptions;
 use crate::scenarios::runner::RunnerError;
@@ -47,6 +49,19 @@ pub struct SetupState {
     /// Held for the lifetime of the run (see `run_lock::acquire`) — the
     /// field is never read directly, only kept alive by the caller.
     pub run_lock: RunLock,
+    /// This run's resolved environment id (see `z3::env_id::resolve_env_id`)
+    /// — surfaced so the caller can read this SAME environment's
+    /// reset-epoch marker (`z3::env_id::reset_epoch_path`), not a different
+    /// environment's, when assembling `StateIdentifier`.
+    pub env_id: String,
+    /// Chain height observed immediately after the RPC client is
+    /// constructed, before any warmup mining — see
+    /// `metrics::manifest::StateIdentifier::chain_height_at_start`.
+    pub chain_height_at_start: u64,
+    /// Hot wallet's total balance (zatoshis), observed once `warmup()`
+    /// confirms it is funded — see
+    /// `metrics::manifest::StateIdentifier::hot_wallet_balance_at_start_zat`.
+    pub hot_wallet_balance_at_start_zat: u64,
 }
 
 // ── setup ─────────────────────────────────────────────────────────────────────
@@ -59,6 +74,7 @@ pub async fn setup(
     run_dir: &RunDir,
     metrics: Arc<dyn MetricsRecorder>,
     phase_tracker: &PhaseTracker,
+    progress: &ProgressLine,
 ) -> Result<SetupState, RunnerError> {
     // 1. Resolve this checkout's environment identity and acquire the
     //    per-env_id concurrency lock BEFORE touching Docker: a stable env_id
@@ -122,6 +138,20 @@ pub async fn setup(
     };
     let rpc = Arc::new(rpc);
 
+    // 4.5. Read the starting chain height now — still within the Bootstrap
+    //    phase (the next transition, to Readiness, happens in step 5 below)
+    //    and before any warmup mining — for
+    //    `StateIdentifier::chain_height_at_start`.
+    let chain_height_at_start = match rpc.get_block_count().await {
+        Ok(h) => h,
+        Err(e) => {
+            let _ = stack.stop().await;
+            return Err(RunnerError::Setup(format!(
+                "failed to read starting chain height: {e}"
+            )));
+        }
+    };
+
     // 5. Resolve the hot wallet account BEFORE mining warmup blocks. Zallet
     //    tracks coinbase payments by scanning blocks for known account
     //    addresses; if the account were only created after mining, Zallet would
@@ -168,10 +198,22 @@ pub async fn setup(
     // 6. Warmup: mine blocks before provisioning. The hot wallet account was
     //    created above so Zallet will credit coinbase outputs as blocks arrive.
     phase_tracker.mark(Phase::Warmup);
-    if let Err(e) = warmup(&rpc, scenario, run_id, metrics.clone(), &hot_wallet_uuid).await {
-        let _ = stack.stop().await;
-        return Err(e);
-    }
+    let hot_wallet_balance_at_start_zat = match warmup(
+        &rpc,
+        scenario,
+        run_id,
+        metrics.clone(),
+        &hot_wallet_uuid,
+        progress,
+    )
+    .await
+    {
+        Ok(balance) => balance,
+        Err(e) => {
+            let _ = stack.stop().await;
+            return Err(e);
+        }
+    };
 
     // 7. Provision the synthetic population (pass the already-resolved hot
     //    wallet UUID so provisioner skips its own z_list_accounts call).
@@ -201,7 +243,8 @@ pub async fn setup(
     //    retries while the wallet catches up, and fails loudly if the hot
     //    wallet's funds cannot actually be spent.
     phase_tracker.mark(Phase::Funding);
-    if let Err(e) = fund_active_accounts(&rpc, scenario, &hot_wallet, &provisioned).await {
+    if let Err(e) = fund_active_accounts(&rpc, scenario, &hot_wallet, &provisioned, progress).await
+    {
         let _ = stack.stop().await;
         return Err(RunnerError::Setup(format!(
             "failed to fund synthetic accounts: {e}"
@@ -221,6 +264,9 @@ pub async fn setup(
         hot_wallet_uuid,
         hot_wallet_address,
         run_lock,
+        env_id: resolved_env_id,
+        chain_height_at_start,
+        hot_wallet_balance_at_start_zat,
     })
 }
 
@@ -236,13 +282,26 @@ const MINE_CHUNK_BLOCKS: u32 = 5;
 /// Mine `total` blocks in chunks of [`MINE_CHUNK_BLOCKS`], retrying a
 /// transport error a few times per chunk — see
 /// [`RpcClient::generate_in_chunks`] for why this is necessary rather than
-/// treating a chunk's transport error as fatal.
-async fn mine_blocks(rpc: &RpcClient, total: u32) -> Result<(), RunnerError> {
-    rpc.generate_in_chunks(total as u64, MINE_CHUNK_BLOCKS)
-        .await
-        .map_err(|e| {
-            RunnerError::Setup(format!("generate failed while mining {total} blocks: {e}"))
-        })
+/// treating a chunk's transport error as fatal. Reports progress after each
+/// chunk when `progress` is given (warmup's block-mining only — the smaller
+/// confirmation-mining calls elsewhere in this file pass `None`).
+async fn mine_blocks(
+    rpc: &RpcClient,
+    total: u32,
+    progress: Option<(&ProgressLine, Instant)>,
+) -> Result<(), RunnerError> {
+    rpc.generate_in_chunks_with_progress(total as u64, MINE_CHUNK_BLOCKS, |mined, total| {
+        if let Some((p, start)) = progress {
+            p.update(
+                Phase::Warmup,
+                &format!("{mined}/{total} blocks mined"),
+                start.elapsed(),
+                None,
+            );
+        }
+    })
+    .await
+    .map_err(|e| RunnerError::Setup(format!("generate failed while mining {total} blocks: {e}")))
 }
 
 // ── funding ───────────────────────────────────────────────────────────────────
@@ -255,6 +314,7 @@ async fn fund_active_accounts(
     scenario: &ScenarioConfig,
     hot_wallet: &FundedAccount,
     provisioned: &ProvisionedPopulation,
+    progress: &ProgressLine,
 ) -> Result<(), RunnerError> {
     let active_ids = &provisioned.population.active_account_ids;
     if active_ids.is_empty() {
@@ -293,14 +353,17 @@ async fn fund_active_accounts(
         })
         .collect::<Result<_, RunnerError>>()?;
 
-    funding::fund_accounts(rpc, hot_wallet, &sinks, plan)
+    funding::fund_accounts(rpc, hot_wallet, &sinks, plan, progress)
         .await
         .map_err(|e| RunnerError::Setup(e.to_string()))?;
 
     // The fan-out outputs need anchor confirmations before the accounts can
     // spend them; mine those now so the first intents of the load phase do not
-    // all stall (the background miner only advances one block per tick).
-    mine_blocks(rpc, ANCHOR_CONFIRMATIONS).await?;
+    // all stall (the background miner only advances one block per tick). Not
+    // itself a progress-reported step — it's a small, fixed-size mine
+    // (ANCHOR_CONFIRMATIONS, currently 10 blocks), not one of the
+    // multi-minute phases progress reporting targets.
+    mine_blocks(rpc, ANCHOR_CONFIRMATIONS, None).await?;
 
     Ok(())
 }
@@ -479,19 +542,30 @@ mod funding_plan_tests {
 
 // ── warmup ────────────────────────────────────────────────────────────────────
 
-/// Mine warmup blocks and verify that the stack is responsive.
+/// Mine warmup blocks and verify that the stack is responsive. Returns the
+/// hot wallet's total balance (zatoshis) once confirmed funded — the caller
+/// reuses this for `StateIdentifier::hot_wallet_balance_at_start_zat`
+/// instead of issuing a second, redundant balance query.
 pub async fn warmup(
     rpc: &RpcClient,
     scenario: &ScenarioConfig,
     run_id: &str,
     metrics: Arc<dyn MetricsRecorder>,
     hot_wallet_uuid: &str,
-) -> Result<(), RunnerError> {
+    progress: &ProgressLine,
+) -> Result<u64, RunnerError> {
+    let warmup_start = Instant::now();
+
     // Mine warmup blocks in chunks — see mine_blocks for why a single
     // generate(warmup_blocks) call cannot work with shielded coinbase.
-    mine_blocks(rpc, scenario.warmup_blocks as u32)
-        .await
-        .map_err(|e| RunnerError::Warmup(format!("warmup mining failed: {e}")))?;
+    mine_blocks(
+        rpc,
+        scenario.warmup_blocks as u32,
+        Some((progress, warmup_start)),
+    )
+    .await
+    .map_err(|e| RunnerError::Warmup(format!("warmup mining failed: {e}")))?;
+    progress.finish();
 
     // Confirm chain is advancing.
     rpc.get_blockchain_info()
@@ -525,26 +599,31 @@ pub async fn warmup(
     // scripts/dev/regtest-miner-setup.sh), or warmup_blocks is below the
     // regtest coinbase maturity window — Zallet sync lag alone should not
     // exhaust this budget on any reasonably-sized wallet.
-    let mut funded = false;
+    let balance_check_start = Instant::now();
+    let balance_check_timeout = WARMUP_BALANCE_CHECK_INTERVAL * WARMUP_BALANCE_CHECK_ATTEMPTS;
+    let mut funded_balance = None;
     for attempt in 0..WARMUP_BALANCE_CHECK_ATTEMPTS {
         let balance = rpc
             .z_get_balance_for_account(hot_wallet_uuid, None)
             .await
             .map_err(|e| RunnerError::Warmup(format!("balance check failed: {e}")))?;
         if balance.shielded_zatoshis() > 0 || balance.transparent_zatoshis() > 0 {
-            funded = true;
+            funded_balance = Some(balance);
             break;
         }
-        if attempt > 0 && attempt % 15 == 0 {
-            eprintln!(
-                "warmup: hot wallet still shows 0 balance after {}s — likely Zallet \
-                 still syncing against accumulated wallet history, not a failure yet",
-                attempt as u64 * WARMUP_BALANCE_CHECK_INTERVAL.as_secs()
-            );
-        }
+        progress.update(
+            Phase::Warmup,
+            &format!(
+                "waiting for hot wallet balance (attempt {}/{WARMUP_BALANCE_CHECK_ATTEMPTS})",
+                attempt + 1
+            ),
+            balance_check_start.elapsed(),
+            Some(balance_check_timeout),
+        );
         sleep(WARMUP_BALANCE_CHECK_INTERVAL).await;
     }
-    if !funded {
+    progress.finish();
+    let Some(funded_balance) = funded_balance else {
         return Err(RunnerError::Warmup(format!(
             "hot wallet has 0 balance after warmup mining and {}s of retries — verify \
              that Zebra's miner_address is the hot_wallet account's transparent \
@@ -552,7 +631,9 @@ pub async fn warmup(
              exceeds the regtest coinbase maturity window",
             WARMUP_BALANCE_CHECK_ATTEMPTS as u64 * WARMUP_BALANCE_CHECK_INTERVAL.as_secs()
         )));
-    }
+    };
+    let hot_wallet_balance_zat =
+        funded_balance.shielded_zatoshis() + funded_balance.transparent_zatoshis();
 
     // A non-zero balance is necessary but NOT sufficient: it counts outputs the
     // wallet has merely *received*. A measured run on Zallet v0.1.0-alpha.3 held
@@ -608,7 +689,7 @@ pub async fn warmup(
         labels: Default::default(),
     });
 
-    Ok(())
+    Ok(hot_wallet_balance_zat)
 }
 
 // ── teardown ──────────────────────────────────────────────────────────────────

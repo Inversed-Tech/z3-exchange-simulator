@@ -41,11 +41,13 @@
 //!   source account's balance covers the plan — see [`ensure_funded`].
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::time::sleep;
 
+use crate::data_model::Phase;
 use crate::rpc::{Recipient, RpcClient, RpcError};
+use crate::scenarios::runner::progress::ProgressLine;
 
 /// Confirmations an output needs before Zallet's proposal engine will select
 /// it as an input. Measured: refused at 3, accepted at >= 10 (consistent with
@@ -460,6 +462,7 @@ pub async fn fund_accounts(
     source: &FundedAccount,
     sinks: &[FundedAccount],
     plan: FundingPlan,
+    progress: &ProgressLine,
 ) -> Result<String, FundingError> {
     // 1. If the shielded pool is empty but transparent coinbase is present,
     //    shield it. With Orchard-coinbase mining this is a no-op.
@@ -517,8 +520,15 @@ pub async fn fund_accounts(
     let rounds = plan
         .transparent_outputs
         .max(u32::from(plan.shielded_zec > 0.0));
+    let rounds_start = Instant::now();
     let mut last_txid: Option<String> = None;
     for round in 0..rounds {
+        progress.update(
+            Phase::Funding,
+            &format!("funding round {}/{rounds}", round + 1),
+            rounds_start.elapsed(),
+            None,
+        );
         let mut recipients: Vec<Recipient> = Vec::with_capacity(sinks.len() * 2);
         for s in sinks {
             if round < plan.transparent_outputs && plan.transparent_zec_each > 0.0 {
@@ -551,6 +561,7 @@ pub async fn fund_accounts(
                 .await?;
         last_txid = Some(wait_operation(rpc, &opid).await?);
     }
+    progress.finish();
 
     last_txid.ok_or_else(|| FundingError::Failed {
         step: "fund_accounts",

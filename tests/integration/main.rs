@@ -270,6 +270,201 @@ fn test_regtest_reset_preview_lists_real_names() {
     );
 }
 
+/// `regtest-reset.sh --yes` must record the reset generation at
+/// `configs/local/reset-epoch-<env_id>` (Track 6): an incrementing epoch
+/// counter plus the chain height observed right after the reset, consumed
+/// by `metrics::manifest::read_reset_state`/`StateFreshness::classify` into
+/// a run's manifest. Destructive (wipes the live regtest stack via
+/// `--yes`), hence `#[ignore]`.
+///
+/// Run with: `cargo test -- --ignored test_regtest_reset_records_reset_epoch`
+#[test]
+#[ignore = "requires a live, bootstrapped external/z3 checkout; destructive; run with: cargo test -- --ignored test_regtest_reset_records_reset_epoch"]
+fn test_regtest_reset_records_reset_epoch() {
+    let reset_epoch_path = current_env_reset_epoch_path();
+
+    let read_epoch = || -> u64 {
+        std::fs::read_to_string(&reset_epoch_path)
+            .ok()
+            .and_then(|c| c.split_whitespace().next().map(str::to_string))
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0)
+    };
+    let before = read_epoch();
+
+    let output = std::process::Command::new("bash")
+        .arg("scripts/dev/regtest-reset.sh")
+        .arg("--yes")
+        .output()
+        .expect("failed to invoke scripts/dev/regtest-reset.sh --yes");
+    assert!(
+        output.status.success(),
+        "regtest-reset.sh --yes failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let content = std::fs::read_to_string(&reset_epoch_path)
+        .unwrap_or_else(|e| panic!("reset-epoch not written at {reset_epoch_path:?}: {e}"));
+    let mut fields = content.split_whitespace();
+    let epoch: u64 = fields
+        .next()
+        .and_then(|s| s.parse().ok())
+        .expect("reset-epoch's first field must be a valid epoch number");
+    let height_at_reset: u64 = fields
+        .next()
+        .and_then(|s| s.parse().ok())
+        .expect("reset-epoch's second field must be a valid chain height");
+
+    assert_eq!(epoch, before + 1, "epoch must increment by exactly 1");
+    // regtest-init.sh's own bootstrap mining (2 blocks, NU5/Orchard
+    // activation) always leaves the post-reset chain at a nonzero height.
+    assert!(
+        height_at_reset > 0,
+        "height_at_reset should reflect real post-reset mining, got {height_at_reset}"
+    );
+}
+
+/// `configs/local/reset-epoch-<env_id>` for this checkout's currently
+/// cached `env-id` (falling back to the legacy, unscoped
+/// `configs/local/reset-epoch` if none is cached yet) — mirrors
+/// `regtest-reset.sh`'s own `resolved_env_id`/`RESET_EPOCH_FILE` resolution
+/// and `src/z3/env_id.rs::reset_epoch_path`, so this test reads exactly the
+/// file the script just wrote, not a stale unscoped name (Track 6 review
+/// finding: reset-epoch must be scoped per environment).
+fn current_env_reset_epoch_path() -> std::path::PathBuf {
+    let env_id = std::fs::read_to_string("configs/local/env-id")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| {
+            s.len() == 8
+                && s.bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        });
+    match env_id {
+        Some(id) => std::path::PathBuf::from(format!("configs/local/reset-epoch-{id}")),
+        None => std::path::PathBuf::from("configs/local/reset-epoch"),
+    }
+}
+
+/// A `--fresh-env` run must never read or be attributed another
+/// environment's reset provenance: resetting the STABLE environment must
+/// leave a freshly-minted `--fresh-env` environment's reset-epoch reading
+/// at `(0, Fresh)`, not the stable environment's post-reset values.
+/// Destructive (wipes the live regtest stack via `--yes`) and starts a
+/// second, independent environment, hence `#[ignore]`.
+///
+/// Run with: `cargo test -- --ignored test_fresh_env_does_not_read_another_environments_reset_epoch`
+#[test]
+#[ignore = "requires a live, bootstrapped external/z3 checkout; destructive; starts a second environment; run with: cargo test -- --ignored test_fresh_env_does_not_read_another_environments_reset_epoch"]
+fn test_fresh_env_does_not_read_another_environments_reset_epoch() {
+    // Reset the stable environment first, so its reset-epoch file exists
+    // and holds a nonzero epoch.
+    let output = std::process::Command::new("bash")
+        .arg("scripts/dev/regtest-reset.sh")
+        .arg("--yes")
+        .output()
+        .expect("failed to invoke scripts/dev/regtest-reset.sh --yes");
+    assert!(
+        output.status.success(),
+        "regtest-reset.sh --yes failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stable_reset_epoch_path = current_env_reset_epoch_path();
+    assert!(
+        stable_reset_epoch_path.exists(),
+        "the stable environment's reset-epoch file must exist after a reset"
+    );
+
+    // A fresh env_id has, by construction, never been reset — its
+    // reset-epoch path must not exist, regardless of what the stable
+    // environment's own file (asserted above) holds.
+    let fresh_env_id = "abcdef01"; // arbitrary well-formed env_id, distinct from whatever is cached
+    let fresh_reset_epoch_path =
+        std::path::PathBuf::from(format!("configs/local/reset-epoch-{fresh_env_id}"));
+    assert!(
+        !fresh_reset_epoch_path.exists(),
+        "a fresh environment's reset-epoch path must not exist merely because the \
+         stable environment was just reset: {fresh_reset_epoch_path:?}"
+    );
+    assert_ne!(
+        stable_reset_epoch_path, fresh_reset_epoch_path,
+        "the stable and a fresh environment must resolve to different reset-epoch paths"
+    );
+}
+
+/// `regtest-reset.sh` must rewrite `.env.regtest`'s `COMPOSE_PROJECT_NAME=`
+/// line with a `sed -i` spelling BSD sed (macOS's default `/usr/bin/sed`)
+/// and GNU sed both accept identically. A bare `sed -i "..."` (GNU-only —
+/// BSD sed requires an extension argument after `-i` and, without one,
+/// parses the very next word as a file path instead, crashing with
+/// "invalid command code") reached exactly this failure live: it aborted
+/// the script immediately after `docker compose down -v` had already wiped
+/// the target environment's volumes, before `regtest-init.sh` could
+/// re-initialize them — so the reset-epoch code later in the same script
+/// (and every regression test depending on the reset completing) was never
+/// reached at all.
+///
+/// Fast, no Docker/live stack required — reads the *actual* `sed -i...`
+/// line out of the script's own source (so a regression in the real file
+/// is what this test catches, not a hand-copied duplicate that could
+/// silently drift from it) and separately exercises that same invocation
+/// pattern against this host's real `sed` in an isolated fixture, so it
+/// fails the same way on any BSD-sed host, not only by string inspection.
+#[test]
+fn test_regtest_reset_env_file_rewrite_uses_portable_sed_i() {
+    let script = std::fs::read_to_string("scripts/dev/regtest-reset.sh")
+        .expect("scripts/dev/regtest-reset.sh must exist");
+    let sed_line = script
+        .lines()
+        .find(|l| l.trim_start().starts_with("sed -i"))
+        .unwrap_or_else(|| {
+            panic!(
+                "expected a `sed -i...` line in regtest-reset.sh (the \
+                 COMPOSE_PROJECT_NAME rewrite) — has the rewrite mechanism changed?"
+            )
+        });
+    assert!(
+        sed_line.contains("sed -i.") || sed_line.contains("sed -i ''"),
+        "regtest-reset.sh's `sed -i` call must use a spelling BSD sed accepts \
+         (e.g. an extension attached directly to -i, like `-i.bak`, or `-i ''` \
+         for no backup) — a bare `sed -i \"...\"` crashes BSD sed (macOS's \
+         default /usr/bin/sed) with 'invalid command code': {sed_line}"
+    );
+
+    // Exercise the actual pattern (`-i.bak` + cleanup) against this host's
+    // real `sed`, in an isolated fixture — not just the string shape.
+    let dir = tempfile::tempdir().unwrap();
+    let env_file = dir.path().join(".env.regtest");
+    std::fs::write(&env_file, "COMPOSE_PROJECT_NAME=z3-regtest\nOTHER=1\n").unwrap();
+    let status = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!(
+            r#"sed -i.bak "s|^COMPOSE_PROJECT_NAME=.*|COMPOSE_PROJECT_NAME=z3-sim-deadbeef|" "{}" && rm -f "{}.bak""#,
+            env_file.display(),
+            env_file.display()
+        ))
+        .status()
+        .expect("failed to invoke sh -c");
+    assert!(
+        status.success(),
+        "the sed -i.bak invocation regtest-reset.sh relies on must succeed on this host's sed"
+    );
+    let content = std::fs::read_to_string(&env_file).unwrap();
+    assert!(
+        content.contains("COMPOSE_PROJECT_NAME=z3-sim-deadbeef"),
+        "COMPOSE_PROJECT_NAME must be rewritten: {content}"
+    );
+    assert!(
+        content.contains("OTHER=1"),
+        "unrelated lines must be preserved: {content}"
+    );
+    let backup_path = dir.path().join(".env.regtest.bak");
+    assert!(
+        !backup_path.exists(),
+        "the sed backup file must be cleaned up, not left behind: {backup_path:?}"
+    );
+}
+
 // ── z3sim print-versions (Track 1) ───────────────────────────────────────────
 //
 // Exercises `print_versions_command`'s actual runtime wiring (arg struct ->

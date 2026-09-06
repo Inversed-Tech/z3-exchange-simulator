@@ -15,23 +15,26 @@ use tokio::time::MissedTickBehavior;
 
 use crate::data_model::{MetricSample, Phase, ScenarioConfig};
 use crate::metrics::{
-    read_simulator_commit, read_z3_commits, write_manifest, JsonlRecorder, MetricsRecorder, RunDir,
-    RunManifest, RunTimeouts,
+    read_reset_state, read_simulator_commit, read_z3_commits, write_manifest, JsonlRecorder,
+    MetricsRecorder, RunDir, RunManifest, RunTimeouts, StateFreshness, StateIdentifier,
 };
 use crate::scenarios::exchange::{run_mempool_watcher, PollingConfig};
 use crate::synthetic::generators::TransactionIntentGenerator;
+use crate::z3::env_id;
 
 pub mod config;
 pub mod dispatch;
 pub mod funding;
 pub mod lifecycle;
 pub mod phase;
+pub mod progress;
 pub mod provisioner;
 pub mod result;
 pub mod scheduler;
 
 pub use config::{load_scenario, validate_scenario, ConfigError};
 pub use phase::PhaseTracker;
+pub use progress::ProgressLine;
 pub use provisioner::PopulationPlan;
 pub use result::{IntentOutcome, RunResult, RunStats};
 pub use scheduler::LoadShape;
@@ -130,6 +133,17 @@ pub struct RunOptions {
     /// bootstrap scripts and Docker state on a machine that happens to have
     /// a real checkout already configured.
     pub compose_dir: PathBuf,
+    /// Directory holding the per-`env_id` reset-epoch markers written by
+    /// `scripts/dev/regtest-reset.sh` (see `z3::env_id::reset_epoch_path`)
+    /// and read into `RunManifest::state.reset_epoch` (see
+    /// `metrics::manifest::read_reset_state`). Defaults to `configs/local`,
+    /// alongside `env-id` and the per-`env_id` lock files. The actual
+    /// filename read is `reset-epoch-<this run's resolved env_id>` — scoped
+    /// per environment so a `--fresh-env` run never reads the stable
+    /// environment's reset provenance, or vice versa. A missing file reads
+    /// as "no reset has run against this specific environment yet" rather
+    /// than an error, so this needs no test-only override.
+    pub reset_epoch_dir: PathBuf,
 }
 
 impl Default for RunOptions {
@@ -148,6 +162,7 @@ impl Default for RunOptions {
             env_id_cache_path: PathBuf::from("configs/local/env-id"),
             run_lock_dir: PathBuf::from("configs/local"),
             compose_dir: PathBuf::from("external/z3"),
+            reset_epoch_dir: PathBuf::from("configs/local"),
         }
     }
 }
@@ -166,6 +181,51 @@ fn generate_run_id(scenario_name: &str) -> String {
 /// `Duration` each must be given.
 fn rate_per_second(count: u64, elapsed: Duration) -> f64 {
     count as f64 / elapsed.as_secs_f64().max(1.0)
+}
+
+/// Logical CPUs available to this process, for `RunManifest::host_cpu_count`.
+fn host_cpu_count() -> u32 {
+    std::thread::available_parallelism().map_or(0, |n| n.get() as u32)
+}
+
+/// This host's memory limit in bytes, for `RunManifest::host_memory_limit_bytes` —
+/// `None` on an unconstrained bare-metal/VM host (the common case for where
+/// `z3sim` itself runs; only the Z3 stack's own containers are ever
+/// resource-constrained today). Reads a Linux cgroup memory limit when one is
+/// in effect (cgroup v2 first, falling back to v1), since that is the one
+/// case a `z3sim` process could itself be running under a real constraint
+/// (e.g. a containerized CI runner); no such concept exists on macOS/Windows,
+/// so this is `None` there unconditionally.
+fn host_memory_limit_bytes() -> Option<u64> {
+    for path in [
+        "/sys/fs/cgroup/memory.max",
+        "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+    ] {
+        if let Ok(content) = std::fs::read_to_string(path) {
+            if let Some(limit) = parse_cgroup_memory_limit(&content) {
+                return Some(limit);
+            }
+        }
+    }
+    None
+}
+
+/// Parses a cgroup memory-limit file's content. Cgroup v2 writes the literal
+/// `max` for "unconstrained"; cgroup v1 writes a huge sentinel value instead
+/// (typically `i64::MAX` rounded down to the page size) — both mean the same
+/// thing, so anything at or above 2^62 bytes (4 exbibytes; no real host has
+/// this much RAM) is treated as unconstrained rather than as a real limit.
+fn parse_cgroup_memory_limit(content: &str) -> Option<u64> {
+    let trimmed = content.trim();
+    if trimmed == "max" {
+        return None;
+    }
+    let value: u64 = trimmed.parse().ok()?;
+    if value >= (1u64 << 62) {
+        None
+    } else {
+        Some(value)
+    }
 }
 
 // ── run ───────────────────────────────────────────────────────────────────────
@@ -244,6 +304,11 @@ pub async fn run(scenario: ScenarioConfig, opts: RunOptions) -> Result<RunResult
         },
         phase_boundaries: Vec::new(),
         load_and_drain_completed_at: None,
+        compose_config_hash: String::new(),
+        image_digests: Vec::new(),
+        host_cpu_count: host_cpu_count(),
+        host_memory_limit_bytes: host_memory_limit_bytes(),
+        state: StateIdentifier::default(),
     };
     write_manifest(&run_dir.manifest_path(), &manifest)
         .map_err(|e| RunnerError::Metrics(e.to_string()))?;
@@ -253,6 +318,7 @@ pub async fn run(scenario: ScenarioConfig, opts: RunOptions) -> Result<RunResult
     //    being recorded only once an RpcClient happens to exist partway
     //    through setup.
     let phase_tracker = PhaseTracker::new();
+    let progress = ProgressLine::new();
 
     // 6. Setup: start Z3, warmup, provision population.
     //    Warmup (mining) runs inside setup() before provisioning so the hot
@@ -271,6 +337,7 @@ pub async fn run(scenario: ScenarioConfig, opts: RunOptions) -> Result<RunResult
         &run_dir,
         metrics.clone(),
         &phase_tracker,
+        &progress,
     )
     .await
     {
@@ -304,7 +371,41 @@ pub async fn run(scenario: ScenarioConfig, opts: RunOptions) -> Result<RunResult
         // load phase and teardown below — so the environment stays reserved
         // for the entire run. Released when it drops at function exit.
         run_lock: _run_lock,
+        env_id: resolved_env_id,
+        chain_height_at_start,
+        hot_wallet_balance_at_start_zat,
     } = setup_state;
+
+    // Read the state/image/config evidence now, while the stack is still up
+    // (image_digests requires running containers) and before `stack` moves
+    // into `teardown` below. These are evidence fields, not correctness
+    // dependencies — a failure degrades to an empty/default value with a
+    // warning rather than failing an otherwise-successful run.
+    manifest.image_digests = match stack.image_digests().await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!("failed to read running image digests for manifest: {e}");
+            Vec::new()
+        }
+    };
+    manifest.compose_config_hash = match stack.compose_config_hash().await {
+        Ok(h) => h,
+        Err(e) => {
+            tracing::warn!("failed to compute compose config hash for manifest: {e}");
+            String::new()
+        }
+    };
+    // Scoped to THIS run's resolved env_id, not a single checkout-wide file
+    // — otherwise a `--fresh-env` run would read (or a stable run would be
+    // misattributed) another environment's reset provenance entirely.
+    let reset_epoch_path = env_id::reset_epoch_path(&opts.reset_epoch_dir, &resolved_env_id);
+    let (reset_epoch, height_at_reset) = read_reset_state(&reset_epoch_path);
+    manifest.state = StateIdentifier {
+        reset_epoch,
+        chain_height_at_start,
+        hot_wallet_balance_at_start_zat,
+        freshness: StateFreshness::classify(chain_height_at_start, height_at_reset),
+    };
 
     let provisioned = Arc::new(provisioned);
 
@@ -318,6 +419,7 @@ pub async fn run(scenario: ScenarioConfig, opts: RunOptions) -> Result<RunResult
         &hot_wallet_address,
         metrics.clone(),
         &phase_tracker,
+        &progress,
     )
     .await;
     // Captured at the exact instant `load_phase()` returns — the same
@@ -405,6 +507,7 @@ async fn load_phase(
     hot_wallet_address: &str,
     metrics: Arc<dyn MetricsRecorder>,
     phase_tracker: &PhaseTracker,
+    progress: &ProgressLine,
 ) -> Result<(u64, Vec<IntentOutcome>), RunnerError> {
     // For Mixed shape, override the flow config.
     let effective_scenario = if matches!(opts.load_shape, LoadShape::Mixed) {
@@ -480,6 +583,11 @@ async fn load_phase(
     );
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
+    // Throttles the dispatch loop's own progress line to roughly once per
+    // second of real elapsed time, not once per tick — a high-TPS scenario
+    // ticks far more often than that and would otherwise flood the line.
+    let mut last_progress_update = Instant::now() - Duration::from_secs(1);
+
     let mut is_first_tick = true;
     loop {
         let elapsed = start.elapsed();
@@ -521,7 +629,21 @@ async fn load_phase(
             );
             tasks.spawn(fut);
         }
+
+        if last_progress_update.elapsed() >= Duration::from_secs(1) {
+            progress.update(
+                Phase::Load,
+                &format!(
+                    "{total_attempted} dispatched, {} in flight",
+                    active_count.load(std::sync::atomic::Ordering::Relaxed)
+                ),
+                elapsed,
+                Some(load_duration),
+            );
+            last_progress_update = Instant::now();
+        }
     }
+    progress.finish();
     // Real elapsed dispatch-loop duration — distinct from `load_duration`
     // (the configured target): scheduler jitter and tick-interval rounding
     // mean the loop can run slightly over or under it.
@@ -607,6 +729,39 @@ async fn load_phase(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── host resources ───────────────────────────────────────────────────────
+
+    #[test]
+    fn host_cpu_count_matches_available_parallelism() {
+        let expected = std::thread::available_parallelism().map_or(0, |n| n.get() as u32);
+        assert_eq!(host_cpu_count(), expected);
+    }
+
+    #[test]
+    fn parse_cgroup_memory_limit_treats_v2_max_as_unconstrained() {
+        assert_eq!(parse_cgroup_memory_limit("max\n"), None);
+    }
+
+    #[test]
+    fn parse_cgroup_memory_limit_treats_v1_huge_sentinel_as_unconstrained() {
+        // The classic cgroup v1 "unconstrained" sentinel: i64::MAX rounded
+        // down to the host's page size.
+        assert_eq!(parse_cgroup_memory_limit("9223372036854771712\n"), None);
+    }
+
+    #[test]
+    fn parse_cgroup_memory_limit_returns_a_real_limit() {
+        assert_eq!(
+            parse_cgroup_memory_limit("2147483648\n"),
+            Some(2_147_483_648)
+        );
+    }
+
+    #[test]
+    fn parse_cgroup_memory_limit_rejects_garbage() {
+        assert_eq!(parse_cgroup_memory_limit("not-a-number"), None);
+    }
 
     // ── rate_per_second ────────────────────────────────────────────────────
 

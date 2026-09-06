@@ -111,7 +111,7 @@ pub fn load_runs(run_dirs: &[PathBuf]) -> Result<Vec<RunData>, ReportError> {
 mod tests {
     use super::*;
     use crate::data_model::{Backend, FlowType};
-    use crate::metrics::RunTimeouts;
+    use crate::metrics::{RunTimeouts, StateIdentifier};
     use chrono::Utc;
 
     fn write_run(dir: &Path, corrupt_intents_line: bool) {
@@ -129,6 +129,11 @@ mod tests {
             timeouts: RunTimeouts::default(),
             phase_boundaries: Vec::new(),
             load_and_drain_completed_at: None,
+            compose_config_hash: String::new(),
+            image_digests: Vec::new(),
+            host_cpu_count: 0,
+            host_memory_limit_bytes: None,
+            state: StateIdentifier::default(),
         };
         std::fs::write(
             dir.join("manifest.json"),

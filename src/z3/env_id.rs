@@ -6,7 +6,7 @@
 //! `configs/local/env-id`) and the port/subnet values keyed off it, so Docker
 //! and the simulator's own RPC client agree on one set of values.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use rand::rngs::OsRng;
 use rand::RngCore;
@@ -55,6 +55,22 @@ fn is_valid_env_id(s: &str) -> bool {
 /// Docker Compose project name for a given environment id, e.g. `z3-sim-a1b2c3d4`.
 pub fn compose_project_for_env(env_id: &str) -> String {
     format!("z3-sim-{env_id}")
+}
+
+/// Path to `env_id`'s reset-epoch marker (see
+/// `scripts/dev/regtest-reset.sh`, which duplicates this exact filename
+/// format in shell for the same low-drift-risk reason
+/// `default_project_name()` there duplicates [`compose_project_for_env`],
+/// and `metrics::manifest::read_reset_state`), scoped per environment id
+/// under `cache_dir` so two environments on the same checkout — the stable
+/// one and a `--fresh-env` one, in particular — never read or write each
+/// other's reset provenance. A run against an environment that has never
+/// been reset simply finds no file at this path (`read_reset_state`
+/// defaults to `(0, 0)`), which is the correct "no reset recorded yet"
+/// reading for that specific environment, not a leftover value from
+/// whichever environment was reset most recently.
+pub fn reset_epoch_path(cache_dir: &Path, env_id: &str) -> PathBuf {
+    cache_dir.join(format!("reset-epoch-{env_id}"))
 }
 
 // ── Port derivation ──────────────────────────────────────────────────────────
@@ -195,6 +211,20 @@ mod tests {
         assert_ne!(
             compose_project_for_env("a1b2c3d4"),
             compose_project_for_env("00000000")
+        );
+    }
+
+    #[test]
+    fn reset_epoch_path_is_scoped_per_env_id() {
+        let dir = Path::new("configs/local");
+        assert_eq!(
+            reset_epoch_path(dir, "a1b2c3d4"),
+            dir.join("reset-epoch-a1b2c3d4")
+        );
+        assert_ne!(
+            reset_epoch_path(dir, "a1b2c3d4"),
+            reset_epoch_path(dir, "00000000"),
+            "two different environments must never resolve to the same reset-epoch path"
         );
     }
 
