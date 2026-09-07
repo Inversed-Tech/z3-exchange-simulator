@@ -65,10 +65,11 @@ pub fn compose_project_for_env(env_id: &str) -> String {
 /// under `cache_dir` so two environments on the same checkout — the stable
 /// one and a `--fresh-env` one, in particular — never read or write each
 /// other's reset provenance. A run against an environment that has never
-/// been reset simply finds no file at this path (`read_reset_state`
-/// defaults to `(0, 0)`), which is the correct "no reset recorded yet"
-/// reading for that specific environment, not a leftover value from
-/// whichever environment was reset most recently.
+/// been reset simply finds no file at this path (`read_reset_state` returns
+/// `None`), which `runner::run()` uses to lazily write an initial baseline
+/// at that run's own starting chain height — see `read_reset_state`'s doc
+/// comment for why comparing against a hardcoded `(0, 0)` instead would
+/// misclassify that environment's very first run.
 pub fn reset_epoch_path(cache_dir: &Path, env_id: &str) -> PathBuf {
     cache_dir.join(format!("reset-epoch-{env_id}"))
 }

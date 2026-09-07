@@ -558,14 +558,19 @@ pub async fn warmup(
 
     // Mine warmup blocks in chunks — see mine_blocks for why a single
     // generate(warmup_blocks) call cannot work with shielded coinbase.
-    mine_blocks(
+    //
+    // `finish()` runs unconditionally, success or failure, so a mining
+    // failure's error message is never concatenated onto the still-open,
+    // \r-redrawn progress line — moving the cursor to a fresh line before
+    // the `?` below propagates the error.
+    let mine_result = mine_blocks(
         rpc,
         scenario.warmup_blocks as u32,
         Some((progress, warmup_start)),
     )
-    .await
-    .map_err(|e| RunnerError::Warmup(format!("warmup mining failed: {e}")))?;
+    .await;
     progress.finish();
+    mine_result.map_err(|e| RunnerError::Warmup(format!("warmup mining failed: {e}")))?;
 
     // Confirm chain is advancing.
     rpc.get_blockchain_info()
@@ -603,10 +608,17 @@ pub async fn warmup(
     let balance_check_timeout = WARMUP_BALANCE_CHECK_INTERVAL * WARMUP_BALANCE_CHECK_ATTEMPTS;
     let mut funded_balance = None;
     for attempt in 0..WARMUP_BALANCE_CHECK_ATTEMPTS {
-        let balance = rpc
-            .z_get_balance_for_account(hot_wallet_uuid, None)
-            .await
-            .map_err(|e| RunnerError::Warmup(format!("balance check failed: {e}")))?;
+        // `finish()` before returning, not after — the same reasoning as
+        // `mine_blocks`'s own call above: a transient RPC failure here must
+        // not leave the error message concatenated onto the still-open
+        // progress line.
+        let balance = match rpc.z_get_balance_for_account(hot_wallet_uuid, None).await {
+            Ok(b) => b,
+            Err(e) => {
+                progress.finish();
+                return Err(RunnerError::Warmup(format!("balance check failed: {e}")));
+            }
+        };
         if balance.shielded_zatoshis() > 0 || balance.transparent_zatoshis() > 0 {
             funded_balance = Some(balance);
             break;

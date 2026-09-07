@@ -476,7 +476,27 @@ impl FundingPlan {
 /// Returns the fan-out txid. The caller must keep mining (the runner's
 /// background miner does) or mine [`ANCHOR_CONFIRMATIONS`] blocks before the
 /// sinks can spend what they received.
+///
+/// The actual work is in `fund_accounts_inner`; this wrapper's only job is
+/// to guarantee `progress.finish()` runs on every exit path, success or
+/// error. `fund_accounts_inner` has several early-return `?`/`ok_or_else`
+/// points (the coinbase-shielding wait, `ensure_funded`, and each round of
+/// the fan-out loop), any of which — without this wrapper — would return
+/// before reaching a `finish()` call, leaving the terminal mid-`\r`-redraw
+/// when the caller's error message prints right after.
 pub async fn fund_accounts(
+    rpc: &Arc<RpcClient>,
+    source: &FundedAccount,
+    sinks: &[FundedAccount],
+    plan: FundingPlan,
+    progress: &ProgressLine,
+) -> Result<String, FundingError> {
+    let result = fund_accounts_inner(rpc, source, sinks, plan, progress).await;
+    progress.finish();
+    result
+}
+
+async fn fund_accounts_inner(
     rpc: &Arc<RpcClient>,
     source: &FundedAccount,
     sinks: &[FundedAccount],
@@ -597,7 +617,8 @@ pub async fn fund_accounts(
             .await?,
         );
     }
-    progress.finish();
+    // `progress.finish()` runs unconditionally in the `fund_accounts`
+    // wrapper above, on every exit path — not here.
 
     last_txid.ok_or_else(|| FundingError::Failed {
         step: "fund_accounts",
@@ -609,7 +630,11 @@ pub async fn fund_accounts(
 mod tests {
     use wiremock::{matchers, Mock, MockServer, ResponseTemplate};
 
-    use super::{is_expiry_race, wait_operation, FundingError};
+    use std::sync::Arc;
+
+    use super::{
+        fund_accounts, is_expiry_race, wait_operation, FundedAccount, FundingError, FundingPlan,
+    };
     use crate::rpc::{AccountInfo, RpcClient};
     use crate::scenarios::runner::progress::ProgressLine;
 
@@ -795,6 +820,67 @@ mod tests {
             progress.update_count(),
             2,
             "expected one progress update per non-terminal poll iteration"
+        );
+    }
+
+    #[tokio::test]
+    async fn fund_accounts_calls_finish_on_an_early_error_not_only_on_success() {
+        // Regression guard: `fund_accounts_inner`'s very first call
+        // (z_getbalanceforaccount) fails here, before any `progress.update`
+        // ever runs — the strongest case, since it proves `finish()` isn't
+        // merely reached via some later code path that happens to run
+        // anyway. Without the `fund_accounts` wrapper's unconditional
+        // `finish()`, this early `?` would skip it entirely.
+        let server = MockServer::start().await;
+        Mock::given(matchers::method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": null,
+                "error": {"code": -1, "message": "getbalanceforaccount unavailable"},
+                "id": 1
+            })))
+            .mount(&server)
+            .await;
+
+        let rpc = Arc::new(RpcClient::new(&server.uri(), "test-run", None, None));
+        let progress = ProgressLine::with_tty(false);
+        let source = FundedAccount {
+            uuid: "src-uuid".into(),
+            address: "u1src".into(),
+            transparent_receiver: Some("t1src".into()),
+            orchard_receiver: None,
+        };
+        let sinks = vec![FundedAccount {
+            uuid: "sink-uuid".into(),
+            address: "u1sink".into(),
+            transparent_receiver: Some("t1sink".into()),
+            orchard_receiver: None,
+        }];
+        let plan = FundingPlan {
+            transparent_outputs: 1,
+            transparent_zec_each: 1.0,
+            shielded_zec: 0.0,
+        };
+
+        let err = fund_accounts(&rpc, &source, &sinks, plan, &progress)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            FundingError::Rpc {
+                step: "z_getbalanceforaccount",
+                ..
+            }
+        ));
+        assert_eq!(
+            progress.update_count(),
+            0,
+            "the failure happens before any progress update is ever issued"
+        );
+        assert_eq!(
+            progress.finish_count(),
+            1,
+            "finish() must still run exactly once on this early-error exit path"
         );
     }
 }

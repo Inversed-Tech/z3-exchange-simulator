@@ -15,7 +15,7 @@ use tokio::time::MissedTickBehavior;
 
 use crate::data_model::{MetricSample, Phase, ScenarioConfig};
 use crate::metrics::{
-    read_reset_state, read_simulator_commit, read_z3_commits, write_manifest, JsonlRecorder,
+    read_simulator_commit, read_z3_commits, resolve_reset_state, write_manifest, JsonlRecorder,
     MetricsRecorder, RunDir, RunManifest, RunTimeouts, StateFreshness, StateIdentifier,
 };
 use crate::scenarios::exchange::{run_mempool_watcher, PollingConfig};
@@ -136,13 +136,16 @@ pub struct RunOptions {
     /// Directory holding the per-`env_id` reset-epoch markers written by
     /// `scripts/dev/regtest-reset.sh` (see `z3::env_id::reset_epoch_path`)
     /// and read into `RunManifest::state.reset_epoch` (see
-    /// `metrics::manifest::read_reset_state`). Defaults to `configs/local`,
-    /// alongside `env-id` and the per-`env_id` lock files. The actual
-    /// filename read is `reset-epoch-<this run's resolved env_id>` — scoped
-    /// per environment so a `--fresh-env` run never reads the stable
-    /// environment's reset provenance, or vice versa. A missing file reads
-    /// as "no reset has run against this specific environment yet" rather
-    /// than an error, so this needs no test-only override.
+    /// `metrics::manifest::resolve_reset_state`). Defaults to
+    /// `configs/local`, alongside `env-id` and the per-`env_id` lock files.
+    /// The actual filename read is `reset-epoch-<this run's resolved
+    /// env_id>` — scoped per environment so a `--fresh-env` run never reads
+    /// the stable environment's reset provenance, or vice versa. A missing
+    /// file means "no reset has run against this specific environment
+    /// yet" — `resolve_reset_state` lazily records a baseline at this run's
+    /// own starting chain height rather than treating that as chain height
+    /// 0. `RunArgs::reset_epoch_dir` overrides this for tests that must not
+    /// read or write the real checkout's `configs/local/`.
     pub reset_epoch_dir: PathBuf,
 }
 
@@ -400,7 +403,8 @@ pub async fn run(scenario: ScenarioConfig, opts: RunOptions) -> Result<RunResult
     // — otherwise a `--fresh-env` run would read (or a stable run would be
     // misattributed) another environment's reset provenance entirely.
     let reset_epoch_path = env_id::reset_epoch_path(&opts.reset_epoch_dir, &resolved_env_id);
-    let (reset_epoch, height_at_reset) = read_reset_state(&reset_epoch_path);
+    let (reset_epoch, height_at_reset) =
+        resolve_reset_state(&reset_epoch_path, chain_height_at_start);
     manifest.state = StateIdentifier {
         reset_epoch,
         chain_height_at_start,

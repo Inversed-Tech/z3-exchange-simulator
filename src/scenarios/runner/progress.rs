@@ -25,6 +25,11 @@ pub struct ProgressLine {
     /// isn't pursued here.
     #[cfg(test)]
     update_count: std::sync::atomic::AtomicUsize,
+    /// Counts `finish()` calls — lets a caller-side test (e.g.
+    /// `funding.rs`'s `fund_accounts` tests) assert `finish()` actually ran
+    /// on an error exit path, not only on success.
+    #[cfg(test)]
+    finish_count: std::sync::atomic::AtomicUsize,
 }
 
 impl ProgressLine {
@@ -33,6 +38,8 @@ impl ProgressLine {
             is_tty: std::io::stderr().is_terminal(),
             #[cfg(test)]
             update_count: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            finish_count: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -63,6 +70,9 @@ impl ProgressLine {
     /// completes, so subsequent output starts on its own line. A no-op on a
     /// non-TTY, which never redrew in place to begin with.
     pub fn finish(&self) {
+        #[cfg(test)]
+        self.finish_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if self.is_tty {
             eprintln!();
         }
@@ -77,6 +87,7 @@ impl ProgressLine {
         Self {
             is_tty,
             update_count: std::sync::atomic::AtomicUsize::new(0),
+            finish_count: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -85,6 +96,13 @@ impl ProgressLine {
     #[cfg(test)]
     pub(crate) fn update_count(&self) -> usize {
         self.update_count.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Number of `finish()` calls observed so far — see the `finish_count`
+    /// field doc comment.
+    #[cfg(test)]
+    pub(crate) fn finish_count(&self) -> usize {
+        self.finish_count.load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
@@ -163,5 +181,13 @@ mod tests {
         p.update(Phase::Funding, "a", Duration::from_secs(1), None);
         p.update(Phase::Funding, "b", Duration::from_secs(2), None);
         assert_eq!(p.update_count(), 2);
+    }
+
+    #[test]
+    fn finish_count_reflects_the_number_of_finish_calls() {
+        let p = ProgressLine::with_tty(false);
+        assert_eq!(p.finish_count(), 0);
+        p.finish();
+        assert_eq!(p.finish_count(), 1);
     }
 }

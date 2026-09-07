@@ -162,22 +162,71 @@ impl StateFreshness {
 /// Reads a `configs/local/reset-epoch-<env_id>` file (see
 /// `z3::env_id::reset_epoch_path`, written by `regtest-reset.sh`'s last
 /// step for that specific environment): two whitespace-separated fields,
-/// `{epoch} {height_at_reset}`. Missing file or a malformed line degrades
-/// to `(0, 0)` — "no reset has run against this environment yet" — rather
-/// than failing the run, matching `env_id::resolve_env_id`'s and
-/// `read_z3_commits`'s forgiving convention for optional, machine-written
-/// local state.
-pub fn read_reset_state(path: &Path) -> (u64, u64) {
-    let Ok(content) = std::fs::read_to_string(path) else {
-        return (0, 0);
-    };
+/// `{epoch} {height_at_reset}`.
+///
+/// Returns `None` for a missing file or a malformed line — "no baseline has
+/// ever been recorded for this environment" — rather than silently
+/// defaulting to `(0, 0)`. That distinction matters: `(0, 0)` is not a safe
+/// stand-in for "never reset," because a freshly bootstrapped (but never
+/// explicitly reset) environment's chain height is *not* 0 by the time a
+/// run reads it — `regtest-init.sh`'s own NU5/Orchard-activation mining
+/// already advances it past 0 first. Silently comparing against `(0, 0)`
+/// would misclassify that environment's very first run as `Reused`. The
+/// caller (`runner::run()`) uses `None` to lazily establish a real baseline
+/// instead — see `write_reset_state`.
+pub fn read_reset_state(path: &Path) -> Option<(u64, u64)> {
+    let content = std::fs::read_to_string(path).ok()?;
     let mut fields = content.split_whitespace();
-    let epoch = fields.next().and_then(|s| s.parse().ok());
-    let height_at_reset = fields.next().and_then(|s| s.parse().ok());
-    match (epoch, height_at_reset) {
-        (Some(e), Some(h)) => (e, h),
-        _ => (0, 0),
+    let epoch = fields.next().and_then(|s| s.parse().ok())?;
+    let height_at_reset = fields.next().and_then(|s| s.parse().ok())?;
+    Some((epoch, height_at_reset))
+}
+
+/// Writes `configs/local/reset-epoch-<env_id>`'s two-field format
+/// (`"{epoch} {height_at_reset}"`), matching `regtest-reset.sh`'s own
+/// format exactly so a later real reset overwrites this file in place.
+///
+/// Used by [`resolve_reset_state`] to lazily establish an initial baseline
+/// (`epoch = 0`, `height_at_reset` = the run's own starting chain height)
+/// the first time an environment is used without ever having gone through
+/// `regtest-reset.sh` — see `read_reset_state`'s doc comment for why `(0,
+/// 0)` is not a safe default to compare against instead.
+pub fn write_reset_state(path: &Path, epoch: u64, height_at_reset: u64) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
     }
+    std::fs::write(path, format!("{epoch} {height_at_reset}\n"))
+}
+
+/// Resolves this run's `(reset_epoch, height_at_reset)` baseline for
+/// `StateFreshness::classify`: reads it from `path` if a prior reset (or an
+/// earlier run's own lazy-init, below) already recorded one, or otherwise
+/// establishes one now at `chain_height_at_start` — this run's own starting
+/// chain height.
+///
+/// The lazy-init path exists because a missing file does not mean "the
+/// chain is at height 0": `regtest-init.sh`'s own NU5/Orchard-activation
+/// mining already advances a freshly bootstrapped environment's chain past
+/// height 0 before any run ever reads `chain_height_at_start`. Comparing
+/// that height against a hardcoded `(0, 0)` would misclassify this
+/// environment's very first run as `Reused` instead of `Fresh`. Writing the
+/// baseline here — once, the first time it's missing — makes this run (and
+/// every subsequent one, until an explicit reset) compare against the
+/// correct reference point instead.
+///
+/// Best-effort: a write failure degrades to using the just-computed
+/// baseline for this run's own classification only (logged, not
+/// propagated) — this is evidence, not a correctness dependency, and a
+/// failed write here does not fail an otherwise-healthy run. The next run
+/// against this same environment simply repeats the same lazy-init.
+pub fn resolve_reset_state(path: &Path, chain_height_at_start: u64) -> (u64, u64) {
+    if let Some(v) = read_reset_state(path) {
+        return v;
+    }
+    if let Err(e) = write_reset_state(path, 0, chain_height_at_start) {
+        tracing::warn!("failed to record initial reset-epoch baseline: {e}");
+    }
+    (0, chain_height_at_start)
 }
 
 pub fn write_manifest(path: &Path, manifest: &RunManifest) -> Result<(), MetricsError> {
@@ -424,22 +473,87 @@ overrides:
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("reset-epoch");
         std::fs::write(&path, "3 12345\n").unwrap();
-        assert_eq!(read_reset_state(&path), (3, 12345));
+        assert_eq!(read_reset_state(&path), Some((3, 12345)));
     }
 
     #[test]
-    fn read_reset_state_defaults_when_file_missing() {
+    fn read_reset_state_none_when_file_missing() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("does-not-exist");
-        assert_eq!(read_reset_state(&path), (0, 0));
+        assert_eq!(read_reset_state(&path), None);
     }
 
     #[test]
-    fn read_reset_state_defaults_when_file_malformed() {
+    fn read_reset_state_none_when_file_malformed() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("reset-epoch");
         std::fs::write(&path, "not-a-number\n").unwrap();
-        assert_eq!(read_reset_state(&path), (0, 0));
+        assert_eq!(read_reset_state(&path), None);
+    }
+
+    #[test]
+    fn write_reset_state_round_trips_through_read_reset_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested").join("reset-epoch-abcd1234");
+        write_reset_state(&path, 0, 2).unwrap();
+        assert_eq!(read_reset_state(&path), Some((0, 2)));
+    }
+
+    #[test]
+    fn write_reset_state_matches_regtest_reset_sh_format() {
+        // regtest-reset.sh writes "printf '%s %s\n' "$NEXT_EPOCH" "$HEIGHT_AT_RESET"`
+        // — both functions must produce byte-identical output for the same
+        // values, since either can be the one that first creates this file.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("reset-epoch");
+        write_reset_state(&path, 4, 2).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "4 2\n");
+    }
+
+    #[test]
+    fn resolve_reset_state_treats_a_bootstrapped_never_reset_environment_as_fresh() {
+        // Regression test for the exact bug this fixes: regtest-init.sh's
+        // own NU5/Orchard-activation mining leaves a freshly bootstrapped
+        // (but never explicitly reset) environment at chain height 2, not
+        // 0, by the time a run reads chain_height_at_start. Comparing that
+        // height against a hardcoded (0, 0) default — instead of lazily
+        // baselining against this run's own starting height — would
+        // misclassify this, the environment's very first run, as Reused.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("reset-epoch-abcd1234");
+        assert_eq!(read_reset_state(&path), None, "no baseline recorded yet");
+
+        let chain_height_at_start = 2;
+        let (reset_epoch, height_at_reset) = resolve_reset_state(&path, chain_height_at_start);
+        assert_eq!(reset_epoch, 0);
+        assert_eq!(height_at_reset, chain_height_at_start);
+        assert_eq!(
+            StateFreshness::classify(chain_height_at_start, height_at_reset),
+            StateFreshness::Fresh
+        );
+        // The baseline must actually persist, so a *second* run against this
+        // same never-reset environment reads it back rather than
+        // re-baselining against its own (now-advanced) height.
+        assert_eq!(read_reset_state(&path), Some((0, chain_height_at_start)));
+    }
+
+    #[test]
+    fn resolve_reset_state_detects_reuse_once_a_baseline_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("reset-epoch-abcd1234");
+        // A prior run already established this baseline (or an explicit
+        // reset recorded it).
+        write_reset_state(&path, 0, 2).unwrap();
+
+        // A later run's chain has advanced past the baseline via load-phase
+        // mining, with no reset in between.
+        let chain_height_at_start = 50;
+        let (reset_epoch, height_at_reset) = resolve_reset_state(&path, chain_height_at_start);
+        assert_eq!((reset_epoch, height_at_reset), (0, 2));
+        assert_eq!(
+            StateFreshness::classify(chain_height_at_start, height_at_reset),
+            StateFreshness::Reused
+        );
     }
 
     #[test]

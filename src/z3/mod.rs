@@ -884,7 +884,13 @@ fn compute_compose_config_hash(json: &str) -> Result<String, Z3Error> {
     })?;
     let mut hasher = Sha256::new();
     hasher.update(normalized.as_bytes());
-    Ok(format!("{:x}", hasher.finalize()))
+    // Matches the "sha256:<hex>" convention every other self-computed hash
+    // field in this codebase uses (scenario_config_hash,
+    // config::validate_scenario) and the manifest schema documented in
+    // docs/architecture/observability.md — a bare hex digest here would be
+    // the one hash field that silently breaks a reader's/tool's
+    // `.starts_with("sha256:")` assumption.
+    Ok(format!("sha256:{:x}", hasher.finalize()))
 }
 
 /// Whether a `docker stats` container name belongs to the given Compose project.
@@ -1743,5 +1749,18 @@ networks:
     fn compose_config_hash_rejects_malformed_json() {
         let err = compute_compose_config_hash("not json").unwrap_err();
         assert!(matches!(err, Z3Error::ComposeCommand { .. }));
+    }
+
+    #[test]
+    fn compose_config_hash_is_sha256_prefixed_like_every_other_manifest_hash_field() {
+        // Matches scenario_config_hash's own "sha256:<hex>" convention (see
+        // scenarios::runner::config's config_hash tests) and
+        // docs/architecture/observability.md's documented schema — a bare
+        // hex digest here would be the one manifest hash field that breaks
+        // a reader's or tool's `.starts_with("sha256:")` assumption.
+        let hash = compute_compose_config_hash(&sample_compose_config("/home/dev/z3")).unwrap();
+        assert!(hash.starts_with("sha256:"), "hash: {hash}");
+        // sha256 hex digest is 64 chars; "sha256:" is 7 chars.
+        assert_eq!(hash.len(), 71, "hash: {hash}");
     }
 }
