@@ -9,7 +9,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::data_model::Phase;
+use crate::data_model::{Phase, RpcCall};
 
 use super::load_curve::load_degradation_candidates;
 use super::loader::RunData;
@@ -141,7 +141,33 @@ fn run_occurrence(runs: &[RunData], method: &str) -> (usize, usize) {
 /// rather than being part of the measured workload — see
 /// docs/rpc/method-scope.md — so a failed `generate` call is excluded here
 /// the same way it is excluded from the stress latency histograms.
+///
+/// Calls matching a `KNOWN_LIMITATIONS` entry (see `known_limitation_findings`)
+/// are excluded from this rate computation entirely — via
+/// `without_known_limitations`, not a post-hoc adjustment to `build_matrix`'s
+/// already-aggregated counts — so a tolerated, already-reported defect never
+/// also inflates a fresh `RpcFailure` finding for the same method. Today's
+/// one entry (`z_listunspent`/`Warmup`) never reaches this function's
+/// Load/Drain-scoped matrix anyway, but a future entry scoped to a workload
+/// phase would, without this filter, be double-reported: once correctly as
+/// `KnownLimitation`, and once incorrectly as a rate-scored `RpcFailure` —
+/// exactly the masking problem this mechanism exists to prevent.
 fn rpc_failure_candidates(runs: &[RunData]) -> Vec<Finding> {
+    rpc_failure_candidates_with_limitations(runs, KNOWN_LIMITATIONS)
+}
+
+/// `rpc_failure_candidates`'s actual logic, taking the known-limitations
+/// table as a parameter so a test can exercise the exclusion mechanism
+/// against a synthetic, workload-phase-scoped entry — proving the general
+/// mechanism, not merely that today's one real entry (`z_listunspent`,
+/// `Warmup`-scoped) happens to never reach this function's Load/Drain
+/// matrix anyway.
+fn rpc_failure_candidates_with_limitations(
+    runs: &[RunData],
+    limitations: &[KnownLimitation],
+) -> Vec<Finding> {
+    let runs = without_known_limitations(runs, limitations);
+    let runs = &runs;
     build_matrix(runs, Phase::is_workload)
         .into_iter()
         .filter(|row| row.category != Category::RegtestControl)
@@ -473,6 +499,22 @@ const KNOWN_LIMITATIONS: &[KnownLimitation] = &[KnownLimitation {
                   see docs/regtest-funding-plan.md",
 }];
 
+/// Whether `call` matches any entry in `limitations` — the shared predicate
+/// behind both `known_limitation_findings` (which reports these calls
+/// explicitly) and `without_known_limitations` (which excludes them from
+/// ordinary rate-based scoring), so the two can never drift apart on what
+/// counts as "this known defect."
+fn matches_known_limitation(call: &RpcCall, limitations: &[KnownLimitation]) -> bool {
+    limitations.iter().any(|limitation| {
+        call.method == limitation.method
+            && call.phase == limitation.phase
+            && call
+                .error_message
+                .as_deref()
+                .is_some_and(|msg| msg.contains(limitation.error_substring))
+    })
+}
+
 /// Flags every `KNOWN_LIMITATIONS` entry actually observed in the provided
 /// runs as a `Low`-severity `KnownLimitation` finding, so the defect is
 /// surfaced explicitly rather than silently absent from the report — never
@@ -518,6 +560,29 @@ fn known_limitation_findings(runs: &[RunData]) -> Vec<Finding> {
                 )],
                 context: None,
             })
+        })
+        .collect()
+}
+
+/// A copy of `runs` with every `RpcCall` matching a `KNOWN_LIMITATIONS`
+/// entry (see `matches_known_limitation`) removed from `rpc_calls`, for
+/// `rpc_failure_candidates` to build its matrix from instead of the raw
+/// runs — so a known, already-reported defect is excluded from the rate
+/// computation entirely (never counted toward either the numerator or the
+/// denominator), not merely prevented from being scored High. A per-row,
+/// post-hoc adjustment to `build_matrix`'s already-aggregated counts isn't
+/// used here: `MatrixRow` deduplicates intent-linked retries to one
+/// representative call per intent, so reconstructing the correct
+/// pre-exclusion counts from the aggregate alone would require
+/// re-implementing that same dedup logic. Filtering the raw calls before
+/// they ever reach `build_matrix` reuses it unmodified instead.
+fn without_known_limitations(runs: &[RunData], limitations: &[KnownLimitation]) -> Vec<RunData> {
+    runs.iter()
+        .map(|run| {
+            let mut run = run.clone();
+            run.rpc_calls
+                .retain(|call| !matches_known_limitation(call, limitations));
+            run
         })
         .collect()
 }
@@ -792,6 +857,71 @@ mod tests {
             .iter()
             .any(|f| f.category == FindingCategory::RpcFailure
                 && f.summary.contains("z_listunspent")));
+    }
+
+    #[test]
+    fn rpc_failure_candidates_excludes_a_workload_phase_known_limitation_from_scoring() {
+        // Regression test for the double-reporting bug this filter exists to
+        // prevent: today's one real KNOWN_LIMITATIONS entry is Warmup-scoped,
+        // so it never reaches this function's Load/Drain-scoped matrix
+        // regardless of this filter — that would make the fix look correct
+        // by coincidence, not by design. A synthetic, Load-scoped entry
+        // proves the mechanism actually generalizes: without the filter, a
+        // future workload-phase entry would be reported twice (once as
+        // KnownLimitation, once as a rate-scored RpcFailure) for the exact
+        // same calls.
+        let synthetic_limitations = [KnownLimitation {
+            method: "z_sendmany",
+            phase: Phase::Load,
+            error_substring: "synthetic known defect",
+            explanation: "test-only entry, not a real limitation",
+        }];
+        let r = run(
+            "r1",
+            vec![call_with_phase_and_error(
+                "z_sendmany",
+                Phase::Load,
+                "synthetic known defect: something",
+            )],
+            vec![],
+        );
+        let findings = rpc_failure_candidates_with_limitations(&[r], &synthetic_limitations);
+        assert!(
+            findings.is_empty(),
+            "a call matching a workload-phase known limitation must not also \
+             surface as a rate-scored RpcFailure finding: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn rpc_failure_candidates_still_scores_workload_phase_failures_that_do_not_match_any_limitation(
+    ) {
+        // Companion regression guard: the exclusion mechanism must not
+        // become a blanket "ignore this method" filter — a failure that
+        // doesn't match any known-limitation entry (different error, here)
+        // must still flow into ordinary rate-based scoring.
+        let synthetic_limitations = [KnownLimitation {
+            method: "z_sendmany",
+            phase: Phase::Load,
+            error_substring: "synthetic known defect",
+            explanation: "test-only entry, not a real limitation",
+        }];
+        let r = run(
+            "r1",
+            vec![call_with_phase_and_error(
+                "z_sendmany",
+                Phase::Load,
+                "an unrelated failure",
+            )],
+            vec![],
+        );
+        let findings = rpc_failure_candidates_with_limitations(&[r], &synthetic_limitations);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.category == FindingCategory::RpcFailure
+                    && f.summary.contains("z_sendmany"))
+        );
     }
 
     #[test]

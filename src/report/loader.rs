@@ -18,7 +18,12 @@ use super::error::ReportError;
 /// logs. `parse_warnings` records lines that failed to deserialize (skipped,
 /// not fatal to the load) so the report can surface incomplete evidence
 /// explicitly rather than silently under-counting.
-#[derive(Debug)]
+///
+/// `Clone` so callers (e.g. `findings::rpc_failure_candidates`) can build a
+/// filtered copy — with specific `rpc_calls` entries removed — to feed
+/// through the same aggregation (`build_matrix`) used everywhere else,
+/// rather than hand-duplicating its counting semantics.
+#[derive(Debug, Clone)]
 pub struct RunData {
     pub run_dir: PathBuf,
     pub manifest: RunManifest,

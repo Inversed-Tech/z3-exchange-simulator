@@ -151,26 +151,6 @@ fn render_executive_summary(runs: &[RunData], findings: &[Finding], md: &mut Str
     md.push('\n');
 
     md.push_str("### 4. Intent-level failures\n\n");
-    let all_intents: Vec<IntentRecord> = runs
-        .iter()
-        .flat_map(|r| r.intents.iter().cloned())
-        .collect();
-    let failures_by_class = terminal_failures_by_class(&all_intents);
-    let total_terminal_failures: u64 = failures_by_class.values().sum();
-    if total_terminal_failures == 0 {
-        md.push_str("- No terminal failures recorded.\n\n");
-    } else {
-        let mut parts: Vec<String> = failures_by_class
-            .iter()
-            .map(|(class, count)| format!("{count} {}", class.as_str()))
-            .collect();
-        parts.sort();
-        md.push_str(&format!(
-            "- **{total_terminal_failures} terminal failure(s)** — {}\n\n",
-            parts.join(", ")
-        ));
-    }
-
     let attempted: usize = runs.iter().map(|r| r.intents.len()).sum();
     let confirmed: usize = runs
         .iter()
@@ -192,12 +172,32 @@ fn render_executive_summary(runs: &[RunData], findings: &[Finding], md: &mut Str
     } else {
         0.0
     };
-
-    md.push_str("### 5. Actionable findings\n\n");
     md.push_str(&format!(
         "- **Intents attempted:** {attempted} — **confirmed {confirmed} ({confirmed_pct:.0}%)**, \
          failed {failed}, timed out {timed_out}\n"
     ));
+
+    let all_intents: Vec<IntentRecord> = runs
+        .iter()
+        .flat_map(|r| r.intents.iter().cloned())
+        .collect();
+    let failures_by_class = terminal_failures_by_class(&all_intents);
+    let total_terminal_failures: u64 = failures_by_class.values().sum();
+    if total_terminal_failures == 0 {
+        md.push_str("- No terminal failures recorded.\n\n");
+    } else {
+        let mut parts: Vec<String> = failures_by_class
+            .iter()
+            .map(|(class, count)| format!("{count} {}", class.as_str()))
+            .collect();
+        parts.sort();
+        md.push_str(&format!(
+            "- **{total_terminal_failures} terminal failure(s)** — {}\n\n",
+            parts.join(", ")
+        ));
+    }
+
+    md.push_str("### 5. Actionable findings\n\n");
 
     let high = findings
         .iter()
@@ -1530,6 +1530,31 @@ mod tests {
             );
             last_pos = pos;
         }
+    }
+
+    #[test]
+    fn intents_attempted_line_is_filed_under_intent_level_failures_not_actionable_findings() {
+        // Regression test for a report-structure bug: "Intents attempted"
+        // is a workload-count line, not a finding, and must appear between
+        // the "4. Intent-level failures" and "5. Actionable findings"
+        // headers — not after the latter, where it would open the
+        // "Actionable findings" section with content that isn't a finding
+        // at all.
+        let md = render_report(&[sample_run()]);
+        let item4 = md.find("### 4. Intent-level failures").unwrap();
+        let item5 = md.find("### 5. Actionable findings").unwrap();
+        let between = &md[item4..item5];
+        assert!(
+            between.contains("Intents attempted:"),
+            "expected \"Intents attempted\" between items 4 and 5:\n{between}"
+        );
+        let after_item5 = &md[item5..];
+        let candidate_findings_heading = after_item5.find("## Candidate findings").unwrap();
+        assert!(
+            !after_item5[..candidate_findings_heading].contains("Intents attempted:"),
+            "\"Intents attempted\" must not appear inside \"5. Actionable findings\":\n{}",
+            &after_item5[..candidate_findings_heading]
+        );
     }
 
     #[test]
