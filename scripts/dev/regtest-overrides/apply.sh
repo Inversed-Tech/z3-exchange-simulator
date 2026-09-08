@@ -121,7 +121,10 @@ fi
 PLACEHOLDER="__GENERATED_BY_INIT_SH__"
 if grep -q "pwhash = \"${PLACEHOLDER}\"" "$ZALLET_TOML"; then
     command -v openssl > /dev/null 2>&1 || die "openssl is required to generate the zallet RPC pwhash"
-    RPC_PASSWORD="$(grep -E '^Z3_REGTEST_RPC_ROUTER_PASSWORD=' "$ENV_FILE" | cut -d= -f2)"
+    # `|| true`: the shipped .env.regtest has no Z3_REGTEST_RPC_ROUTER_PASSWORD
+    # line at all — under `set -euo pipefail` a bare failing grep would abort
+    # the script before the default below can apply.
+    RPC_PASSWORD="$(grep -E '^Z3_REGTEST_RPC_ROUTER_PASSWORD=' "$ENV_FILE" | cut -d= -f2 || true)"
     RPC_PASSWORD="${RPC_PASSWORD:-zebra}"
     SALT="$(openssl rand -hex 16)"
     HASH="$(printf '%s' "$RPC_PASSWORD" | openssl dgst -sha256 -mac HMAC -macopt "key:$SALT" | awk '{print $NF}')"
