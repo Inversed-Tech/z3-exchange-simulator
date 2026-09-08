@@ -181,6 +181,22 @@ else
     printf 'COMPOSE_PROJECT_NAME=%s\n' "$COMPOSE_PROJECT_NAME" >> "$ENV_FILE"
 fi
 
+# The wipe above destroyed the wallet whose hot_wallet UA .env.regtest points
+# Zebra's coinbase at, but the file still carries that address. Restore the
+# shipped placeholder before re-initializing, for two reasons: regtest-init.sh
+# mines its first 2 blocks below NU5 activation, where an Orchard UA makes
+# Zebra's `generate` panic ("Cannot create Orchard transactions … before NU5
+# activation"); and regtest-miner-setup.sh's placeholder gate must see the
+# placeholder or it will skip re-deriving the address from the NEW wallet,
+# leaving coinbase pointed at an account that no longer exists. Same literal
+# as regtest-miner-setup.sh's PLACEHOLDER (the value the pinned stack ships).
+MINER_PLACEHOLDER="tmSRd1r8gs77Ja67Fw1JcdoXytxsyrLTPJm"
+if grep -q '^ZEBRA_MINING__MINER_ADDRESS=' "$ENV_FILE"; then
+    sed -i.bak "s|^ZEBRA_MINING__MINER_ADDRESS=.*|ZEBRA_MINING__MINER_ADDRESS=${MINER_PLACEHOLDER}|" "$ENV_FILE"
+    rm -f "${ENV_FILE}.bak"
+    log "==> Restored the placeholder miner address for re-initialization."
+fi
+
 log "==> Re-initializing the regtest wallet from scratch..."
 (cd "$Z3_DIR" && ./scripts/regtest-init.sh)
 

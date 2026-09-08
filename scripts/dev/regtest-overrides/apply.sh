@@ -187,6 +187,28 @@ fi
 cp "$SCRIPT_DIR/docker-compose.regtest.override.yml" "$Z3_DIR/docker-compose.regtest.override.yml"
 log "==> Copied docker-compose.regtest.override.yml into $Z3_DIR."
 
+# 6. regtest-init.sh: make its wallet-db cleanup conditional. The pinned
+# script deletes /data/wallet.db (and .lock) unconditionally, BEFORE its own
+# already-initialized (*.age) check — it was written for one-time setup. But
+# `z3sim run` re-runs it on every invocation (Z3Config::ensure_wallet_bootstrapped),
+# and re-running it against an initialized wallet destroys the account table:
+# Zallet regenerates an empty wallet.db from the mnemonic, the hot_wallet
+# account record is gone, regtest-miner-setup.sh's placeholder gate then skips
+# re-creating it, and Zebra keeps mining to an address no account owns — every
+# scenario dies in warmup with "hot wallet has 0 balance". Gate the deletion
+# on the same *.age marker the script's own ALREADY_INIT check uses.
+INIT_SH="$Z3_DIR/scripts/regtest-init.sh"
+if grep -qF "ls /data/*.age > /dev/null 2>&1 || rm -f" "$INIT_SH"; then
+    log "==> regtest-init.sh: wallet-db cleanup already conditional."
+else
+    grep -qF "sh -c 'rm -f /data/.lock /data/wallet.db'" "$INIT_SH" \
+        || die "regtest-init.sh cleanup line not found — the pinned script changed; update apply.sh step 6"
+    sed -i "s@sh -c 'rm -f /data/.lock /data/wallet.db'@sh -c 'ls /data/*.age > /dev/null 2>\&1 || rm -f /data/.lock /data/wallet.db'@" "$INIT_SH"
+    grep -qF "ls /data/*.age > /dev/null 2>&1 || rm -f" "$INIT_SH" \
+        || die "failed to patch regtest-init.sh's cleanup line"
+    log "==> regtest-init.sh: wallet-db cleanup now skipped once the wallet is initialized."
+fi
+
 log ""
 log "Override set applied. Next steps:"
 log "  bash scripts/dev/zallet-release-image/build.sh ${ZALLET_VERSION}"
