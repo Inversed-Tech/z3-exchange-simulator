@@ -84,6 +84,79 @@ image via `scripts/dev/zallet-release-image/build.sh`, apply the
    artifacts for attribution).
 3. Any deviation from this spec (machine type, OS image, package set).
 
+## Operating the machine (driving session workflow)
+
+### SSH alias
+
+The driving session's `~/.ssh/config` entry (keypair at `~/.ssh/z3sim_gcp`,
+public key in instance metadata for `z3sim`):
+
+```ssh-config
+Host z3sim-gcp
+    HostName 34.156.25.159
+    User z3sim
+    IdentityFile ~/.ssh/z3sim_gcp
+    ServerAliveInterval 30
+```
+
+After that, everything is `ssh z3sim-gcp '<command>'` or an interactive login.
+Note the run user `z3sim` is **uid 1001** (GCP's default `ubuntu` account
+claimed 1000) — the uid-sensitive fixes in
+`scripts/dev/regtest-overrides/` exist for exactly this.
+
+### Setup + run commands
+
+The repo lives at `~/z3-exchange-simulator` on the VM (public repo, plain
+https clone). Fresh setup and a scenario run:
+
+```sh
+cd ~/z3-exchange-simulator
+git fetch && git checkout <branch> && git pull --ff-only
+export PATH="$HOME/.cargo/bin:$PATH"   # rustup installs per-user; non-login
+                                       # shells (tmux, ssh command mode) miss it
+make clone-z3 && make bootstrap        # idempotent; safe to re-run
+./target/debug/z3sim run --scenario configs/scenarios/smoke.yaml
+make regtest-reset                     # between runs that reuse the wallet
+```
+
+Run outputs land in `experiments/runs/<run-id>/`; pull them back with
+`scp -r z3sim-gcp:z3-exchange-simulator/experiments/runs/<run-id> …`.
+
+### Long runs: use tmux
+
+Multi-scenario sequences take hours — never run them on a bare SSH
+connection. Launch inside tmux (installed) so the run survives disconnects
+and stays attachable:
+
+```sh
+tmux new-session -d -s z3runs 'bash ~/run-scenarios.sh'  # detached launch
+tmux attach -t z3runs                                    # watch live (Ctrl-b d to detach)
+tmux capture-pane -t z3runs -p | tail -20                # peek without attaching
+```
+
+Two gotchas, both hit in practice: tmux starts a **non-login shell**, so
+export `~/.cargo/bin` onto PATH inside the script itself; and have the script
+tee everything to log files (e.g. `~/scenario-runs-<stamp>/`) so tmux is only
+the supervisor, never the record. Plain `nohup` also survives disconnects but
+gives up interactive attach; containerizing the driver adds nothing since it
+orchestrates `docker compose` itself.
+
+### Stale state warning
+
+`.env.regtest` inside `external/z3` persists values across environments —
+including `ZEBRA_MINING__MINER_ADDRESS`, which a previous environment's
+miner-setup pointed at *its* wallet's Orchard UA. A brand-new Compose
+project reusing that file panics Zebra's `generate` at heights < NU5
+("Cannot create Orchard transactions … before NU5 activation") and, past
+init, would mine rewards to an address the new wallet does not control.
+When in doubt, wipe `external/z3` (a throwaway pinned clone) and re-run
+`make clone-z3 && make bootstrap`.
+
+### Cost
+
+The instance is on-demand (~$0.7/h): **stop it when idle**. The static IP
+and all disk state survive stop/start.
+
 ## Reproducibility notes for run attribution
 
 - Record in each run's artifacts: machine type, CPU platform
