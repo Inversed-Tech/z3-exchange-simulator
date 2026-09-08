@@ -187,26 +187,34 @@ fi
 cp "$SCRIPT_DIR/docker-compose.regtest.override.yml" "$Z3_DIR/docker-compose.regtest.override.yml"
 log "==> Copied docker-compose.regtest.override.yml into $Z3_DIR."
 
-# 6. regtest-init.sh: make its wallet-db cleanup conditional. The pinned
-# script deletes /data/wallet.db (and .lock) unconditionally, BEFORE its own
-# already-initialized (*.age) check — it was written for one-time setup. But
-# `z3sim run` re-runs it on every invocation (Z3Config::ensure_wallet_bootstrapped),
-# and re-running it against an initialized wallet destroys the account table:
-# Zallet regenerates an empty wallet.db from the mnemonic, the hot_wallet
-# account record is gone, regtest-miner-setup.sh's placeholder gate then skips
-# re-creating it, and Zebra keeps mining to an address no account owns — every
-# scenario dies in warmup with "hot wallet has 0 balance". Gate the deletion
-# on the same *.age marker the script's own ALREADY_INIT check uses.
+# 6. regtest-init.sh: fix its broken idempotence against Zallet >= beta. The
+# pinned script (written for alpha.3) treats a `/data/*.age` file as the
+# already-initialized marker — but beta Zallet stores the encrypted mnemonic
+# INSIDE wallet.db, so no .age file ever exists, ALREADY_INIT is always 0,
+# and every invocation takes the full path: delete wallet.db, re-run
+# init-wallet-encryption + generate-mnemonic — a brand-new wallet, all
+# accounts destroyed. `z3sim run` re-runs this script on every invocation
+# (Z3Config::ensure_wallet_bootstrapped), so the hot_wallet account that
+# regtest-miner-setup.sh created is gone by the time the runner looks for it,
+# and Zebra keeps mining to the dead account's UA — every scenario dies in
+# warmup with "hot wallet has 0 balance". Use wallet.db itself as the marker
+# for both the cleanup and the ALREADY_INIT check. (Trade-off: an init
+# interrupted between wallet creation and mnemonic generation now needs a
+# `make regtest-reset` to recover instead of a bare re-run — the reset path
+# wipes the volume, so the marker is gone and init runs in full.)
 INIT_SH="$Z3_DIR/scripts/regtest-init.sh"
-if grep -qF "ls /data/*.age > /dev/null 2>&1 || rm -f" "$INIT_SH"; then
-    log "==> regtest-init.sh: wallet-db cleanup already conditional."
+if grep -qF "test -s /data/wallet.db || rm -f" "$INIT_SH"; then
+    log "==> regtest-init.sh: wallet.db-marker idempotence already patched."
 else
     grep -qF "sh -c 'rm -f /data/.lock /data/wallet.db'" "$INIT_SH" \
         || die "regtest-init.sh cleanup line not found — the pinned script changed; update apply.sh step 6"
-    sed -i "s@sh -c 'rm -f /data/.lock /data/wallet.db'@sh -c 'ls /data/*.age > /dev/null 2>\&1 || rm -f /data/.lock /data/wallet.db'@" "$INIT_SH"
-    grep -qF "ls /data/*.age > /dev/null 2>&1 || rm -f" "$INIT_SH" \
-        || die "failed to patch regtest-init.sh's cleanup line"
-    log "==> regtest-init.sh: wallet-db cleanup now skipped once the wallet is initialized."
+    grep -qF "sh -c 'ls /data/*.age 2>/dev/null | wc -l')" "$INIT_SH" \
+        || die "regtest-init.sh ALREADY_INIT line not found — the pinned script changed; update apply.sh step 6"
+    sed -i "s@sh -c 'rm -f /data/.lock /data/wallet.db'@sh -c 'test -s /data/wallet.db || rm -f /data/.lock /data/wallet.db'@" "$INIT_SH"
+    sed -i "s@sh -c 'ls /data/\*.age 2>/dev/null | wc -l')@sh -c 'test -s /data/wallet.db \&\& echo 1 || echo 0')@" "$INIT_SH"
+    grep -qF "test -s /data/wallet.db && echo 1 || echo 0" "$INIT_SH" \
+        || die "failed to patch regtest-init.sh's ALREADY_INIT check"
+    log "==> regtest-init.sh: idempotence marker switched from *.age to wallet.db."
 fi
 
 log ""
