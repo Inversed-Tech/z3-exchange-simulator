@@ -45,6 +45,16 @@ pub struct RunManifest {
     /// reached this point (setup failed) or predates this field.
     #[serde(default)]
     pub load_and_drain_completed_at: Option<DateTime<Utc>>,
+    /// This run's `z3::env_id` — the identity behind its isolated Compose
+    /// project, network, volumes, ports, and subnet (see `z3::env_id`).
+    /// Ties a manifest back to the specific isolated environment that
+    /// produced it, which matters once more than one is running on a host
+    /// (see `z3::env_id::compose_project_for_env` to recover the exact
+    /// Compose project name, e.g. `z3-sim-<env_id>`). Empty on manifests
+    /// written before this field existed, or when setup failed before an
+    /// environment id was resolved.
+    #[serde(default)]
+    pub env_id: String,
     /// SHA-256 hex digest of this run's effective `docker compose config`
     /// (images, env vars, ports, network layout, container-side paths),
     /// with checkout-location-dependent bind-mount source paths stripped
@@ -312,6 +322,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("manifest.json");
         let m = RunManifest {
+            env_id: "a1b2c3d4".into(),
             run_id: "20260610T000000Z-smoke".into(),
             run_started_at: Utc::now(),
             run_completed_at: None,
@@ -337,6 +348,41 @@ mod tests {
         assert_eq!(back.run_id, m.run_id);
         assert_eq!(back.zebra_commit, "zebra-sha");
         assert!(back.run_completed_at.is_none());
+        assert_eq!(back.env_id, "a1b2c3d4");
+    }
+
+    #[test]
+    fn read_manifest_without_env_id_field_defaults_to_empty() {
+        // Backward compatibility: a manifest written before this field
+        // existed must still deserialize, with env_id defaulting to "" —
+        // same contract as every other #[serde(default)] field here.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("manifest.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "run_id": "20260610T000000Z-smoke",
+                "run_started_at": "2026-06-10T00:00:00Z",
+                "run_completed_at": null,
+                "simulator_commit": "abc123",
+                "zebra_commit": "zebra-sha",
+                "zaino_commit": "zaino-sha",
+                "zallet_commit": "zallet-sha",
+                "scenario_name": "smoke",
+                "scenario_config_hash": "sha256:deadbeef",
+                "target_tps": 10.0,
+                "timeouts": {
+                    "rpc_timeout_ms": 0,
+                    "operation_poll_interval_ms": 0,
+                    "max_operation_wait_ms": 0,
+                    "confirmation_poll_interval_ms": 0,
+                    "max_confirmation_wait_ms": 0
+                }
+            }"#,
+        )
+        .unwrap();
+        let back = read_manifest(&path).unwrap();
+        assert_eq!(back.env_id, "");
     }
 
     #[test]
@@ -429,6 +475,7 @@ overrides:
         write_manifest(
             &path,
             &RunManifest {
+                env_id: String::new(),
                 run_id: "test".into(),
                 run_started_at: Utc::now(),
                 run_completed_at: None,
@@ -562,6 +609,7 @@ overrides:
         let path = dir.path().join("manifest.json");
         let started = Utc::now();
         let mut m = RunManifest {
+            env_id: String::new(),
             run_id: "phase-test".into(),
             run_started_at: started,
             run_completed_at: None,
@@ -603,6 +651,7 @@ overrides:
         let path = dir.path().join("manifest.json");
         let completed = Utc::now();
         let m = RunManifest {
+            env_id: String::new(),
             run_id: "complete-test".into(),
             run_started_at: Utc::now(),
             run_completed_at: Some(completed),

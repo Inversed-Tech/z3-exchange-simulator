@@ -614,6 +614,7 @@ mod tests {
 
     fn base_manifest(run_id: &str) -> RunManifest {
         RunManifest {
+            env_id: String::new(),
             run_id: run_id.into(),
             run_started_at: Utc::now(),
             run_completed_at: Some(Utc::now()),

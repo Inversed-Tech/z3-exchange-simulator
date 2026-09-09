@@ -121,6 +121,7 @@ mod tests {
 
     fn write_run(dir: &Path, corrupt_intents_line: bool) {
         let manifest = RunManifest {
+            env_id: String::new(),
             run_id: "test-run".into(),
             run_started_at: Utc::now(),
             run_completed_at: Some(Utc::now()),

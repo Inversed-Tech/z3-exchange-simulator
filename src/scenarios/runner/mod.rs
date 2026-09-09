@@ -307,6 +307,7 @@ pub async fn run(scenario: ScenarioConfig, opts: RunOptions) -> Result<RunResult
         },
         phase_boundaries: Vec::new(),
         load_and_drain_completed_at: None,
+        env_id: String::new(),
         compose_config_hash: String::new(),
         image_digests: Vec::new(),
         host_cpu_count: host_cpu_count(),
@@ -385,6 +386,7 @@ pub async fn run(scenario: ScenarioConfig, opts: RunOptions) -> Result<RunResult
     // into `teardown` below. These are evidence fields, not correctness
     // dependencies — a failure degrades to an empty/default value with a
     // warning rather than failing an otherwise-successful run.
+    manifest.env_id = resolved_env_id.clone();
     manifest.image_digests = match stack.image_digests().await {
         Ok(v) => v,
         Err(e) => {

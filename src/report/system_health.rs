@@ -174,6 +174,7 @@ mod tests {
         RunData {
             run_dir: "/tmp/r".into(),
             manifest: RunManifest {
+                env_id: String::new(),
                 run_id: "r".into(),
                 run_started_at: Utc::now(),
                 run_completed_at: Some(Utc::now()),

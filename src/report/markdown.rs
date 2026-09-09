@@ -10,6 +10,7 @@ use std::path::Path;
 use crate::data_model::{IntentRecord, Phase, RpcCall};
 use crate::metrics::StateFreshness;
 use crate::scenarios::runner::result::terminal_failures_by_class;
+use crate::z3::env_id::compose_project_for_env;
 
 use super::charts::{render_latency_chart, render_tps_chart};
 use super::findings::{
@@ -146,7 +147,20 @@ fn render_executive_summary(runs: &[RunData], findings: &[Finding], md: &mut Str
                 s.reset_epoch, s.chain_height_at_start
             ),
         };
-        md.push_str(&format!("- **{}**: {desc}\n", run.manifest.run_id));
+        let env_desc = if run.manifest.env_id.is_empty() {
+            "no environment id recorded (predates this field, or setup failed \
+             before one was resolved)"
+                .to_string()
+        } else {
+            format!(
+                "environment {}",
+                compose_project_for_env(&run.manifest.env_id)
+            )
+        };
+        md.push_str(&format!(
+            "- **{}**: {desc} — {env_desc}\n",
+            run.manifest.run_id
+        ));
     }
     md.push('\n');
 
@@ -1160,6 +1174,7 @@ mod tests {
         RunData {
             run_dir: "/tmp/r1".into(),
             manifest: RunManifest {
+                env_id: String::new(),
                 run_id: "20260803T084825Z-smoke".into(),
                 run_started_at: Utc::now(),
                 run_completed_at: Some(Utc::now()),
@@ -1575,11 +1590,15 @@ mod tests {
             hot_wallet_balance_at_start_zat: 0,
             freshness: crate::metrics::StateFreshness::Reused,
         };
+        run.manifest.env_id = "a1b2c3d4".into();
         let md = render_report(&[run]);
         assert!(md.contains("FAIL"));
         assert!(md.contains("confirmed 1 < min_confirmed 2"));
         assert!(md.contains("zfnd/zebra:6.0.0"));
         assert!(md.contains("reused (reset epoch 3, chain height 42)"));
+        // Ties the manifest back to the specific isolated Track-2
+        // environment that produced it (FINDING-5).
+        assert!(md.contains("environment z3-sim-a1b2c3d4"));
         // sample_run() carries exactly one failed intent, classified
         // InsufficientBalance.
         assert!(md.contains("**1 terminal failure(s)** — 1 insufficient_balance"));

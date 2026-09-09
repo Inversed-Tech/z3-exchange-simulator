@@ -456,6 +456,7 @@ mod tests {
         std::fs::write(rd.metrics_path(), "").unwrap();
 
         let manifest = RunManifest {
+            env_id: String::new(),
             run_id: rd.run_id.clone(),
             run_started_at: Utc::now(),
             run_completed_at: Some(Utc::now()),
@@ -536,6 +537,7 @@ mod tests {
         });
 
         let manifest = RunManifest {
+            env_id: String::new(),
             run_id: rd.run_id.clone(),
             run_started_at: Utc::now(),
             run_completed_at: Some(Utc::now()),
@@ -580,6 +582,7 @@ mod tests {
         std::fs::write(rd.rpc_calls_path(), "").unwrap();
         std::fs::write(rd.metrics_path(), "").unwrap();
         let manifest = RunManifest {
+            env_id: String::new(),
             run_id: rd.run_id.clone(),
             run_started_at: Utc::now(),
             run_completed_at: None,
@@ -616,6 +619,7 @@ mod tests {
         .unwrap();
         std::fs::write(rd.metrics_path(), "").unwrap();
         let manifest = RunManifest {
+            env_id: String::new(),
             run_id: rd.run_id.clone(),
             run_started_at: Utc::now(),
             run_completed_at: None,
@@ -648,6 +652,7 @@ mod tests {
         std::fs::write(rd.rpc_calls_path(), "").unwrap();
         std::fs::write(rd.metrics_path(), "").unwrap();
         let manifest = RunManifest {
+            env_id: String::new(),
             run_id: rd.run_id.clone(),
             run_started_at: Utc::now(),
             run_completed_at: None,
@@ -695,6 +700,7 @@ mod tests {
         drop(mwriter);
 
         let manifest = RunManifest {
+            env_id: String::new(),
             run_id: rd.run_id.clone(),
             run_started_at: Utc::now(),
             run_completed_at: Some(Utc::now()),
@@ -768,6 +774,7 @@ mod tests {
         drop(mwriter);
 
         let manifest = RunManifest {
+            env_id: String::new(),
             run_id: rd.run_id.clone(),
             run_started_at: Utc::now(),
             run_completed_at: Some(Utc::now()),
@@ -827,6 +834,7 @@ mod tests {
         drop(rwriter);
 
         let manifest = RunManifest {
+            env_id: String::new(),
             run_id: rd.run_id.clone(),
             run_started_at: Utc::now(),
             run_completed_at: Some(Utc::now()),
@@ -902,6 +910,7 @@ mod tests {
         std::fs::write(rd.metrics_path(), "").unwrap();
 
         let manifest = RunManifest {
+            env_id: String::new(),
             run_id: rd.run_id.clone(),
             run_started_at: Utc::now(),
             run_completed_at: Some(Utc::now()),
@@ -986,6 +995,7 @@ mod tests {
         drop(iwriter);
 
         let manifest = RunManifest {
+            env_id: String::new(),
             run_id: rd.run_id.clone(),
             run_started_at: Utc::now(),
             run_completed_at: Some(Utc::now()),
@@ -1031,6 +1041,7 @@ mod tests {
         std::fs::write(rd.rpc_calls_path(), "").unwrap();
         std::fs::write(rd.metrics_path(), "").unwrap();
         let manifest = RunManifest {
+            env_id: String::new(),
             run_id: rd.run_id.clone(),
             run_started_at: Utc::now(),
             run_completed_at: Some(Utc::now()),
@@ -1067,6 +1078,7 @@ mod tests {
         // Deliberately do NOT create rpc_calls.jsonl.
         std::fs::write(rd.metrics_path(), "").unwrap();
         let manifest = RunManifest {
+            env_id: String::new(),
             run_id: rd.run_id.clone(),
             run_started_at: Utc::now(),
             run_completed_at: Some(Utc::now()),
@@ -1103,6 +1115,7 @@ mod tests {
         std::fs::write(rd.rpc_calls_path(), "").unwrap();
         std::fs::write(rd.metrics_path(), "").unwrap();
         let manifest = RunManifest {
+            env_id: String::new(),
             run_id: rd.run_id.clone(),
             run_started_at: Utc::now(),
             run_completed_at: Some(Utc::now()),
