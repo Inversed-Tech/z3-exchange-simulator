@@ -157,6 +157,61 @@ When in doubt, wipe `external/z3` (a throwaway pinned clone) and re-run
 The instance is on-demand (~$0.7/h): **stop it when idle**. The static IP
 and all disk state survive stop/start.
 
+## Baseline benchmarks (2026-09-09, machine idle)
+
+Standard, quick synthetic benchmarks recorded once so a future rerun can
+detect a changed machine type, CPU platform, noisy neighbour, or disk
+regression before blaming the stack. Re-run the exact commands below on an
+idle VM (no containers, load ≈ 0) and compare; deviations of more than ~10 %
+on CPU/RAM or a different plateau on disk mean the numbers are not comparable.
+
+Environment at the time of the run: `c3d-standard-16` in `europe-west1-b`,
+AMD EPYC 9B14, Ubuntu 24.04.4 LTS, kernel `6.17.0-1022-gcp`, 200 GB pd-ssd
+(`PERSISTENT-SSD`, NVMe interface, `mq-deadline` scheduler), sysbench 1.0.20,
+fio 3.36. Install with `sudo apt-get install -y sysbench fio`.
+
+### CPU — `sysbench cpu --cpu-max-prime=20000 --time=20`
+
+| Threads | events/s | avg latency (ms) | 95th (ms) |
+|---|---|---|---|
+| 1 | 1522 | 0.66 | 0.67 |
+| 16 | 13456 | 1.19 | 1.21 |
+
+16-thread scaling is 8.8× single-thread, consistent with 8 physical cores ×
+2 SMT threads: halo2 proving should not expect a 16× speed-up from rayon.
+
+### RAM — `sysbench memory --memory-block-size=1M`
+
+| Test | Threads | Throughput |
+|---|---|---|
+| write (`--memory-total-size=100G`) | 1 | 29.3 GiB/s |
+| write (`--memory-total-size=400G`) | 16 | 68.1 GiB/s |
+| read (`--memory-total-size=400G`) | 16 | 445 GiB/s (cache-resident; sanity check only) |
+
+### Disk — `fio --direct=1 --ioengine=libaio --size=4G --runtime=20 --time_based` on `/`
+
+| Test | bs | jobs × iodepth | IOPS | Bandwidth | avg lat | p99 lat |
+|---|---|---|---|---|---|---|
+| seq write | 1M | 1 × 16 | 336 | 336 MiB/s | 47 ms | 50 ms |
+| seq read | 1M | 1 × 16 | 336 | 336 MiB/s | 47 ms | 48 ms |
+| rand write | 4k | 4 × 32 | 13 044 | 50 MiB/s | 9.8 ms | 11.1 ms |
+| rand read | 4k | 4 × 32 | 12 190 | 47 MiB/s | 10.5 ms | 10.9 ms |
+
+The identical read/write figures and flat, high latencies show the disk is
+sitting at its **provisioned pd-ssd throttle**, not a media limit. Expect
+~340 MiB/s sequential and ~12–13k random 4k IOPS regardless of queue depth;
+a larger disk or hyperdisk-balanced would move these, a CPU change would not.
+Zebra/Zallet state on regtest is small, so this is unlikely to be a
+bottleneck, but it explains any fsync-heavy stalls if they appear.
+
+Exact fio invocation used (one line per test, `RW/BS/JOBS/QD` from the table):
+
+```sh
+fio --name=t --filename=~/fio-test.bin --size=4G --direct=1 --ioengine=libaio \
+    --runtime=20 --time_based --group_reporting --rw=RW --bs=BS --numjobs=JOBS --iodepth=QD
+rm ~/fio-test.bin
+```
+
 ## Reproducibility notes for run attribution
 
 - Record in each run's artifacts: machine type, CPU platform
