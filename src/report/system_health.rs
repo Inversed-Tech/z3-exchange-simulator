@@ -36,10 +36,16 @@ pub struct ProvingTimeStats {
 
 #[derive(Debug, Clone, Default)]
 pub struct SystemHealth {
-    /// From the `tps_achieved` metric — the simulator's own run-average
-    /// throughput figure. Distinct from (and a useful cross-check against)
-    /// this report's own per-window TPS curve in `load_curve.rs`.
-    pub achieved_tps: Option<f64>,
+    /// From the `scheduled_dispatch_rate` metric — how many intents per
+    /// second the scheduler actually dispatched, over real load-phase
+    /// elapsed time. Not a confirmed-transaction rate — see
+    /// `confirmed_tx_throughput` for that, the only figure this report may
+    /// label "TPS".
+    pub scheduled_dispatch_rate: Option<f64>,
+    /// From the `confirmed_tx_throughput` metric — confirmed transactions
+    /// per second of load+drain wall-clock time. This is the run's
+    /// confirmed_tx_throughput figure; the report labels it "TPS".
+    pub confirmed_tx_throughput: Option<f64>,
     pub peak_mempool_tx_count: Option<f64>,
     pub peak_mempool_bytes: Option<f64>,
     /// Count of `mempool_saturated` samples — emitted once every sampling
@@ -47,7 +53,17 @@ pub struct SystemHealth {
     /// saturation threshold (see the mempool watcher in
     /// `src/scenarios/exchange.rs`).
     pub saturation_events: u64,
-    pub proving_time: Option<ProvingTimeStats>,
+    /// From `shielded_proving_time_ms` samples — ZK spend/output proof
+    /// generation, emitted only when a withdrawal's flow touches a shielded
+    /// pool on either end (`FlowType::is_shielded()`). `None` for a run with
+    /// no such withdrawals, or none emitted.
+    pub shielded_proving_time: Option<ProvingTimeStats>,
+    /// From `wallet_operation_time_ms` samples — the same measured window
+    /// (accepted `z_sendmany` call through operation completion) for a
+    /// purely transparent withdrawal, where no ZK proof is generated. Kept
+    /// separate from `shielded_proving_time` so a transparent-only run's
+    /// wallet-operation latency is never mislabeled as proving time.
+    pub wallet_operation_time: Option<ProvingTimeStats>,
     /// Sorted by process name for deterministic report output (`metrics`
     /// iteration order is file order, not grouped by process).
     pub process_peaks: Vec<ProcessResourcePeak>,
@@ -56,21 +72,24 @@ pub struct SystemHealth {
 /// Computes one run's system-health figures from its `metrics.jsonl`
 /// samples. Every field degrades to `None`/empty/zero rather than erroring
 /// when a metric was never emitted (e.g. a run with no shielded sends has no
-/// `withdrawal_proving_time_ms` samples) — this is supplementary context on
+/// `shielded_proving_time_ms` samples) — this is supplementary context on
 /// top of the RPC-log-derived sections, not something a run can fail to
 /// produce.
 pub fn compute_system_health(run: &RunData) -> SystemHealth {
-    let mut achieved_tps = None;
+    let mut scheduled_dispatch_rate = None;
+    let mut confirmed_tx_throughput = None;
     let mut peak_mempool_tx_count: Option<f64> = None;
     let mut peak_mempool_bytes: Option<f64> = None;
     let mut saturation_events = 0u64;
-    let mut proving_samples: Vec<f64> = Vec::new();
+    let mut shielded_proving_samples: Vec<f64> = Vec::new();
+    let mut wallet_operation_samples: Vec<f64> = Vec::new();
     let mut process_cpu: HashMap<String, f64> = HashMap::new();
     let mut process_mem: HashMap<String, f64> = HashMap::new();
 
     for sample in &run.metrics {
         match sample.metric_name.as_str() {
-            "tps_achieved" => achieved_tps = Some(sample.value),
+            "scheduled_dispatch_rate" => scheduled_dispatch_rate = Some(sample.value),
+            "confirmed_tx_throughput" => confirmed_tx_throughput = Some(sample.value),
             "mempool_tx_count" => {
                 peak_mempool_tx_count =
                     Some(peak_mempool_tx_count.unwrap_or(0.0).max(sample.value));
@@ -83,7 +102,8 @@ pub fn compute_system_health(run: &RunData) -> SystemHealth {
                     saturation_events += 1;
                 }
             }
-            "withdrawal_proving_time_ms" => proving_samples.push(sample.value),
+            "shielded_proving_time_ms" => shielded_proving_samples.push(sample.value),
+            "wallet_operation_time_ms" => wallet_operation_samples.push(sample.value),
             "process_cpu_percent" => {
                 if let Some(process) = sample.labels.get("process") {
                     let entry = process_cpu.entry(process.clone()).or_insert(sample.value);
@@ -100,17 +120,20 @@ pub fn compute_system_health(run: &RunData) -> SystemHealth {
         }
     }
 
-    let proving_time = if proving_samples.is_empty() {
-        None
-    } else {
-        proving_samples.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
+    fn stats_from(mut samples: Vec<f64>) -> Option<ProvingTimeStats> {
+        if samples.is_empty() {
+            return None;
+        }
+        samples.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
         Some(ProvingTimeStats {
-            p50_ms: percentile_value(&proving_samples, 0.50),
-            p95_ms: percentile_value(&proving_samples, 0.95),
-            p99_ms: percentile_value(&proving_samples, 0.99),
-            samples: proving_samples.len(),
+            p50_ms: percentile_value(&samples, 0.50),
+            p95_ms: percentile_value(&samples, 0.95),
+            p99_ms: percentile_value(&samples, 0.99),
+            samples: samples.len(),
         })
-    };
+    }
+    let shielded_proving_time = stats_from(shielded_proving_samples);
+    let wallet_operation_time = stats_from(wallet_operation_samples);
 
     let mut processes: Vec<String> = process_cpu
         .keys()
@@ -129,11 +152,13 @@ pub fn compute_system_health(run: &RunData) -> SystemHealth {
         .collect();
 
     SystemHealth {
-        achieved_tps,
+        scheduled_dispatch_rate,
+        confirmed_tx_throughput,
         peak_mempool_tx_count,
         peak_mempool_bytes,
         saturation_events,
-        proving_time,
+        shielded_proving_time,
+        wallet_operation_time,
         process_peaks,
     }
 }
@@ -142,13 +167,14 @@ pub fn compute_system_health(run: &RunData) -> SystemHealth {
 mod tests {
     use super::*;
     use crate::data_model::MetricSample;
-    use crate::metrics::{RunManifest, RunTimeouts};
+    use crate::metrics::{RunManifest, RunTimeouts, StateIdentifier};
     use chrono::Utc;
 
     fn run_with_metrics(metrics: Vec<MetricSample>) -> RunData {
         RunData {
             run_dir: "/tmp/r".into(),
             manifest: RunManifest {
+                env_id: String::new(),
                 run_id: "r".into(),
                 run_started_at: Utc::now(),
                 run_completed_at: Some(Utc::now()),
@@ -160,6 +186,14 @@ mod tests {
                 scenario_config_hash: "sha256:x".into(),
                 target_tps: 8.0,
                 timeouts: RunTimeouts::default(),
+                phase_boundaries: Vec::new(),
+                load_and_drain_completed_at: None,
+                compose_config_hash: String::new(),
+                image_digests: Vec::new(),
+                host_cpu_count: 0,
+                host_memory_limit_bytes: None,
+                state: StateIdentifier::default(),
+                assertion: None,
             },
             rpc_calls: Vec::new(),
             intents: Vec::new(),
@@ -184,17 +218,33 @@ mod tests {
     #[test]
     fn empty_metrics_produce_empty_health() {
         let h = compute_system_health(&run_with_metrics(Vec::new()));
-        assert!(h.achieved_tps.is_none());
+        assert!(h.scheduled_dispatch_rate.is_none());
+        assert!(h.confirmed_tx_throughput.is_none());
         assert!(h.peak_mempool_tx_count.is_none());
-        assert!(h.proving_time.is_none());
+        assert!(h.shielded_proving_time.is_none());
+        assert!(h.wallet_operation_time.is_none());
         assert!(h.process_peaks.is_empty());
         assert_eq!(h.saturation_events, 0);
     }
 
     #[test]
-    fn achieved_tps_reads_the_metric_value() {
-        let h = compute_system_health(&run_with_metrics(vec![sample("tps_achieved", 6.6, &[])]));
-        assert_eq!(h.achieved_tps, Some(6.6));
+    fn scheduled_dispatch_rate_reads_the_metric_value() {
+        let h = compute_system_health(&run_with_metrics(vec![sample(
+            "scheduled_dispatch_rate",
+            6.6,
+            &[],
+        )]));
+        assert_eq!(h.scheduled_dispatch_rate, Some(6.6));
+    }
+
+    #[test]
+    fn confirmed_tx_throughput_reads_the_metric_value() {
+        let h = compute_system_health(&run_with_metrics(vec![sample(
+            "confirmed_tx_throughput",
+            4.2,
+            &[],
+        )]));
+        assert_eq!(h.confirmed_tx_throughput, Some(4.2));
     }
 
     #[test]
@@ -221,14 +271,31 @@ mod tests {
     }
 
     #[test]
-    fn proving_time_percentiles_from_samples() {
+    fn shielded_proving_time_percentiles_from_samples() {
         let samples: Vec<MetricSample> = (1..=10)
-            .map(|i| sample("withdrawal_proving_time_ms", (i * 100) as f64, &[]))
+            .map(|i| sample("shielded_proving_time_ms", (i * 100) as f64, &[]))
             .collect();
         let h = compute_system_health(&run_with_metrics(samples));
-        let p = h.proving_time.expect("expected proving time stats");
+        let p = h
+            .shielded_proving_time
+            .expect("expected shielded proving time stats");
         assert_eq!(p.samples, 10);
         assert_eq!(p.p50_ms, 600.0);
+        assert!(h.wallet_operation_time.is_none());
+    }
+
+    #[test]
+    fn wallet_operation_time_percentiles_from_samples_and_is_distinct_from_shielded() {
+        let samples: Vec<MetricSample> = (1..=10)
+            .map(|i| sample("wallet_operation_time_ms", (i * 100) as f64, &[]))
+            .collect();
+        let h = compute_system_health(&run_with_metrics(samples));
+        let p = h
+            .wallet_operation_time
+            .expect("expected wallet operation time stats");
+        assert_eq!(p.samples, 10);
+        assert_eq!(p.p50_ms, 600.0);
+        assert!(h.shielded_proving_time.is_none());
     }
 
     #[test]

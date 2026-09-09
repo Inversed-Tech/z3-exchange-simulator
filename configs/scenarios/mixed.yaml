@@ -50,3 +50,13 @@ activity_profiles:
 amounts:
   min_zatoshis: 10000       # 0.0001 ZEC
   max_zatoshis: 10000000    # 0.1 ZEC — smaller ceiling for shielded; fees are higher
+
+
+# Placeholder — permissive on purpose, pending empirical baselining
+# (Track 3 §9: run once, observe actual confirmed/failed/timed_out counts,
+# then set real thresholds with headroom above/below the baseline).
+expectations:
+  min_confirmed: 0
+  max_terminal_failures: 999999
+  max_timeouts: 999999
+  allowed_error_classes: []

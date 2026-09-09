@@ -12,6 +12,14 @@
 # static address, and bind the JSON-RPC server to it — a private bind that the
 # host port mapping still reaches.
 #
+# The subnet and static address are parameterized (Z3_SIM_SUBNET /
+# Z3_SIM_ZAINO_IP) so two simulator environments on the same host never
+# collide on network address — see src/z3/env_id.rs::derive_subnet.
+# `z3sim run` derives these per its own resolved env_id and passes them as
+# process environment variables directly to `docker compose` (which take
+# precedence over this file's values), so this file's own defaults below are
+# only what a bare `docker compose` invocation outside `z3sim` sees.
+#
 # The single environment key below merges on top of the `environment: !override`
 # map in docker-compose.regtest.yml (compose merges later files key-by-key), so
 # every other ZAINO_* variable from that layer is preserved.
@@ -20,9 +28,9 @@ services:
   zaino:
     networks:
       default:
-        ipv4_address: 172.28.0.10
+        ipv4_address: ${Z3_SIM_ZAINO_IP:-172.28.0.10}
     environment:
-      ZAINO_JSON_SERVER_SETTINGS__JSON_RPC_LISTEN_ADDRESS: 172.28.0.10:8237
+      ZAINO_JSON_SERVER_SETTINGS__JSON_RPC_LISTEN_ADDRESS: ${Z3_SIM_ZAINO_IP:-172.28.0.10}:8237
 
   # The Zallet image runs as uid 1000, but the named data volume is created
   # root-owned (regtest-init.sh touches it with a root busybox container before
@@ -48,4 +56,4 @@ networks:
   default:
     ipam:
       config:
-        - subnet: 172.28.0.0/16
+        - subnet: ${Z3_SIM_SUBNET:-172.28.0.0/16}

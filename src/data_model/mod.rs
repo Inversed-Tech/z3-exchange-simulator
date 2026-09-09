@@ -51,6 +51,17 @@ impl FlowType {
     pub fn is_shielded(&self) -> bool {
         matches!(self, FlowType::TToZ | FlowType::ZToT | FlowType::ZToZ)
     }
+
+    /// The snake_case name used both as this enum's serde representation and
+    /// as a metric label value — the single source of truth for that name.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            FlowType::TToT => "t_to_t",
+            FlowType::TToZ => "t_to_z",
+            FlowType::ZToT => "z_to_t",
+            FlowType::ZToZ => "z_to_z",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -91,6 +102,155 @@ pub enum SweepStatus {
     Broadcast,
     Confirmed,
     Failed,
+}
+
+/// Machine-readable classification of a terminal intent failure, derived
+/// from the free-text error message an `ExchangeError`/`RpcError` carried at
+/// the point `IntentOutcome::Failed`/`TimedOut` was constructed. Lets
+/// `ExpectationsConfig::allowed_error_classes` (scenario YAML) name a class
+/// of failure a scenario author has decided not to count toward
+/// `max_terminal_failures`, without matching on the raw error string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IntentFailureClass {
+    /// "Insufficient balance" — the source's notes/UTXOs had not yet reached
+    /// the anchor-confirmation depth `z_sendmany` requires.
+    InsufficientBalance,
+    /// "already spent" / `bad-txns-inputs-missingorspent` — a double-spend-
+    /// style rejection, typically from concurrent intents racing the same
+    /// input.
+    MempoolConflict,
+    /// The intent's `IntentOutcome` was `TimedOut`, not `Failed` — always
+    /// this class regardless of the timeout's own context string.
+    Timeout,
+    /// Any other terminal failure not matched by a more specific class.
+    Other,
+}
+
+impl IntentFailureClass {
+    /// The snake_case name used both as this enum's serde representation and
+    /// as the string scenario authors write into
+    /// `ExpectationsConfig::allowed_error_classes` — the single source of
+    /// truth for that name, so the two can never drift out of sync.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::InsufficientBalance => "insufficient_balance",
+            Self::MempoolConflict => "mempool_conflict",
+            Self::Timeout => "timeout",
+            Self::Other => "other",
+        }
+    }
+
+    /// Classifies a terminal `Failed` outcome's free-text error message,
+    /// matching the same substrings the load-phase retry loop
+    /// (`send_many_with_anchor_retries`) already keys on, plus Orchard's own
+    /// double-spend rejection wording (`"duplicate nullifier"` /
+    /// `"double-spend"`) — observed baselining `health-z2z` (concurrent
+    /// shielded intents racing the same note), semantically the same class
+    /// of rejection as the transparent `"already spent"` case but phrased
+    /// differently at the shielded-pool level. Never returns `Timeout` — a
+    /// timed-out intent is classified directly from its
+    /// `IntentOutcome::TimedOut` variant instead, since a timeout carries no
+    /// comparable error string.
+    pub fn classify(error: &str) -> Self {
+        if error.contains("Insufficient balance") {
+            Self::InsufficientBalance
+        } else if error.contains("already spent")
+            || error.contains("bad-txns-inputs-missingorspent")
+            || error.contains("duplicate nullifier")
+            || error.contains("double-spend")
+        {
+            Self::MempoolConflict
+        } else {
+            Self::Other
+        }
+    }
+}
+
+/// Which lifecycle stage of a run an [`RpcCall`] was issued during. Backed by
+/// a shared `AtomicU8` (see `crate::scenarios::runner::phase::PhaseTracker`)
+/// so every RPC call recorded by any task concurrently sharing one run's
+/// `RpcClient` — the background miner, the mempool watcher, the periodic
+/// balance checker, and every dispatched intent — is retagged the instant
+/// the run advances to the next phase, with no per-call-site plumbing.
+///
+/// Phases are strictly sequential for a given run (no two ever run
+/// concurrently), which is what makes one shared "current phase" value
+/// correct instead of racy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[repr(u8)]
+pub enum Phase {
+    /// From process start (before the Z3 stack is even up) through
+    /// `Z3Stack::start()`/`wait_until_ready()`/`RpcClient` construction.
+    Bootstrap = 0,
+    /// The hot-wallet-resolution retry loop — the first Zallet calls issued
+    /// after the stack reports ready.
+    Readiness = 1,
+    /// `lifecycle::warmup()`: mining warmup blocks and confirming the stack
+    /// (and the hot wallet specifically) is responsive.
+    Warmup = 2,
+    /// `lifecycle::fund_active_accounts()`: the hot-wallet-to-synthetic-account
+    /// funding fan-out and its confirmation mining.
+    Funding = 3,
+    /// The scheduler's dispatch loop — the measured workload.
+    Load = 4,
+    /// Draining in-flight intents after the dispatch loop ends; background
+    /// tasks (miner, mempool watcher, balance checker) keep running.
+    Drain = 5,
+    /// Deserialization fallback for `RpcCall` rows recorded before phase
+    /// tagging existed. Never assigned by live code, and always excluded
+    /// from every phase-scoped report view rather than silently folded into
+    /// `Load`, which would mislabel setup-phase evidence as workload evidence.
+    Unknown = 255,
+}
+
+impl TryFrom<u8> for Phase {
+    type Error = ();
+
+    fn try_from(v: u8) -> Result<Self, Self::Error> {
+        match v {
+            0 => Ok(Phase::Bootstrap),
+            1 => Ok(Phase::Readiness),
+            2 => Ok(Phase::Warmup),
+            3 => Ok(Phase::Funding),
+            4 => Ok(Phase::Load),
+            5 => Ok(Phase::Drain),
+            255 => Ok(Phase::Unknown),
+            _ => Err(()),
+        }
+    }
+}
+
+fn default_phase() -> Phase {
+    Phase::Unknown
+}
+
+fn default_attempt_number() -> u32 {
+    1
+}
+
+impl Phase {
+    /// True for `Load`/`Drain` — the phases whose RPC activity is the
+    /// measured workload. Load-curve charts, degradation detection, and the
+    /// headline RPC compatibility matrix are all scoped to these two phases
+    /// by default (see `report::rpc_matrix::build_matrix`,
+    /// `report::load_curve::load_degradation_candidates`). `Unknown` (a run
+    /// predating phase tagging) is deliberately excluded — it is not assumed
+    /// to be workload activity.
+    pub fn is_workload(self) -> bool {
+        matches!(self, Phase::Load | Phase::Drain)
+    }
+
+    /// True for `Bootstrap`/`Readiness`/`Warmup`/`Funding` — everything
+    /// before the measured workload begins. Used to build the
+    /// informational, unscored "Setup-phase RPC activity" report appendix.
+    pub fn is_setup(self) -> bool {
+        matches!(
+            self,
+            Phase::Bootstrap | Phase::Readiness | Phase::Warmup | Phase::Funding
+        )
+    }
 }
 
 /// Which Z3 backend served an RPC call.
@@ -233,6 +393,25 @@ pub struct RpcCall {
     pub success: bool,
     pub error_code: Option<i64>,
     pub error_message: Option<String>,
+    /// Lifecycle phase this call was issued during. `#[serde(default)]` so
+    /// `rpc_calls.jsonl` files written before this field existed still
+    /// deserialize, tagged `Phase::Unknown` rather than misread as any real
+    /// phase.
+    #[serde(default = "default_phase")]
+    pub phase: Phase,
+    /// The transaction intent this call was issued on behalf of, if any.
+    /// `None` for calls not tied to a specific intent (health checks, warmup
+    /// mining, balance polling, the funding-phase fan-out, ...).
+    /// `#[serde(default)]` so `rpc_calls.jsonl` files written before this
+    /// field existed still deserialize.
+    #[serde(default)]
+    pub intent_id: Option<String>,
+    /// 1 for the first attempt of a given `(intent_id, method)` retry
+    /// sequence, incrementing for each retry. Always 1 when `intent_id` is
+    /// `None`. `#[serde(default = "default_attempt_number")]` for the same
+    /// backward-compatibility reason as `phase`.
+    #[serde(default = "default_attempt_number")]
+    pub attempt_number: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -288,6 +467,52 @@ pub struct ScenarioConfig {
     pub source_path: String,
     #[serde(default = "default_warmup_blocks")]
     pub warmup_blocks: u64,
+    /// What "pass" means for this scenario. Deliberately NOT `#[serde(default)]`
+    /// — a scenario YAML that omits this block fails to parse (`ConfigError::Parse`)
+    /// rather than silently running with no pass/fail criterion. A plain Rust
+    /// `Default` impl still exists (see below) so non-YAML test fixtures that
+    /// don't care about assertions can use `..Default::default()`-style
+    /// construction; it has no bearing on YAML parsing.
+    pub expectations: ExpectationsConfig,
+}
+
+/// A scenario's pass/fail criteria, evaluated once the run completes (see
+/// `scenarios::runner::result::RunStats::evaluate`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExpectationsConfig {
+    /// Minimum confirmed transactions required to pass. Compared against
+    /// `RunStats::confirmed`.
+    pub min_confirmed: u64,
+    /// Maximum terminal (non-retry) transaction failures tolerated,
+    /// deduplicated to one count per failed intent — never per RPC retry
+    /// attempt — with any intent whose failure class appears in
+    /// `allowed_error_classes` excluded from the count.
+    pub max_terminal_failures: u64,
+    /// Maximum timeouts tolerated. Compared against `RunStats::timed_out`.
+    pub max_timeouts: u64,
+    /// Error classes (see `IntentFailureClass::as_str`) pre-approved as not
+    /// counting toward `max_terminal_failures`, e.g. `"insufficient_balance"`.
+    /// Empty means every terminal failure counts.
+    #[serde(default)]
+    pub allowed_error_classes: Vec<String>,
+}
+
+impl Default for ExpectationsConfig {
+    /// Fully permissive — never fails a run. Exists only so Rust test
+    /// fixtures that construct a `ScenarioConfig` without caring about
+    /// assertions can write `expectations: ExpectationsConfig::default()`
+    /// instead of repeating these four fields everywhere. Has no bearing on
+    /// YAML parsing: `ScenarioConfig::expectations` itself is not
+    /// `#[serde(default)]`, so a real scenario file must still declare this
+    /// block explicitly.
+    fn default() -> Self {
+        Self {
+            min_confirmed: 0,
+            max_terminal_failures: u64::MAX,
+            max_timeouts: u64::MAX,
+            allowed_error_classes: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -319,6 +544,13 @@ pub struct IntentRecord {
     /// stall.
     pub timeout_context: Option<String>,
     pub recorded_at: DateTime<Utc>,
+    /// `None` for a confirmed outcome. Set from `IntentFailureClass::classify`
+    /// for `Failed`, or always `Timeout` for `TimedOut` — see
+    /// `IntentRecord::from_outcome`. Used by
+    /// `RunStats::evaluate`/`terminal_failures_by_class` to honor a
+    /// scenario's `allowed_error_classes` without re-parsing `error`'s raw
+    /// text.
+    pub failure_class: Option<IntentFailureClass>,
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -507,10 +739,16 @@ mod tests {
             success: true,
             error_code: None,
             error_message: None,
+            phase: Phase::Load,
+            intent_id: Some("int-1".into()),
+            attempt_number: 2,
         };
         let back = roundtrip(&v);
         assert_eq!(v.backend, back.backend);
         assert_eq!(v.latency_ms, back.latency_ms);
+        assert_eq!(v.phase, back.phase);
+        assert_eq!(v.intent_id, back.intent_id);
+        assert_eq!(v.attempt_number, back.attempt_number);
         assert!(back.success);
     }
 
@@ -549,6 +787,12 @@ mod tests {
             config_hash: "abc123".into(),
             source_path: "configs/scenarios/smoke.yaml".into(),
             warmup_blocks: 10,
+            expectations: ExpectationsConfig {
+                min_confirmed: 60,
+                max_terminal_failures: 0,
+                max_timeouts: 0,
+                allowed_error_classes: vec![],
+            },
         };
         let back = roundtrip(&v);
         assert_eq!(v.name, back.name);
@@ -784,6 +1028,127 @@ mod tests {
         );
     }
 
+    #[test]
+    fn phase_wire_format_all_variants() {
+        for (phase, wire) in [
+            (Phase::Bootstrap, r#""bootstrap""#),
+            (Phase::Readiness, r#""readiness""#),
+            (Phase::Warmup, r#""warmup""#),
+            (Phase::Funding, r#""funding""#),
+            (Phase::Load, r#""load""#),
+            (Phase::Drain, r#""drain""#),
+            (Phase::Unknown, r#""unknown""#),
+        ] {
+            assert_eq!(serde_json::to_string(&phase).unwrap(), wire);
+        }
+    }
+
+    #[test]
+    fn phase_try_from_u8_roundtrips_every_discriminant() {
+        for phase in [
+            Phase::Bootstrap,
+            Phase::Readiness,
+            Phase::Warmup,
+            Phase::Funding,
+            Phase::Load,
+            Phase::Drain,
+            Phase::Unknown,
+        ] {
+            assert_eq!(Phase::try_from(phase as u8), Ok(phase));
+        }
+        assert!(Phase::try_from(42u8).is_err());
+    }
+
+    #[test]
+    fn rpc_call_missing_phase_field_deserializes_as_unknown() {
+        // Reproduces an rpc_calls.jsonl line written before phase tagging
+        // existed: the field is entirely absent, not null.
+        let json = r#"{
+            "call_id": "c", "run_id": "r", "method": "getblockcount",
+            "backend": "Zebra", "params_hash": null, "request_at": "2024-06-01T12:00:00Z",
+            "response_at": null, "latency_ms": null, "success": true,
+            "error_code": null, "error_message": null
+        }"#;
+        let call: RpcCall = serde_json::from_str(json).unwrap();
+        assert_eq!(call.phase, Phase::Unknown);
+    }
+
+    #[test]
+    fn rpc_call_missing_intent_linkage_fields_deserialize_to_unlinked_defaults() {
+        // Reproduces an rpc_calls.jsonl line written before intent/attempt
+        // linkage existed: both fields are entirely absent, not null.
+        let json = r#"{
+            "call_id": "c", "run_id": "r", "method": "getblockcount",
+            "backend": "Zebra", "params_hash": null, "request_at": "2024-06-01T12:00:00Z",
+            "response_at": null, "latency_ms": null, "success": true,
+            "error_code": null, "error_message": null, "phase": "load"
+        }"#;
+        let call: RpcCall = serde_json::from_str(json).unwrap();
+        assert_eq!(call.intent_id, None);
+        assert_eq!(call.attempt_number, 1);
+    }
+
+    #[test]
+    fn intent_failure_class_as_str_matches_serde_wire_format() {
+        for class in [
+            IntentFailureClass::InsufficientBalance,
+            IntentFailureClass::MempoolConflict,
+            IntentFailureClass::Timeout,
+            IntentFailureClass::Other,
+        ] {
+            let wire = serde_json::to_string(&class).unwrap();
+            assert_eq!(wire, format!("\"{}\"", class.as_str()));
+        }
+    }
+
+    #[test]
+    fn intent_failure_class_classify_matches_known_error_substrings() {
+        assert_eq!(
+            IntentFailureClass::classify("Insufficient balance (have 0, need 10000)"),
+            IntentFailureClass::InsufficientBalance
+        );
+        assert_eq!(
+            IntentFailureClass::classify("bad-txns-inputs-missingorspent"),
+            IntentFailureClass::MempoolConflict
+        );
+        assert_eq!(
+            IntentFailureClass::classify("some other note was already spent"),
+            IntentFailureClass::MempoolConflict
+        );
+        assert_eq!(
+            IntentFailureClass::classify(
+                "orchard double-spend: duplicate nullifier: Nullifier(0xabc123)"
+            ),
+            IntentFailureClass::MempoolConflict
+        );
+        assert_eq!(
+            IntentFailureClass::classify("connection refused"),
+            IntentFailureClass::Other
+        );
+    }
+
+    #[test]
+    fn expectations_config_default_is_fully_permissive() {
+        let e = ExpectationsConfig::default();
+        assert_eq!(e.min_confirmed, 0);
+        assert_eq!(e.max_terminal_failures, u64::MAX);
+        assert_eq!(e.max_timeouts, u64::MAX);
+        assert!(e.allowed_error_classes.is_empty());
+    }
+
+    #[test]
+    fn expectations_config_roundtrip() {
+        let v = ExpectationsConfig {
+            min_confirmed: 60,
+            max_terminal_failures: 0,
+            max_timeouts: 0,
+            allowed_error_classes: vec!["insufficient_balance".into()],
+        };
+        let back = roundtrip(&v);
+        assert_eq!(back.min_confirmed, 60);
+        assert_eq!(back.allowed_error_classes, vec!["insufficient_balance"]);
+    }
+
     // ── Deserialization ───────────────────────────────────────────────────────
 
     #[test]
@@ -908,6 +1273,9 @@ mod tests {
             success: false,
             error_code: Some(-32_601),
             error_message: Some("Method not found".into()),
+            phase: Phase::Funding,
+            intent_id: Some("int-1".into()),
+            attempt_number: 3,
         };
         let back = roundtrip(&v);
         assert_eq!(back.params_hash, Some("sha256:abcdef".into()));
@@ -1103,6 +1471,7 @@ mod tests {
                 .into(),
             source_path: "/workspace/configs/scenarios/burst.yaml".into(),
             warmup_blocks: 10,
+            expectations: ExpectationsConfig::default(),
         };
         let back = roundtrip(&v);
         assert_eq!(back.config_hash, v.config_hash);

@@ -105,6 +105,7 @@ mod tests {
             error: None,
             timeout_context: Some("tx abc did not reach 3 confirmations".into()),
             recorded_at: Utc::now(),
+            failure_class: Some(crate::data_model::IntentFailureClass::Timeout),
         });
         let content = std::fs::read_to_string(rd.intents_path()).unwrap();
         assert!(content.contains("timed_out"));
@@ -130,6 +131,9 @@ mod tests {
             success: true,
             error_code: None,
             error_message: None,
+            phase: crate::data_model::Phase::Unknown,
+            intent_id: None,
+            attempt_number: 1,
         };
         rec.record_rpc_call(call);
         let content = std::fs::read_to_string(rd.rpc_calls_path()).unwrap();
@@ -155,6 +159,9 @@ mod tests {
             success: true,
             error_code: None,
             error_message: None,
+            phase: crate::data_model::Phase::Unknown,
+            intent_id: None,
+            attempt_number: 1,
         };
         rec.record_rpc_call(call);
         let (p50, _, _) = rec.latency.percentiles("z_getbalances", "Zallet").unwrap();
@@ -180,6 +187,9 @@ mod tests {
             success: true,
             error_code: None,
             error_message: None,
+            phase: crate::data_model::Phase::Unknown,
+            intent_id: None,
+            attempt_number: 1,
         };
         rec.record_rpc_call(call);
         rec.flush_latency_samples("r-1");
@@ -213,6 +223,9 @@ mod tests {
             success: true,
             error_code: None,
             error_message: None,
+            phase: crate::data_model::Phase::Unknown,
+            intent_id: None,
+            attempt_number: 1,
         });
         rec.record_metric(MetricSample {
             run_id: "r".into(),
@@ -242,6 +255,9 @@ mod tests {
             success: true,
             error_code: None,
             error_message: None,
+            phase: crate::data_model::Phase::Unknown,
+            intent_id: None,
+            attempt_number: 1,
         };
         rec.record_rpc_call(call);
         let content = std::fs::read_to_string(rd.rpc_calls_path()).unwrap();
@@ -306,6 +322,9 @@ mod tests {
             success: true,
             error_code: None,
             error_message: None,
+            phase: crate::data_model::Phase::Unknown,
+            intent_id: None,
+            attempt_number: 1,
         };
 
         rec.record_rpc_call(make_call(100));

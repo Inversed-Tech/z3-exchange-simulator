@@ -7,6 +7,11 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+use crate::data_model::{IntentRecord, Phase, RpcCall};
+use crate::metrics::StateFreshness;
+use crate::scenarios::runner::result::terminal_failures_by_class;
+use crate::z3::env_id::compose_project_for_env;
+
 use super::charts::{render_latency_chart, render_tps_chart};
 use super::findings::{
     flag_candidates, Finding, FindingCategory, Severity, HIGH_DISPARITY_GAP, HIGH_RATE,
@@ -19,7 +24,9 @@ use super::load_curve::{
     MIN_WINDOW_CALLS,
 };
 use super::loader::RunData;
-use super::rpc_matrix::{build_matrix, build_unlisted, load_parity_annotations, Category, ParityInfo};
+use super::rpc_matrix::{
+    build_matrix, build_retry_detail, build_unlisted, load_parity_annotations, Category, ParityInfo,
+};
 use super::system_health::{compute_system_health, SystemHealth};
 
 /// Renders a Markdown pipe table with separator-row dash counts
@@ -67,26 +74,97 @@ fn render_table(headers: &[&str], rows: &[Vec<String>], md: &mut String) {
 }
 
 /// Executive summary up top: the digest a reader should be able to stop at
-/// if they only have a minute — run/scenario counts, overall load results,
-/// and a severity-ranked list of the findings that matter most. Everything
-/// here is also fully spelled out later in the report; this section exists
-/// purely to make the report skimmable, per the project's explicit ask that
-/// the report be "comprehensive, easy to read, and already digested."
+/// if they only have a minute. Answers five questions, in the order the
+/// client asked for, before any per-run detail table below: (1) did the run
+/// pass or fail its scenario assertions, (2) what component versions ran,
+/// (3) was the starting chain state fresh or reused, (4) what terminal
+/// intent failures occurred, and (5) which candidate findings need
+/// attention. Everything here is also fully spelled out later in the
+/// report; this section exists purely to make the report skimmable.
 fn render_executive_summary(runs: &[RunData], findings: &[Finding], md: &mut String) {
     md.push_str("## Executive summary\n\n");
 
     let scenarios: Vec<&str> = {
-        let mut v: Vec<&str> = runs.iter().map(|r| r.manifest.scenario_name.as_str()).collect();
+        let mut v: Vec<&str> = runs
+            .iter()
+            .map(|r| r.manifest.scenario_name.as_str())
+            .collect();
         v.sort_unstable();
         v.dedup();
         v
     };
     md.push_str(&format!(
-        "- **Runs included:** {} (scenario(s): {})\n",
+        "- **Runs included:** {} (scenario(s): {})\n\n",
         runs.len(),
         scenarios.join(", ")
     ));
 
+    md.push_str("### 1. Assertion result\n\n");
+    for run in runs {
+        match &run.manifest.assertion {
+            Some(a) if a.passed => md.push_str(&format!("- **{}**: PASS\n", run.manifest.run_id)),
+            Some(a) => {
+                md.push_str(&format!("- **{}**: FAIL\n", run.manifest.run_id));
+                for v in &a.violations {
+                    md.push_str(&format!("  - {v}\n"));
+                }
+            }
+            None => md.push_str(&format!(
+                "- **{}**: no assertion recorded (predates scenario expectations, or the run \
+                 never reached evaluation)\n",
+                run.manifest.run_id
+            )),
+        }
+    }
+    md.push('\n');
+
+    md.push_str("### 2. Component versions\n\n");
+    for run in runs {
+        if run.manifest.image_digests.is_empty() {
+            md.push_str(&format!(
+                "- **{}**: no image digests recorded (predates this field)\n",
+                run.manifest.run_id
+            ));
+            continue;
+        }
+        md.push_str(&format!("- **{}**:\n", run.manifest.run_id));
+        for img in &run.manifest.image_digests {
+            md.push_str(&format!(
+                "  - {}: {} (image id {})\n",
+                img.service, img.image, img.id
+            ));
+        }
+    }
+    md.push('\n');
+
+    md.push_str("### 3. State freshness\n\n");
+    for run in runs {
+        let s = &run.manifest.state;
+        let desc = match s.freshness {
+            StateFreshness::Fresh => "fresh".to_string(),
+            StateFreshness::Reused => format!(
+                "reused (reset epoch {}, chain height {})",
+                s.reset_epoch, s.chain_height_at_start
+            ),
+        };
+        let env_desc = if run.manifest.env_id.is_empty() {
+            "no environment id recorded (predates this field, or setup failed \
+             before one was resolved)"
+                .to_string()
+        } else {
+            format!(
+                "environment {}",
+                compose_project_for_env(&run.manifest.env_id)
+            )
+        };
+        md.push_str(&format!(
+            "- **{}**: {desc} — {env_desc}\n",
+            run.manifest.run_id
+        ));
+    }
+    md.push('\n');
+
+    md.push_str("### 4. Intent-level failures\n\n");
     let attempted: usize = runs.iter().map(|r| r.intents.len()).sum();
     let confirmed: usize = runs
         .iter()
@@ -113,16 +191,49 @@ fn render_executive_summary(runs: &[RunData], findings: &[Finding], md: &mut Str
          failed {failed}, timed out {timed_out}\n"
     ));
 
-    let high = findings.iter().filter(|f| f.severity == Severity::High).count();
-    let medium = findings.iter().filter(|f| f.severity == Severity::Medium).count();
-    let low = findings.iter().filter(|f| f.severity == Severity::Low).count();
+    let all_intents: Vec<IntentRecord> = runs
+        .iter()
+        .flat_map(|r| r.intents.iter().cloned())
+        .collect();
+    let failures_by_class = terminal_failures_by_class(&all_intents);
+    let total_terminal_failures: u64 = failures_by_class.values().sum();
+    if total_terminal_failures == 0 {
+        md.push_str("- No terminal failures recorded.\n\n");
+    } else {
+        let mut parts: Vec<String> = failures_by_class
+            .iter()
+            .map(|(class, count)| format!("{count} {}", class.as_str()))
+            .collect();
+        parts.sort();
+        md.push_str(&format!(
+            "- **{total_terminal_failures} terminal failure(s)** — {}\n\n",
+            parts.join(", ")
+        ));
+    }
+
+    md.push_str("### 5. Actionable findings\n\n");
+
+    let high = findings
+        .iter()
+        .filter(|f| f.severity == Severity::High)
+        .count();
+    let medium = findings
+        .iter()
+        .filter(|f| f.severity == Severity::Medium)
+        .count();
+    let low = findings
+        .iter()
+        .filter(|f| f.severity == Severity::Low)
+        .count();
     md.push_str(&format!(
         "- **Candidate findings:** **{high} High**, {medium} Medium, {low} Low (see \
          \"Candidate findings\" below; tier definitions in the Appendix)\n\n"
     ));
 
-    md.push_str("**Overall read** (mechanically derived from the counts above — not a \
-                  substitute for engineering judgment): ");
+    md.push_str(
+        "**Overall read** (mechanically derived from the counts above — not a \
+                  substitute for engineering judgment): ",
+    );
     if high == 0 && medium == 0 {
         md.push_str(&format!(
             "no High- or Medium-severity candidates were flagged, and {confirmed_pct:.0}% of \
@@ -143,12 +254,20 @@ fn render_executive_summary(runs: &[RunData], findings: &[Finding], md: &mut Str
         ));
     }
 
-    let mut high_findings: Vec<&Finding> = findings.iter().filter(|f| f.severity == Severity::High).collect();
-    high_findings.sort_by(|a, b| a.category.to_string().cmp(&b.category.to_string()).then(a.summary.cmp(&b.summary)));
+    let mut high_findings: Vec<&Finding> = findings
+        .iter()
+        .filter(|f| f.severity == Severity::High)
+        .collect();
+    high_findings.sort_by(|a, b| {
+        a.category
+            .to_string()
+            .cmp(&b.category.to_string())
+            .then(a.summary.cmp(&b.summary))
+    });
     if high_findings.is_empty() {
         md.push_str("No High-severity candidates flagged.\n\n");
     } else {
-        md.push_str("### High-severity candidates\n\n");
+        md.push_str("#### High-severity candidates\n\n");
         const MAX_SHOWN: usize = 10;
         for f in high_findings.iter().take(MAX_SHOWN) {
             md.push_str(&format!("- **[{}]** {}\n", f.category, f.summary));
@@ -186,7 +305,15 @@ fn breakable(s: &str, n: usize) -> String {
 
 fn render_run_metadata(runs: &[RunData], md: &mut String) {
     md.push_str("## Runs included in this report\n\n");
-    let headers = ["Run ID", "Scenario", "Target TPS", "Zebra", "Zaino", "Zallet", "Simulator commit"];
+    let headers = [
+        "Run ID",
+        "Scenario",
+        "Target dispatch rate (intents/s)",
+        "Zebra",
+        "Zaino",
+        "Zallet",
+        "Simulator commit",
+    ];
     let rows: Vec<Vec<String>> = runs
         .iter()
         .map(|run| {
@@ -212,9 +339,17 @@ fn render_load_results(runs: &[RunData], md: &mut String) {
         .iter()
         .map(|run| {
             let attempted = run.intents.len();
-            let confirmed = run.intents.iter().filter(|i| i.outcome == "confirmed").count();
+            let confirmed = run
+                .intents
+                .iter()
+                .filter(|i| i.outcome == "confirmed")
+                .count();
             let failed = run.intents.iter().filter(|i| i.outcome == "failed").count();
-            let timed_out = run.intents.iter().filter(|i| i.outcome == "timed_out").count();
+            let timed_out = run
+                .intents
+                .iter()
+                .filter(|i| i.outcome == "timed_out")
+                .count();
             vec![
                 run.manifest.run_id.clone(),
                 attempted.to_string(),
@@ -262,7 +397,13 @@ fn render_flow_type_breakdown(runs: &[RunData], md: &mut String) {
         }
         any = true;
         md.push_str(&format!("### {}\n\n", run.manifest.run_id));
-        let headers = ["Flow type", "Confirmed", "Failed", "Timed out", "Confirm rate"];
+        let headers = [
+            "Flow type",
+            "Confirmed",
+            "Failed",
+            "Timed out",
+            "Confirm rate",
+        ];
         let mut flows: Vec<_> = by_flow.into_iter().collect();
         flows.sort_by(|a, b| a.0.cmp(&b.0));
         let rows: Vec<Vec<String>> = flows
@@ -289,12 +430,16 @@ fn render_flow_type_breakdown(runs: &[RunData], md: &mut String) {
     }
 }
 
-/// Per-run TPS/latency/error-rate curve, all RPC methods combined — the
-/// "load-curve results (TPS vs. latency)" scope.md asks for. Rendered per
-/// run, not aggregated, since two runs' time series only make sense
-/// side-by-side if they share a load shape (see `load_curve.rs`). When
-/// `assets_dir` is provided, a TPS chart and a latency chart are rendered
-/// as PNGs and embedded after each run's table.
+/// Per-run RPC-call-rate/latency/error-rate curve, all RPC methods combined —
+/// the "load-curve results (throughput vs. latency)" scope.md asks for.
+/// Scoped to `Load`/`Drain` phase calls only (see
+/// `crate::data_model::Phase::is_workload`) — setup-phase activity (bootstrap,
+/// warmup mining, funding fan-out) is shown separately, in "Setup phase
+/// timing" and "Setup-phase RPC activity" below. Rendered per run, not
+/// aggregated, since two runs' time series only make sense side-by-side if
+/// they share a load shape (see `load_curve.rs`). When `assets_dir` is
+/// provided, an RPC-call-rate chart and a latency chart are rendered as PNGs
+/// and embedded after each run's table.
 fn render_load_curve(
     runs: &[RunData],
     health: &[SystemHealth],
@@ -303,39 +448,57 @@ fn render_load_curve(
 ) {
     md.push_str("## Load curve by run\n\n");
     md.push_str(&format!(
-        "Achieved throughput, latency, and error rate in fixed {DEFAULT_WINDOW_SECS}-second \
-         windows across each run's own timeline — all RPC methods combined (see the RPC \
-         compatibility matrix below for per-method detail). Candidate inflection points \
-         detected from these curves appear under \"Load degradation\" in Candidate findings.\n\n"
+        "RPC-call rate, latency, and error rate in fixed {DEFAULT_WINDOW_SECS}-second \
+         windows across each run's own Load+Drain timeline — all RPC methods combined, \
+         setup-phase activity excluded (see \"Setup phase timing\"/\"Setup-phase RPC \
+         activity\" for that). Candidate inflection points detected from these curves \
+         appear under \"Load degradation\" in Candidate findings; the full RPC compatibility \
+         matrix is in the Appendix.\n\n"
     ));
     let fmt_ms = |v: Option<f64>| v.map(|v| format!("{v:.0}")).unwrap_or_else(|| "—".into());
     let mut any = false;
     for (run, h) in runs.iter().zip(health) {
-        let points = windowed_load_curve(&run.rpc_calls, DEFAULT_WINDOW_SECS);
+        let workload_calls: Vec<RpcCall> = run
+            .rpc_calls
+            .iter()
+            .filter(|c| c.phase.is_workload())
+            .cloned()
+            .collect();
+        let points = windowed_load_curve(&workload_calls, DEFAULT_WINDOW_SECS);
         if points.is_empty() {
             continue;
         }
         any = true;
         md.push_str(&format!("### {}\n\n", run.manifest.run_id));
 
-        let achieved = h.achieved_tps.map(|v| format!("{v:.1}")).unwrap_or_else(|| "N/A".into());
+        let confirmed_tps = h
+            .confirmed_tx_throughput
+            .map(|v| format!("{v:.1}"))
+            .unwrap_or_else(|| "N/A".into());
+        let dispatch_rate = h
+            .scheduled_dispatch_rate
+            .map(|v| format!("{v:.1}"))
+            .unwrap_or_else(|| "N/A".into());
         let peak = peak_tps_point(&points);
         let peak_offset = peak
             .map(|p| (p.window_start - points[0].window_start).num_seconds())
             .unwrap_or(0);
         md.push_str(&format!(
-            "**Target TPS:** {:.1} · **Achieved TPS:** {achieved} (run average, from the \
-             `tps_achieved` metric) · **Peak window:** {:.1} TPS at +{peak_offset}s\n\n",
+            "**Target dispatch rate:** {:.1} intents/s · **Scheduled dispatch rate:** \
+             {dispatch_rate} intents/s (run average, from `scheduled_dispatch_rate` — actual \
+             load-phase elapsed time, not the configured duration) · **Confirmed tx \
+             throughput (TPS):** {confirmed_tps} (from `confirmed_tx_throughput`) · **Peak \
+             RPC-call window:** {:.1} calls/s at +{peak_offset}s\n\n",
             run.manifest.target_tps,
-            peak.map(|p| p.tps).unwrap_or(0.0),
+            peak.map(|p| p.rpc_calls_per_second).unwrap_or(0.0),
         ));
 
         match find_degradation_point(&points) {
             Some(d) => md.push_str(&format!(
-                "**Candidate degradation point:** +{}s — {:.1} TPS, P99 {} (baseline P99 {}), \
-                 error rate {:.0}% — **[{}]**\n\n",
+                "**Candidate degradation point:** +{}s — {:.1} RPC calls/s, P99 {} (baseline \
+                 P99 {}), error rate {:.0}% — **[{}]**\n\n",
                 d.offset_secs,
-                d.tps,
+                d.rpc_calls_per_second,
                 fmt_ms(d.p99_ms),
                 fmt_ms(d.baseline_p99_ms),
                 d.error_rate * 100.0,
@@ -346,14 +509,25 @@ fn render_load_curve(
 
         if let Some(dir) = assets_dir {
             if let Ok(path) = render_tps_chart(dir, &run.manifest.run_id, &points) {
-                md.push_str(&format!("![TPS over time]({})\n\n", path.display()));
+                md.push_str(&format!(
+                    "![RPC calls per second over time]({})\n\n",
+                    path.display()
+                ));
             }
             if let Ok(path) = render_latency_chart(dir, &run.manifest.run_id, &points) {
                 md.push_str(&format!("![Latency over time]({})\n\n", path.display()));
             }
         }
 
-        let headers = ["+s", "Calls", "Errors", "TPS", "P50 ms", "P95 ms", "P99 ms"];
+        let headers = [
+            "+s",
+            "Calls",
+            "Errors",
+            "RPC calls/s",
+            "P50 ms",
+            "P95 ms",
+            "P99 ms",
+        ];
         let start = points[0].window_start;
         let rows: Vec<Vec<String>> = points
             .iter()
@@ -363,7 +537,7 @@ fn render_load_curve(
                     format!("+{offset}s"),
                     p.calls.to_string(),
                     p.errors.to_string(),
-                    format!("{:.1}", p.tps),
+                    format!("{:.1}", p.rpc_calls_per_second),
                     fmt_ms(p.p50_ms),
                     fmt_ms(p.p95_ms),
                     fmt_ms(p.p99_ms),
@@ -402,22 +576,32 @@ fn render_system_health(runs: &[RunData], health: &[SystemHealth], md: &mut Stri
             (None, None) => md.push_str("- **Mempool:** no samples recorded.\n"),
             _ => md.push_str(&format!(
                 "- **Mempool:** peak {} tx ({} bytes); {} saturation event(s) observed.\n",
-                h.peak_mempool_tx_count.map(|v| format!("{v:.0}")).unwrap_or_else(|| "—".into()),
-                h.peak_mempool_bytes.map(|v| format!("{v:.0}")).unwrap_or_else(|| "—".into()),
+                h.peak_mempool_tx_count
+                    .map(|v| format!("{v:.0}"))
+                    .unwrap_or_else(|| "—".into()),
+                h.peak_mempool_bytes
+                    .map(|v| format!("{v:.0}"))
+                    .unwrap_or_else(|| "—".into()),
                 h.saturation_events,
             )),
         }
 
-        match &h.proving_time {
-            Some(p) => md.push_str(&format!(
-                "- **Shielded withdrawal proving time:** P50 {:.0}ms, P95 {:.0}ms, P99 {:.0}ms \
-                 over {} sample(s).\n",
+        // Each line renders only when its own sample set is non-empty — a
+        // transparent-only run's report must never even mention "shielded
+        // proving," not merely avoid mislabeling its data as such.
+        if let Some(p) = &h.shielded_proving_time {
+            md.push_str(&format!(
+                "- **Shielded proving time:** P50 {:.0}ms, P95 {:.0}ms, P99 {:.0}ms over {} \
+                 sample(s).\n",
                 p.p50_ms, p.p95_ms, p.p99_ms, p.samples
-            )),
-            None => md.push_str(
-                "- **Shielded withdrawal proving time:** no samples recorded (no shielded \
-                 withdrawals observed, or the metric was not emitted).\n",
-            ),
+            ));
+        }
+        if let Some(p) = &h.wallet_operation_time {
+            md.push_str(&format!(
+                "- **Wallet operation time (no shielded proof):** P50 {:.0}ms, P95 {:.0}ms, P99 \
+                 {:.0}ms over {} sample(s).\n",
+                p.p50_ms, p.p95_ms, p.p99_ms, p.samples
+            ));
         }
 
         if h.process_peaks.is_empty() {
@@ -431,8 +615,12 @@ fn render_system_health(runs: &[RunData], health: &[SystemHealth], md: &mut Stri
                 .map(|p| {
                     vec![
                         p.process.clone(),
-                        p.peak_cpu_percent.map(|v| format!("{v:.1}")).unwrap_or_else(|| "—".into()),
-                        p.peak_memory_mb.map(|v| format!("{v:.0}")).unwrap_or_else(|| "—".into()),
+                        p.peak_cpu_percent
+                            .map(|v| format!("{v:.1}"))
+                            .unwrap_or_else(|| "—".into()),
+                        p.peak_memory_mb
+                            .map(|v| format!("{v:.0}"))
+                            .unwrap_or_else(|| "—".into()),
                     ]
                 })
                 .collect();
@@ -445,20 +633,32 @@ fn render_system_health(runs: &[RunData], health: &[SystemHealth], md: &mut Stri
 }
 
 fn render_rpc_matrix(runs: &[RunData], md: &mut String) {
-    md.push_str("## RPC compatibility matrix\n\n");
+    md.push_str("## Appendix A — RPC compatibility matrix\n\n");
     md.push_str(
-        "Derived mechanically from the `rpc_calls.jsonl` of every run listed above. \
-         `Not tested` means no observed call, not \"known to fail\". `Parity`/`Notes` are \
-         pulled in from the hand-maintained docs/rpc/rpc-coverage-matrix.md — they reflect \
-         that doc's most recent update, not this report's own runs; `TBD` means \"not yet \
-         independently verified,\" not a claim of correctness.\n\n",
+        "Derived mechanically from the `rpc_calls.jsonl` of every run listed above, scoped to \
+         `Load`/`Drain`-phase calls only — the measured workload. Setup-phase activity \
+         (bootstrap, warmup mining, funding fan-out) is shown separately in \"Setup-phase RPC \
+         activity\" below, not folded into this matrix. \
+         `Not tested` means no observed call in this scope, not \"known to fail\". \
+         `Parity`/`Notes` are pulled in from the hand-maintained docs/rpc/rpc-coverage-matrix.md \
+         — they reflect that doc's most recent update, not this report's own runs; `TBD` means \
+         \"not yet independently verified,\" not a claim of correctness.\n\n",
     );
-    let matrix = build_matrix(runs);
+    let matrix = build_matrix(runs, Phase::is_workload);
     let parity = load_parity_annotations();
     let empty_parity = ParityInfo::default();
     let headers = [
-        "Method", "Backend", "Status", "Calls", "Successes", "P50 ms", "P95 ms", "P99 ms",
-        "Error codes", "Parity", "Notes",
+        "Method",
+        "Backend",
+        "Status",
+        "Calls",
+        "Successes",
+        "P50 ms",
+        "P95 ms",
+        "P99 ms",
+        "Error codes",
+        "Parity",
+        "Notes",
     ];
     for category in [Category::Stress, Category::RegtestControl, Category::Smoke] {
         let cat_rows: Vec<_> = matrix.iter().filter(|r| r.category == category).collect();
@@ -486,8 +686,16 @@ fn render_rpc_matrix(runs: &[RunData], md: &mut String) {
                     fmt_ms(row.p95_ms),
                     fmt_ms(row.p99_ms),
                     codes,
-                    if info.parity.is_empty() { "—".to_string() } else { info.parity.clone() },
-                    if info.notes.is_empty() { "—".to_string() } else { info.notes.clone() },
+                    if info.parity.is_empty() {
+                        "—".to_string()
+                    } else {
+                        info.parity.clone()
+                    },
+                    if info.notes.is_empty() {
+                        "—".to_string()
+                    } else {
+                        info.notes.clone()
+                    },
                 ]
             })
             .collect();
@@ -497,12 +705,44 @@ fn render_rpc_matrix(runs: &[RunData], md: &mut String) {
     render_unlisted_rpc_calls(runs, md);
 }
 
+/// Per-method breakdown of how many attempts a load/drain-phase intent
+/// needed before its terminal outcome — the evidence behind the client's
+/// "101 calls, 28 failed retries" observation, broken out so a reader can
+/// see retry volume without it inflating `rpc_failure_candidates`' own rate
+/// computation (which counts terminal outcomes only, via `IntentRecord`, not
+/// raw call volume).
+fn render_retry_detail(runs: &[RunData], md: &mut String) {
+    let detail = build_retry_detail(runs, Phase::is_workload);
+    if detail.is_empty() {
+        return;
+    }
+    md.push_str("### Retry detail by method\n\n");
+    md.push_str(
+        "How many attempts a Load/Drain-phase intent needed before its terminal outcome, for \
+         methods with at least one intent-linked call. A method absent here had no \
+         intent-linked calls in this scope.\n\n",
+    );
+    let headers = ["Method", "1 attempt", "2-3 attempts", "4+ attempts"];
+    let rows: Vec<Vec<String>> = detail
+        .iter()
+        .map(|row| {
+            vec![
+                breakable(row.method, 8),
+                row.single_attempt.to_string(),
+                row.two_to_three_attempts.to_string(),
+                row.four_plus_attempts.to_string(),
+            ]
+        })
+        .collect();
+    render_table(&headers, &rows, md);
+}
+
 /// RPC calls observed during these runs whose method is not part of the
 /// tracked roster — see [`build_unlisted`]'s doc comment for why this
 /// exists as a separate section instead of silently dropping them, as
 /// `build_matrix` does.
 fn render_unlisted_rpc_calls(runs: &[RunData], md: &mut String) {
-    let rows = build_unlisted(runs);
+    let rows = build_unlisted(runs, Phase::is_workload);
     if rows.is_empty() {
         return;
     }
@@ -515,7 +755,14 @@ fn render_unlisted_rpc_calls(runs: &[RunData], md: &mut String) {
         super::rpc_matrix::IN_SCOPE_METHODS.len(),
     ));
     let headers = [
-        "Method", "Backend(s)", "Status", "Calls", "Successes", "P50 ms", "P95 ms", "P99 ms",
+        "Method",
+        "Backend(s)",
+        "Status",
+        "Calls",
+        "Successes",
+        "P50 ms",
+        "P95 ms",
+        "P99 ms",
         "Error codes",
     ];
     let fmt_ms = |v: Option<f64>| v.map(|v| format!("{v:.0}")).unwrap_or_else(|| "—".into());
@@ -543,6 +790,207 @@ fn render_unlisted_rpc_calls(runs: &[RunData], md: &mut String) {
     render_table(&headers, &table_rows, md);
 }
 
+/// Setup-phase (`Bootstrap`/`Readiness`/`Warmup`/`Funding`) RPC activity —
+/// built the same way as the headline RPC compatibility matrix, but scoped
+/// to the opposite phase set (see [`Phase::is_setup`]) and deliberately never
+/// fed into `findings.rs`'s rate-based severity scoring: this is diagnostic
+/// context on setup behavior (including funding's own anchor-confirmation
+/// retries), not a workload finding.
+fn render_setup_phase_rpc_activity(runs: &[RunData], md: &mut String) {
+    md.push_str("## Appendix B — Setup-phase RPC activity\n\n");
+    md.push_str(
+        "Informational only — never scored as a candidate finding. Covers every RPC call \
+         issued before the measured workload began: stack bootstrap, hot-wallet readiness \
+         polling, warmup mining, and the funding fan-out (including its own anchor-confirmation \
+         retries).\n\n",
+    );
+    let matrix = build_matrix(runs, Phase::is_setup);
+    let exercised: Vec<_> = matrix.iter().filter(|r| r.calls > 0).collect();
+    let unlisted = build_unlisted(runs, Phase::is_setup);
+    if exercised.is_empty() && unlisted.is_empty() {
+        md.push_str("No setup-phase RPC activity recorded for the runs in this report.\n\n");
+        return;
+    }
+    let fmt_ms = |v: Option<f64>| v.map(|v| format!("{v:.0}")).unwrap_or_else(|| "—".into());
+    if !exercised.is_empty() {
+        let headers = [
+            "Method",
+            "Backend",
+            "Calls",
+            "Successes",
+            "P50 ms",
+            "P95 ms",
+            "P99 ms",
+            "Error codes",
+        ];
+        let rows: Vec<Vec<String>> = exercised
+            .iter()
+            .map(|row| {
+                let codes = if row.error_codes.is_empty() {
+                    "—".to_string()
+                } else {
+                    format!("{:?}", row.error_codes)
+                };
+                vec![
+                    breakable(row.method, 8),
+                    row.backend_label.to_string(),
+                    row.calls.to_string(),
+                    row.successes.to_string(),
+                    fmt_ms(row.p50_ms),
+                    fmt_ms(row.p95_ms),
+                    fmt_ms(row.p99_ms),
+                    codes,
+                ]
+            })
+            .collect();
+        render_table(&headers, &rows, md);
+    }
+    if !unlisted.is_empty() {
+        // Symmetric with the headline matrix's own "Observed outside the
+        // tracked roster" — an off-roster method exercised only during setup
+        // must not become invisible just because it isn't Load/Drain scoped.
+        md.push_str("Also observed outside the tracked roster during setup:\n\n");
+        let headers = [
+            "Method",
+            "Backend(s)",
+            "Calls",
+            "Successes",
+            "P50 ms",
+            "P95 ms",
+            "P99 ms",
+            "Error codes",
+        ];
+        let rows: Vec<Vec<String>> = unlisted
+            .iter()
+            .map(|row| {
+                let codes = if row.error_codes.is_empty() {
+                    "—".to_string()
+                } else {
+                    format!("{:?}", row.error_codes)
+                };
+                vec![
+                    breakable(&row.method, 8),
+                    row.observed_backends.join(", "),
+                    row.calls.to_string(),
+                    row.successes.to_string(),
+                    fmt_ms(row.p50_ms),
+                    fmt_ms(row.p95_ms),
+                    fmt_ms(row.p99_ms),
+                    codes,
+                ]
+            })
+            .collect();
+        render_table(&headers, &rows, md);
+    }
+}
+
+/// One line per run noting any `Phase::Unknown` RPC calls in its evidence —
+/// rows from a run directory predating phase tagging. Deliberately not
+/// silently dropped nor silently folded into `Load` (which would mislabel
+/// setup-phase evidence as workload evidence on the very next report run
+/// against an old run directory).
+fn render_unknown_phase_advisory(runs: &[RunData], md: &mut String) {
+    let affected: Vec<(&str, usize)> = runs
+        .iter()
+        .map(|r| {
+            (
+                r.manifest.run_id.as_str(),
+                r.rpc_calls
+                    .iter()
+                    .filter(|c| c.phase == Phase::Unknown)
+                    .count(),
+            )
+        })
+        .filter(|(_, count)| *count > 0)
+        .collect();
+    if affected.is_empty() {
+        return;
+    }
+    for (run_id, count) in affected {
+        md.push_str(&format!(
+            "> **Note:** {run_id}: {count} RPC call(s) have unknown phase — this run predates \
+             phase instrumentation and is excluded from every phase-scoped view above (both the \
+             workload matrix/load curve and the setup-phase appendix); regenerate a newer run \
+             for phase-scoped analysis.\n\n"
+        ));
+    }
+}
+
+/// "Setup phase timing" — phase name, start timestamp, and duration (the
+/// delta to the next boundary, or to `run_completed_at` for the last phase)
+/// from `manifest.phase_boundaries`. Kept separate from "Load curve by run"
+/// so setup timing remains visible without it being read as part of the
+/// measured workload.
+fn render_setup_phase_timing(runs: &[RunData], md: &mut String) {
+    md.push_str("## Setup phase timing\n\n");
+    md.push_str(
+        "Wall-clock start time and duration of each lifecycle phase, from the run manifest. \
+         `Load`/`Drain` are included here for completeness but are the measured workload — see \
+         \"Load curve by run\" for their own detail.\n\n",
+    );
+    let mut any = false;
+    for run in runs {
+        let boundaries = &run.manifest.phase_boundaries;
+        if boundaries.is_empty() {
+            continue;
+        }
+        any = true;
+        md.push_str(&format!("### {}\n\n", run.manifest.run_id));
+        let headers = ["Phase", "Started at", "Duration"];
+        let mut rows: Vec<Vec<String>> = boundaries
+            .iter()
+            .enumerate()
+            .map(|(i, b)| {
+                // The last boundary (always Drain, once any phase was
+                // reached at all) ends when `load_phase()` itself returned
+                // — NOT `run_completed_at`, which additionally includes Z3
+                // stack teardown time. Falls back to `run_completed_at` only
+                // for a manifest that predates this field, or a run whose
+                // load phase never completed (setup failed before Drain).
+                let end = boundaries
+                    .get(i + 1)
+                    .map(|next| next.started_at)
+                    .or(run.manifest.load_and_drain_completed_at)
+                    .or(run.manifest.run_completed_at);
+                let duration = end
+                    .map(|e| format!("{}s", (e - b.started_at).num_seconds().max(0)))
+                    .unwrap_or_else(|| "—".to_string());
+                vec![
+                    format!("{:?}", b.phase),
+                    b.started_at.format("%H:%M:%S%.3f").to_string(),
+                    duration,
+                ]
+            })
+            .collect();
+        // The residual gap between the Drain phase's own end and
+        // `run_completed_at` is Z3 stack teardown — shown explicitly rather
+        // than silently absorbed into Drain's duration, so cross-checking
+        // Drain's duration against `confirmed_tx_throughput`'s own
+        // elapsed-time window (which also stops at `load_and_drain_completed_at`)
+        // reconciles.
+        if let (Some(completed), Some(load_and_drain_done)) = (
+            run.manifest.run_completed_at,
+            run.manifest.load_and_drain_completed_at,
+        ) {
+            let teardown_secs = (completed - load_and_drain_done).num_seconds();
+            if teardown_secs > 0 {
+                rows.push(vec![
+                    "Teardown".to_string(),
+                    load_and_drain_done.format("%H:%M:%S%.3f").to_string(),
+                    format!("{teardown_secs}s"),
+                ]);
+            }
+        }
+        render_table(&headers, &rows, md);
+    }
+    if !any {
+        md.push_str(
+            "No phase-boundary data recorded for the runs in this report (these runs predate \
+             phase instrumentation).\n\n",
+        );
+    }
+}
+
 fn render_findings(findings: &[Finding], md: &mut String) {
     md.push_str("## Candidate findings\n\n");
     md.push_str(
@@ -564,6 +1012,7 @@ fn render_findings(findings: &[Finding], md: &mut String) {
         FindingCategory::FlowTypeDisparity,
         FindingCategory::LoadDegradation,
         FindingCategory::DataCompleteness,
+        FindingCategory::KnownLimitation,
     ] {
         let mut items: Vec<&Finding> = findings.iter().filter(|f| f.category == category).collect();
         if items.is_empty() {
@@ -572,7 +1021,13 @@ fn render_findings(findings: &[Finding], md: &mut String) {
         items.sort_by_key(|f| f.severity);
         md.push_str(&format!("### {category}\n\n"));
         for item in items {
-            md.push_str(&format!("- **[{}]** {}\n", item.severity, item.summary));
+            match &item.context {
+                Some(ctx) => md.push_str(&format!(
+                    "- **[{}]** {} ({ctx})\n",
+                    item.severity, item.summary
+                )),
+                None => md.push_str(&format!("- **[{}]** {}\n", item.severity, item.summary)),
+            }
             for ev in &item.evidence {
                 md.push_str(&format!("  - {ev}\n"));
             }
@@ -615,7 +1070,7 @@ fn render_limitations(runs: &[RunData], md: &mut String) {
 /// "High"/"Medium"/"Low" in the report above can be checked against a
 /// precise definition rather than taken on faith.
 fn render_severity_appendix(md: &mut String) {
-    md.push_str("## Appendix: severity tier definitions\n\n");
+    md.push_str("## Appendix C — Severity tier definitions\n\n");
     md.push_str(
         "Severity is assigned mechanically from simple rate/ratio thresholds — a triage \
          aid for this list, not a human severity assessment. Exact rule per category:\n\n",
@@ -657,7 +1112,13 @@ fn render_severity_appendix(md: &mut String) {
     ));
     md.push_str(
         "- **Data completeness** — always **Low**. Flags incomplete evidence (malformed \
-         input lines), not a claim about the system under test.\n\n",
+         input lines), not a claim about the system under test.\n",
+    );
+    md.push_str(
+        "- **Known limitation** — always **Low**. A pre-approved, documented defect matched \
+         on method, phase, and error signature (see `KNOWN_LIMITATIONS` in `findings.rs`); any \
+         other failure for the same method or phase alone is still scored normally, not \
+         masked by this category.\n\n",
     );
 }
 
@@ -672,9 +1133,17 @@ fn render_report_impl(runs: &[RunData], assets_dir: Option<&Path>) -> String {
     render_flow_type_breakdown(runs, &mut md);
     render_load_curve(runs, &health, assets_dir, &mut md);
     render_system_health(runs, &health, &mut md);
-    render_rpc_matrix(runs, &mut md);
+    render_setup_phase_timing(runs, &mut md);
     render_findings(&findings, &mut md);
     render_limitations(runs, &mut md);
+    // ── Appendix ── moved out of the main report body per the client's
+    // explicit ask: the full RPC matrix and retry distributions are
+    // reference detail, not what a reader needs to judge pass/fail.
+    md.push_str("# Appendix\n\n");
+    render_rpc_matrix(runs, &mut md);
+    render_retry_detail(runs, &mut md);
+    render_setup_phase_rpc_activity(runs, &mut md);
+    render_unknown_phase_advisory(runs, &mut md);
     render_severity_appendix(&mut md);
     md
 }
@@ -684,8 +1153,8 @@ pub fn render_report(runs: &[RunData]) -> String {
     render_report_impl(runs, None)
 }
 
-/// Renders the full Markdown report, additionally generating a TPS chart
-/// and a latency chart per run into `assets_dir` (created if missing) and
+/// Renders the full Markdown report, additionally generating an RPC-call-rate
+/// chart and a latency chart per run into `assets_dir` (created if missing) and
 /// embedding them via absolute file paths — simplest way to keep the
 /// images resolvable regardless of the working directory a PDF converter
 /// is run from.
@@ -698,13 +1167,14 @@ pub fn render_report_with_assets(runs: &[RunData], assets_dir: &Path) -> String 
 mod tests {
     use super::*;
     use crate::data_model::{Backend, FlowType, IntentRecord, RpcCall};
-    use crate::metrics::{RunManifest, RunTimeouts};
+    use crate::metrics::{RunManifest, RunTimeouts, StateIdentifier};
     use chrono::Utc;
 
     fn sample_run() -> RunData {
         RunData {
             run_dir: "/tmp/r1".into(),
             manifest: RunManifest {
+                env_id: String::new(),
                 run_id: "20260803T084825Z-smoke".into(),
                 run_started_at: Utc::now(),
                 run_completed_at: Some(Utc::now()),
@@ -716,6 +1186,14 @@ mod tests {
                 scenario_config_hash: "sha256:x".into(),
                 target_tps: 1.0,
                 timeouts: RunTimeouts::default(),
+                phase_boundaries: Vec::new(),
+                load_and_drain_completed_at: None,
+                compose_config_hash: String::new(),
+                image_digests: Vec::new(),
+                host_cpu_count: 0,
+                host_memory_limit_bytes: None,
+                state: StateIdentifier::default(),
+                assertion: None,
             },
             rpc_calls: vec![
                 RpcCall {
@@ -730,6 +1208,9 @@ mod tests {
                     success: true,
                     error_code: None,
                     error_message: None,
+                    phase: crate::data_model::Phase::Load,
+                    intent_id: None,
+                    attempt_number: 1,
                 },
                 RpcCall {
                     call_id: "c2".into(),
@@ -743,6 +1224,9 @@ mod tests {
                     success: false,
                     error_code: Some(-20),
                     error_message: Some("WalletDb::get_memo failed".into()),
+                    phase: crate::data_model::Phase::Load,
+                    intent_id: None,
+                    attempt_number: 1,
                 },
             ],
             intents: vec![
@@ -754,6 +1238,7 @@ mod tests {
                     error: None,
                     timeout_context: None,
                     recorded_at: Utc::now(),
+                    failure_class: None,
                 },
                 IntentRecord {
                     run_id: "r".into(),
@@ -763,6 +1248,7 @@ mod tests {
                     error: Some("insufficient balance".into()),
                     timeout_context: None,
                     recorded_at: Utc::now(),
+                    failure_class: Some(crate::data_model::IntentFailureClass::InsufficientBalance),
                 },
             ],
             metrics: Vec::new(),
@@ -798,13 +1284,15 @@ mod tests {
         let md = render_report(&[sample_run()]);
         assert!(md.contains("## Load curve by run"));
         assert!(md.contains("20260803T084825Z-smoke"));
-        assert!(md.contains("TPS"));
+        // Rendered from the `confirmed_tx_throughput` metric (see
+        // `render_load_curve`) — the only rate labeled "TPS" in this report.
+        assert!(md.contains("Confirmed tx throughput (TPS)"));
     }
 
     #[test]
     fn render_report_includes_rpc_matrix_with_status() {
         let md = render_report(&[sample_run()]);
-        assert!(md.contains("## RPC compatibility matrix"));
+        assert!(md.contains("## Appendix A — RPC compatibility matrix"));
         assert!(md.contains("z_listun")); // method name may carry break hints past this point
         assert!(md.contains("Failed"));
     }
@@ -815,7 +1303,9 @@ mod tests {
         assert!(md.contains("## Candidate findings"));
         assert!(md.contains("not finished findings"));
         assert!(md.contains("z_listunspent"));
-        assert!(md.contains("**[High]**") || md.contains("**[Medium]**") || md.contains("**[Low]**"));
+        assert!(
+            md.contains("**[High]**") || md.contains("**[Medium]**") || md.contains("**[Low]**")
+        );
     }
 
     #[test]
@@ -830,6 +1320,7 @@ mod tests {
             error: None,
             timeout_context: None,
             recorded_at: Utc::now(),
+            failure_class: None,
         }];
         let md = render_report(&[run]);
         assert!(md.contains("No candidates flagged"));
@@ -846,7 +1337,7 @@ mod tests {
     #[test]
     fn render_report_includes_severity_appendix() {
         let md = render_report(&[sample_run()]);
-        assert!(md.contains("## Appendix: severity tier definitions"));
+        assert!(md.contains("## Appendix C — Severity tier definitions"));
         assert!(md.contains("RPC failure"));
         assert!(md.contains("Load degradation"));
     }
@@ -859,11 +1350,137 @@ mod tests {
     }
 
     #[test]
+    fn unknown_phase_calls_produce_advisory_not_silent_drop() {
+        let mut run = sample_run();
+        run.rpc_calls.push(RpcCall {
+            call_id: "c-unknown".into(),
+            run_id: "r".into(),
+            method: "getblockcount".into(),
+            backend: crate::data_model::Backend::Zebra,
+            params_hash: None,
+            request_at: chrono::Utc::now(),
+            response_at: Some(chrono::Utc::now()),
+            latency_ms: Some(5),
+            success: true,
+            error_code: None,
+            error_message: None,
+            phase: Phase::Unknown,
+            intent_id: None,
+            attempt_number: 1,
+        });
+        let md = render_report(&[run]);
+        assert!(
+            md.contains("unknown phase"),
+            "expected an advisory line naming unknown-phase calls; got:\n{md}"
+        );
+        assert!(
+            md.contains("predates phase instrumentation"),
+            "advisory must explain why, not just flag the count; got:\n{md}"
+        );
+    }
+
+    #[test]
+    fn render_report_without_unknown_phase_calls_omits_the_advisory() {
+        let md = render_report(&[sample_run()]);
+        assert!(!md.contains("predates phase instrumentation"));
+    }
+
+    #[test]
+    fn render_report_includes_setup_phase_sections() {
+        let md = render_report(&[sample_run()]);
+        assert!(md.contains("## Setup phase timing"));
+        assert!(md.contains("## Appendix B — Setup-phase RPC activity"));
+    }
+
+    #[test]
+    fn setup_phase_timing_drain_duration_excludes_teardown_and_shows_it_separately() {
+        // Regression guard: the Drain row's duration must reconcile with
+        // `confirmed_tx_throughput`'s own elapsed-time window — both stop at
+        // `load_and_drain_completed_at`, not `run_completed_at` (which also
+        // includes Z3 stack teardown time). The gap between the two must
+        // still be visible, as its own "Teardown" row, not silently dropped.
+        use crate::data_model::Phase;
+        use crate::metrics::PhaseBoundary;
+        use chrono::TimeZone;
+
+        let mut run = sample_run();
+        let t0 = chrono::Utc.with_ymd_and_hms(2026, 9, 5, 9, 0, 0).unwrap();
+        run.manifest.phase_boundaries = vec![
+            PhaseBoundary {
+                phase: Phase::Load,
+                started_at: t0,
+            },
+            PhaseBoundary {
+                phase: Phase::Drain,
+                started_at: t0 + chrono::Duration::seconds(5),
+            },
+        ];
+        // Drain's own work finishes 10s after it starts...
+        run.manifest.load_and_drain_completed_at = Some(t0 + chrono::Duration::seconds(15));
+        // ...but teardown (stopping the Z3 stack) takes a further 20s before
+        // run_completed_at is set.
+        run.manifest.run_completed_at = Some(t0 + chrono::Duration::seconds(35));
+
+        let md = render_report(&[run]);
+        let section = &md[md.find("## Setup phase timing").unwrap()..];
+        let section = &section[..section
+            .find("## Appendix A — RPC compatibility matrix")
+            .unwrap()];
+
+        assert!(
+            section.contains("Drain") && section.contains("| 10s |"),
+            "Drain row must show 10s (load_and_drain_completed_at - Drain.started_at), \
+             not 30s (run_completed_at - Drain.started_at); got:\n{section}"
+        );
+        assert!(
+            section.contains("Teardown") && section.contains("| 20s |"),
+            "the residual gap to run_completed_at must appear as its own Teardown row; \
+             got:\n{section}"
+        );
+    }
+
+    #[test]
+    fn setup_phase_unlisted_method_is_not_silently_dropped() {
+        // Regression guard: an off-roster method exercised only during
+        // setup (never during Load/Drain) must still surface somewhere in
+        // the report — in the setup-phase appendix's own unlisted listing —
+        // rather than becoming invisible once the headline matrix's
+        // "Observed outside the tracked roster" table was scoped to
+        // Load/Drain only.
+        let mut run = sample_run();
+        run.rpc_calls.push(RpcCall {
+            call_id: "c-setup-unlisted".into(),
+            run_id: "r".into(),
+            method: "z_getbalanceforaccount".into(),
+            backend: crate::data_model::Backend::Zallet,
+            params_hash: None,
+            request_at: chrono::Utc::now(),
+            response_at: Some(chrono::Utc::now()),
+            latency_ms: Some(6),
+            success: true,
+            error_code: None,
+            error_message: None,
+            phase: Phase::Funding,
+            intent_id: None,
+            attempt_number: 1,
+        });
+        let md = render_report(&[run]);
+        assert!(
+            md.contains("Also observed outside the tracked roster during setup"),
+            "expected the setup-phase unlisted subsection; got:\n{md}"
+        );
+        assert!(md.contains("z_getbal"));
+    }
+
+    #[test]
     fn render_table_pads_separator_width_to_content() {
         let mut md = String::new();
         render_table(
             &["Short", "Also short"],
-            &[vec!["a-very-long-cell-value-here".to_string(), "x".to_string()]],
+            &[vec![
+                "a-very-long-cell-value-here".to_string(),
+                "x".to_string(),
+            ]],
             &mut md,
         );
         let sep_line = md.lines().nth(1).unwrap();
@@ -891,7 +1508,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let md = render_report_with_assets(&[sample_run()], dir.path());
         assert!(md.contains(".png"));
-        assert!(md.contains("![TPS over time]"));
+        assert!(md.contains("![RPC calls per second over time]"));
         assert!(md.contains("![Latency over time]"));
     }
 
@@ -902,5 +1519,128 @@ mod tests {
         assert!(!assets.exists());
         render_report_with_assets(&[sample_run()], &assets);
         assert!(assets.exists());
+    }
+
+    #[test]
+    fn executive_summary_answers_five_questions_in_order_before_any_per_run_table() {
+        let md = render_report(&[sample_run()]);
+        let summary_end = md.find("## Runs included in this report").unwrap();
+        let summary = &md[..summary_end];
+
+        let headers = [
+            "### 1. Assertion result",
+            "### 2. Component versions",
+            "### 3. State freshness",
+            "### 4. Intent-level failures",
+            "### 5. Actionable findings",
+        ];
+        let mut last_pos = 0;
+        for h in headers {
+            let pos = summary.find(h).unwrap_or_else(|| {
+                panic!("expected header {h:?} in executive summary:\n{summary}")
+            });
+            assert!(
+                pos >= last_pos,
+                "header {h:?} appeared out of order in executive summary:\n{summary}"
+            );
+            last_pos = pos;
+        }
+    }
+
+    #[test]
+    fn intents_attempted_line_is_filed_under_intent_level_failures_not_actionable_findings() {
+        // Regression test for a report-structure bug: "Intents attempted"
+        // is a workload-count line, not a finding, and must appear between
+        // the "4. Intent-level failures" and "5. Actionable findings"
+        // headers — not after the latter, where it would open the
+        // "Actionable findings" section with content that isn't a finding
+        // at all.
+        let md = render_report(&[sample_run()]);
+        let item4 = md.find("### 4. Intent-level failures").unwrap();
+        let item5 = md.find("### 5. Actionable findings").unwrap();
+        let between = &md[item4..item5];
+        assert!(
+            between.contains("Intents attempted:"),
+            "expected \"Intents attempted\" between items 4 and 5:\n{between}"
+        );
+        let after_item5 = &md[item5..];
+        let candidate_findings_heading = after_item5.find("## Candidate findings").unwrap();
+        assert!(
+            !after_item5[..candidate_findings_heading].contains("Intents attempted:"),
+            "\"Intents attempted\" must not appear inside \"5. Actionable findings\":\n{}",
+            &after_item5[..candidate_findings_heading]
+        );
+    }
+
+    #[test]
+    fn executive_summary_shows_assertion_versions_and_freshness() {
+        let mut run = sample_run();
+        run.manifest.assertion = Some(crate::scenarios::runner::result::AssertionOutcome {
+            passed: false,
+            violations: vec!["confirmed 1 < min_confirmed 2".to_string()],
+        });
+        run.manifest.image_digests = vec![crate::z3::ImageInfo {
+            service: "zebra".into(),
+            image: "zfnd/zebra:6.0.0".into(),
+            id: "sha256:abc123".into(),
+        }];
+        run.manifest.state = crate::metrics::StateIdentifier {
+            reset_epoch: 3,
+            chain_height_at_start: 42,
+            hot_wallet_balance_at_start_zat: 0,
+            freshness: crate::metrics::StateFreshness::Reused,
+        };
+        run.manifest.env_id = "a1b2c3d4".into();
+        let md = render_report(&[run]);
+        assert!(md.contains("FAIL"));
+        assert!(md.contains("confirmed 1 < min_confirmed 2"));
+        assert!(md.contains("zfnd/zebra:6.0.0"));
+        assert!(md.contains("reused (reset epoch 3, chain height 42)"));
+        // Ties the manifest back to the specific isolated Track-2
+        // environment that produced it (FINDING-5).
+        assert!(md.contains("environment z3-sim-a1b2c3d4"));
+        // sample_run() carries exactly one failed intent, classified
+        // InsufficientBalance.
+        assert!(md.contains("**1 terminal failure(s)** — 1 insufficient_balance"));
+    }
+
+    #[test]
+    fn rpc_matrix_and_retry_detail_and_setup_activity_appear_only_in_the_appendix() {
+        let md = render_report(&[sample_run()]);
+        let appendix_start = md.find("# Appendix").expect("expected an Appendix section");
+        let (before, after) = md.split_at(appendix_start);
+
+        for heading in [
+            "## Appendix A — RPC compatibility matrix",
+            "## Appendix B — Setup-phase RPC activity",
+            "## Appendix C — Severity tier definitions",
+        ] {
+            assert_eq!(
+                before.matches(heading).count(),
+                0,
+                "{heading:?} must not appear before the Appendix section"
+            );
+            assert_eq!(
+                after.matches(heading).count(),
+                1,
+                "{heading:?} must appear exactly once, inside the Appendix section"
+            );
+        }
+        // "Candidate findings" (the full list) must come before the appendix,
+        // not after — the executive summary's condensed High-severity list
+        // is a separate, earlier occurrence of similar wording, so anchor on
+        // the full section's own heading instead.
+        assert!(before.contains("## Candidate findings"));
+        assert!(!after.contains("## Candidate findings"));
+    }
+
+    #[test]
+    fn candidate_findings_disclaimer_text_is_unchanged() {
+        let md = render_report(&[sample_run()]);
+        assert!(md.contains(
+            "**These are flagged candidates, not finished findings.** Each is a mechanically \
+             detected statistical outlier or observed failure, stated with only what the data \
+             shows."
+        ));
     }
 }

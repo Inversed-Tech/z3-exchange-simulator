@@ -18,7 +18,12 @@ use super::error::ReportError;
 /// logs. `parse_warnings` records lines that failed to deserialize (skipped,
 /// not fatal to the load) so the report can surface incomplete evidence
 /// explicitly rather than silently under-counting.
-#[derive(Debug)]
+///
+/// `Clone` so callers (e.g. `findings::rpc_failure_candidates`) can build a
+/// filtered copy — with specific `rpc_calls` entries removed — to feed
+/// through the same aggregation (`build_matrix`) used everywhere else,
+/// rather than hand-duplicating its counting semantics.
+#[derive(Debug, Clone)]
 pub struct RunData {
     pub run_dir: PathBuf,
     pub manifest: RunManifest,
@@ -111,11 +116,12 @@ pub fn load_runs(run_dirs: &[PathBuf]) -> Result<Vec<RunData>, ReportError> {
 mod tests {
     use super::*;
     use crate::data_model::{Backend, FlowType};
-    use crate::metrics::RunTimeouts;
+    use crate::metrics::{RunTimeouts, StateIdentifier};
     use chrono::Utc;
 
     fn write_run(dir: &Path, corrupt_intents_line: bool) {
         let manifest = RunManifest {
+            env_id: String::new(),
             run_id: "test-run".into(),
             run_started_at: Utc::now(),
             run_completed_at: Some(Utc::now()),
@@ -127,6 +133,14 @@ mod tests {
             scenario_config_hash: "sha256:x".into(),
             target_tps: 1.0,
             timeouts: RunTimeouts::default(),
+            phase_boundaries: Vec::new(),
+            load_and_drain_completed_at: None,
+            compose_config_hash: String::new(),
+            image_digests: Vec::new(),
+            host_cpu_count: 0,
+            host_memory_limit_bytes: None,
+            state: StateIdentifier::default(),
+            assertion: None,
         };
         std::fs::write(
             dir.join("manifest.json"),
@@ -146,6 +160,9 @@ mod tests {
             success: true,
             error_code: None,
             error_message: None,
+            phase: crate::data_model::Phase::Unknown,
+            intent_id: None,
+            attempt_number: 1,
         };
         std::fs::write(
             dir.join("rpc_calls.jsonl"),
@@ -161,6 +178,7 @@ mod tests {
             error: None,
             timeout_context: None,
             recorded_at: Utc::now(),
+            failure_class: None,
         };
         let mut intents_content = format!("{}\n", serde_json::to_string(&intent).unwrap());
         if corrupt_intents_line {

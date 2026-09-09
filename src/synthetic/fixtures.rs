@@ -46,7 +46,7 @@ mod tests {
     use super::*;
     use crate::data_model::{
         Account, AccountStatus, ActivityProfile, ActivityProfileConfig, AmountRangeConfig,
-        FlowConfig, ObservabilityConfig, ScenarioConfig,
+        ExpectationsConfig, FlowConfig, ObservabilityConfig, ScenarioConfig,
     };
     use crate::synthetic::generators::AccountGenerator;
     use chrono::Utc;
@@ -86,6 +86,7 @@ mod tests {
             config_hash: String::new(),
             source_path: String::new(),
             warmup_blocks: 10,
+            expectations: ExpectationsConfig::default(),
         };
         let mut gen = AccountGenerator::new(config).unwrap();
         gen.generate_population().unwrap()

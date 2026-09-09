@@ -20,8 +20,16 @@ struct MetricAgg {
     confirmed_total: f64,
     failed_total: f64,
     saturation_events: u64,
-    proving_ms: Vec<u64>,
-    tps_achieved: Option<f64>,
+    /// `shielded_proving_time_ms` samples only — ZK spend/output proof
+    /// generation. Kept separate from `wallet_operation_ms` so a purely
+    /// transparent run's wallet-operation latency is never rendered under
+    /// the "Shielded transaction proving times" heading.
+    shielded_proving_ms: Vec<u64>,
+    /// `wallet_operation_time_ms` samples — the same measured window for a
+    /// withdrawal with no shielded leg, where no ZK proof is generated.
+    wallet_operation_ms: Vec<u64>,
+    scheduled_dispatch_rate: Option<f64>,
+    confirmed_tx_throughput: Option<f64>,
 }
 
 #[derive(Default)]
@@ -37,9 +45,18 @@ struct IntentAgg {
 /// stall reads "operation <id> did not complete ..."; a confirmation-depth
 /// stall reads "tx <id> did not reach ... confirmations". Bucketing avoids a
 /// summary table exploding into one row per distinct intent/tx id.
-fn timeout_stage(context: &str) -> &'static str {
+/// `is_shielded` gates the "(ZK proving)" qualifier — an async
+/// `z_sendmany`-operation wait applies to transparent sends too (they go
+/// through the same operation-id polling), so only a flow that actually
+/// creates a shielded proof may be described as proving time (Track 5 of
+/// the Foundation feedback).
+fn timeout_stage(context: &str, is_shielded: bool) -> &'static str {
     if context.starts_with("operation ") {
-        "async operation (ZK proving) wait"
+        if is_shielded {
+            "async operation (ZK proving) wait"
+        } else {
+            "async operation (wallet operation completion) wait"
+        }
     } else if context.starts_with("tx ") {
         "on-chain confirmation wait"
     } else {
@@ -47,8 +64,72 @@ fn timeout_stage(context: &str) -> &'static str {
     }
 }
 
+/// Accumulates one `RpcCall` into `aggs`, keyed by `(method, backend)`. Shared
+/// by the workload-scoped and setup-scoped accumulation passes in
+/// `generate_summary` so the two can never drift on how a row is built.
+fn accumulate_rpc_call(aggs: &mut HashMap<(String, String), RpcCallAgg>, call: &RpcCall) {
+    let backend_str = format!("{:?}", call.backend);
+    let agg = aggs
+        .entry((call.method.clone(), backend_str))
+        .or_insert_with(|| RpcCallAgg {
+            count: 0,
+            success_count: 0,
+            latencies: vec![],
+            error_counts: HashMap::new(),
+        });
+    agg.count += 1;
+    if call.success {
+        agg.success_count += 1;
+    }
+    if let Some(ms) = call.latency_ms {
+        agg.latencies.push(ms);
+    }
+    if let Some(code) = call.error_code {
+        *agg.error_counts.entry(code).or_default() += 1;
+    }
+}
+
+/// Renders one `| Method | Backend | P50 ms | P95 ms | P99 ms | Calls | Errors |`
+/// table from `aggs`, sorted by `(method, backend)`. Shared by the
+/// workload-scoped and setup-scoped sections in `generate_summary`.
+fn render_rpc_agg_table(aggs: &HashMap<(String, String), RpcCallAgg>, md: &mut String) {
+    md.push_str("| Method | Backend | P50 ms | P95 ms | P99 ms | Calls | Errors |\n");
+    md.push_str("|---|---|---|---|---|---|---|\n");
+
+    let mut agg_entries: Vec<_> = aggs.iter().collect();
+    agg_entries.sort_by(|a, b| a.0.cmp(b.0));
+
+    for ((method, backend), agg) in &agg_entries {
+        let error_count = agg.count - agg.success_count;
+        let mut latencies = agg.latencies.clone();
+        let (p50_str, p95_str, p99_str) = if latencies.is_empty() {
+            ("N/A".to_string(), "N/A".to_string(), "N/A".to_string())
+        } else {
+            latencies.sort_unstable();
+            (
+                format!("{:.0}", percentile_value(&latencies, 0.50)),
+                format!("{:.0}", percentile_value(&latencies, 0.95)),
+                format!("{:.0}", percentile_value(&latencies, 0.99)),
+            )
+        };
+        md.push_str(&format!(
+            "| {method} | {backend} | {p50_str} | {p95_str} | {p99_str} | {} | {error_count} |\n",
+            agg.count
+        ));
+    }
+    md.push('\n');
+}
+
 pub fn generate_summary(run_dir: &RunDir, manifest: &RunManifest) -> Result<String, MetricsError> {
-    let mut rpc_aggs: HashMap<(String, String), RpcCallAgg> = HashMap::new();
+    // Scoped the same way `report::rpc_matrix::build_matrix` scopes the
+    // aggregate findings report: the headline table reflects the measured
+    // workload (Load/Drain) only, so a setup-phase retry (funding fan-out,
+    // warmup mining) can never inflate a per-method failure count here the
+    // way it did before phase tagging existed. Setup-phase activity is kept,
+    // not discarded — shown in its own table below instead.
+    let mut workload_aggs: HashMap<(String, String), RpcCallAgg> = HashMap::new();
+    let mut setup_aggs: HashMap<(String, String), RpcCallAgg> = HashMap::new();
+    let mut unknown_phase_calls: u64 = 0;
 
     let rpc_path = run_dir.rpc_calls_path();
     if rpc_path.exists() {
@@ -60,24 +141,15 @@ pub fn generate_summary(run_dir: &RunDir, manifest: &RunManifest) -> Result<Stri
             }
             match serde_json::from_str::<RpcCall>(&line) {
                 Ok(call) => {
-                    let backend_str = format!("{:?}", call.backend);
-                    let agg = rpc_aggs
-                        .entry((call.method.clone(), backend_str))
-                        .or_insert_with(|| RpcCallAgg {
-                            count: 0,
-                            success_count: 0,
-                            latencies: vec![],
-                            error_counts: HashMap::new(),
-                        });
-                    agg.count += 1;
-                    if call.success {
-                        agg.success_count += 1;
-                    }
-                    if let Some(ms) = call.latency_ms {
-                        agg.latencies.push(ms);
-                    }
-                    if let Some(code) = call.error_code {
-                        *agg.error_counts.entry(code).or_default() += 1;
+                    if call.phase.is_workload() {
+                        accumulate_rpc_call(&mut workload_aggs, &call);
+                    } else if call.phase.is_setup() {
+                        accumulate_rpc_call(&mut setup_aggs, &call);
+                    } else {
+                        // Phase::Unknown — a run predating phase tagging.
+                        // Excluded from both tables rather than assumed to
+                        // be either, same as the aggregate findings report.
+                        unknown_phase_calls += 1;
                     }
                 }
                 Err(e) => eprintln!("[metrics] summary: malformed rpc_calls line: {e}"),
@@ -90,8 +162,10 @@ pub fn generate_summary(run_dir: &RunDir, manifest: &RunManifest) -> Result<Stri
         confirmed_total: 0.0,
         failed_total: 0.0,
         saturation_events: 0,
-        proving_ms: vec![],
-        tps_achieved: None,
+        shielded_proving_ms: vec![],
+        wallet_operation_ms: vec![],
+        scheduled_dispatch_rate: None,
+        confirmed_tx_throughput: None,
     };
 
     let metrics_path = run_dir.metrics_path();
@@ -116,10 +190,14 @@ pub fn generate_summary(run_dir: &RunDir, manifest: &RunManifest) -> Result<Stri
                             magg.saturation_events += 1;
                         }
                     }
-                    "withdrawal_proving_time_ms" => {
-                        magg.proving_ms.push(sample.value as u64);
+                    "shielded_proving_time_ms" => {
+                        magg.shielded_proving_ms.push(sample.value as u64);
                     }
-                    "tps_achieved" => magg.tps_achieved = Some(sample.value),
+                    "wallet_operation_time_ms" => {
+                        magg.wallet_operation_ms.push(sample.value as u64);
+                    }
+                    "scheduled_dispatch_rate" => magg.scheduled_dispatch_rate = Some(sample.value),
+                    "confirmed_tx_throughput" => magg.confirmed_tx_throughput = Some(sample.value),
                     _ => {}
                 },
                 Err(e) => eprintln!("[metrics] summary: malformed metrics line: {e}"),
@@ -153,7 +231,9 @@ pub fn generate_summary(run_dir: &RunDir, manifest: &RunManifest) -> Result<Stri
                         "timed_out" => {
                             agg.timed_out += 1;
                             if let Some(ctx) = &record.timeout_context {
-                                *timeout_stage_counts.entry(timeout_stage(ctx)).or_default() += 1;
+                                *timeout_stage_counts
+                                    .entry(timeout_stage(ctx, record.flow_type.is_shielded()))
+                                    .or_default() += 1;
                             }
                         }
                         _ => {}
@@ -182,7 +262,11 @@ pub fn generate_summary(run_dir: &RunDir, manifest: &RunManifest) -> Result<Stri
         (0.0, 0.0)
     };
 
-    let achieved_tps_str = match magg.tps_achieved {
+    let dispatch_rate_str = match magg.scheduled_dispatch_rate {
+        Some(v) => format!("{v:.1}"),
+        None => "N/A".to_string(),
+    };
+    let confirmed_throughput_str = match magg.confirmed_tx_throughput {
         Some(v) => format!("{v:.1}"),
         None => "N/A".to_string(),
     };
@@ -190,6 +274,22 @@ pub fn generate_summary(run_dir: &RunDir, manifest: &RunManifest) -> Result<Stri
     let mut md = String::new();
 
     md.push_str(&format!("# Run Summary: {}\n\n", manifest.run_id));
+
+    md.push_str("## Result\n");
+    match &manifest.assertion {
+        Some(a) if a.passed => md.push_str("**PASS**\n\n"),
+        Some(a) => {
+            md.push_str("**FAIL**\n");
+            for v in &a.violations {
+                md.push_str(&format!("- {v}\n"));
+            }
+            md.push('\n');
+        }
+        None => md.push_str(
+            "No assertion recorded — the run never reached evaluation (setup failed) or this \
+             scenario predates `expectations`.\n\n",
+        ),
+    }
 
     md.push_str("## Run metadata\n");
     md.push_str(&format!("- Scenario: {}\n", manifest.scenario_name));
@@ -208,8 +308,17 @@ pub fn generate_summary(run_dir: &RunDir, manifest: &RunManifest) -> Result<Stri
     ));
 
     md.push_str("## Load results\n");
-    md.push_str(&format!("- Target TPS: {}\n", manifest.target_tps));
-    md.push_str(&format!("- Achieved TPS: {achieved_tps_str}\n"));
+    md.push_str(&format!(
+        "- Target dispatch rate: {} intents/s\n",
+        manifest.target_tps
+    ));
+    md.push_str(&format!(
+        "- Scheduled dispatch rate: {dispatch_rate_str} intents/s (actual load-phase elapsed \
+         time, not the configured duration)\n"
+    ));
+    md.push_str(&format!(
+        "- Confirmed tx throughput (TPS): {confirmed_throughput_str}\n"
+    ));
     md.push_str(&format!(
         "- Total transactions attempted: {}\n",
         total_attempted as u64
@@ -224,31 +333,30 @@ pub fn generate_summary(run_dir: &RunDir, manifest: &RunManifest) -> Result<Stri
     ));
 
     md.push_str("## RPC latency (P50 / P95 / P99)\n");
-    md.push_str("| Method | Backend | P50 ms | P95 ms | P99 ms | Calls | Errors |\n");
-    md.push_str("|---|---|---|---|---|---|---|\n");
+    md.push_str(
+        "Scoped to the measured workload (Load/Drain phase calls) — setup-phase activity \
+         (bootstrap, warmup mining, funding fan-out, including its own retries) is shown \
+         separately below and never mixed into this table's Calls/Errors counts.\n",
+    );
+    render_rpc_agg_table(&workload_aggs, &mut md);
 
-    let mut agg_entries: Vec<_> = rpc_aggs.iter().collect();
-    agg_entries.sort_by(|a, b| a.0.cmp(b.0));
+    if !setup_aggs.is_empty() {
+        md.push_str("## Setup-phase RPC activity\n");
+        md.push_str(
+            "Informational — RPC activity before the measured workload began (stack bootstrap, \
+             hot-wallet readiness, warmup mining, the funding fan-out and its own \
+             anchor-confirmation retries). Not part of the workload table above.\n",
+        );
+        render_rpc_agg_table(&setup_aggs, &mut md);
+    }
 
-    for ((method, backend), agg) in &agg_entries {
-        let error_count = agg.count - agg.success_count;
-        let mut latencies = agg.latencies.clone();
-        let (p50_str, p95_str, p99_str) = if latencies.is_empty() {
-            ("N/A".to_string(), "N/A".to_string(), "N/A".to_string())
-        } else {
-            latencies.sort_unstable();
-            (
-                format!("{:.0}", percentile_value(&latencies, 0.50)),
-                format!("{:.0}", percentile_value(&latencies, 0.95)),
-                format!("{:.0}", percentile_value(&latencies, 0.99)),
-            )
-        };
+    if unknown_phase_calls > 0 {
         md.push_str(&format!(
-            "| {method} | {backend} | {p50_str} | {p95_str} | {p99_str} | {} | {error_count} |\n",
-            agg.count
+            "> **Note:** {unknown_phase_calls} RPC call(s) have unknown phase — this run \
+             predates phase instrumentation and they are excluded from both tables above \
+             rather than assumed to be workload or setup activity.\n\n"
         ));
     }
-    md.push('\n');
 
     md.push_str("## Mempool\n");
     md.push_str(&format!(
@@ -261,10 +369,24 @@ pub fn generate_summary(run_dir: &RunDir, manifest: &RunManifest) -> Result<Stri
     ));
 
     md.push_str("## Shielded transaction proving times\n");
-    if magg.proving_ms.is_empty() {
+    if magg.shielded_proving_ms.is_empty() {
         md.push_str("- P50: N/A ms, P95: N/A ms, P99: N/A ms\n\n");
     } else {
-        let mut sorted = magg.proving_ms.clone();
+        let mut sorted = magg.shielded_proving_ms.clone();
+        sorted.sort_unstable();
+        md.push_str(&format!(
+            "- P50: {:.0} ms, P95: {:.0} ms, P99: {:.0} ms\n\n",
+            percentile_value(&sorted, 0.50),
+            percentile_value(&sorted, 0.95),
+            percentile_value(&sorted, 0.99),
+        ));
+    }
+
+    md.push_str("## Wallet operation times (no shielded proof)\n");
+    if magg.wallet_operation_ms.is_empty() {
+        md.push_str("- P50: N/A ms, P95: N/A ms, P99: N/A ms\n\n");
+    } else {
+        let mut sorted = magg.wallet_operation_ms.clone();
         sorted.sort_unstable();
         md.push_str(&format!(
             "- P50: {:.0} ms, P95: {:.0} ms, P99: {:.0} ms\n\n",
@@ -300,15 +422,22 @@ pub fn generate_summary(run_dir: &RunDir, manifest: &RunManifest) -> Result<Stri
     }
 
     md.push_str("## Notable errors and findings\n");
-    let has_errors = agg_entries
-        .iter()
-        .any(|(_, agg)| !agg.error_counts.is_empty());
+    let has_errors = workload_aggs
+        .values()
+        .chain(setup_aggs.values())
+        .any(|agg| !agg.error_counts.is_empty());
     if has_errors {
-        for ((method, _backend), agg) in &agg_entries {
-            let mut codes: Vec<_> = agg.error_counts.iter().collect();
-            codes.sort_by_key(|(code, _)| *code);
-            for (code, count) in codes {
-                md.push_str(&format!("- {method}: error {code} × {count}\n"));
+        for (scope_label, aggs) in [("workload", &workload_aggs), ("setup", &setup_aggs)] {
+            let mut entries: Vec<_> = aggs.iter().collect();
+            entries.sort_by(|a, b| a.0.cmp(b.0));
+            for ((method, _backend), agg) in &entries {
+                let mut codes: Vec<_> = agg.error_counts.iter().collect();
+                codes.sort_by_key(|(code, _)| *code);
+                for (code, count) in codes {
+                    md.push_str(&format!(
+                        "- [{scope_label}] {method}: error {code} × {count}\n"
+                    ));
+                }
             }
         }
     } else {
@@ -322,7 +451,7 @@ pub fn generate_summary(run_dir: &RunDir, manifest: &RunManifest) -> Result<Stri
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::metrics::manifest::{RunManifest, RunTimeouts};
+    use crate::metrics::manifest::{RunManifest, RunTimeouts, StateIdentifier};
     use crate::metrics::run_dir::RunDir;
     use crate::metrics::writers::JsonlWriter;
 
@@ -347,10 +476,14 @@ mod tests {
             success: true,
             error_code: None,
             error_message: None,
+            phase: crate::data_model::Phase::Load,
+            intent_id: None,
+            attempt_number: 1,
         });
         std::fs::write(rd.metrics_path(), "").unwrap();
 
         let manifest = RunManifest {
+            env_id: String::new(),
             run_id: rd.run_id.clone(),
             run_started_at: Utc::now(),
             run_completed_at: Some(Utc::now()),
@@ -362,6 +495,14 @@ mod tests {
             scenario_config_hash: "sha:0".into(),
             target_tps: 10.0,
             timeouts: RunTimeouts::default(),
+            phase_boundaries: Vec::new(),
+            load_and_drain_completed_at: None,
+            compose_config_hash: String::new(),
+            image_digests: Vec::new(),
+            host_cpu_count: 0,
+            host_memory_limit_bytes: None,
+            state: StateIdentifier::default(),
+            assertion: None,
         };
 
         generate_summary(&rd, &manifest).unwrap();
@@ -374,7 +515,10 @@ mod tests {
             md.contains("## Load results"),
             "missing load results section"
         );
-        assert!(md.contains("Target TPS"), "missing target TPS line");
+        assert!(
+            md.contains("Target dispatch rate"),
+            "missing target dispatch rate line"
+        );
         assert!(md.contains("## RPC latency"), "missing latency section");
         assert!(
             md.contains("| getblockcount"),
@@ -389,7 +533,90 @@ mod tests {
     }
 
     #[test]
-    fn generate_summary_shows_tps_and_confirmed_from_metrics_jsonl() {
+    fn timeout_stage_labels_proving_only_for_shielded_flows() {
+        // Track 5 of the Foundation feedback: an async z_sendmany-operation
+        // wait applies to transparent sends too, so only a shielded flow
+        // may be described as "(ZK proving)".
+        assert_eq!(
+            timeout_stage("operation op-1 did not complete within the deadline", true),
+            "async operation (ZK proving) wait"
+        );
+        assert_eq!(
+            timeout_stage("operation op-1 did not complete within the deadline", false),
+            "async operation (wallet operation completion) wait"
+        );
+        assert_eq!(
+            timeout_stage("tx abcd did not confirm within the deadline", false),
+            "on-chain confirmation wait"
+        );
+    }
+
+    #[test]
+    fn generate_summary_renders_result_verdict() {
+        use crate::scenarios::runner::result::AssertionOutcome;
+
+        let base = tempfile::tempdir().unwrap();
+        let rd_pass = RunDir::create(base.path(), "passtest").unwrap();
+        std::fs::write(rd_pass.rpc_calls_path(), "").unwrap();
+        std::fs::write(rd_pass.metrics_path(), "").unwrap();
+
+        let mut manifest = RunManifest {
+            env_id: String::new(),
+            run_id: rd_pass.run_id.clone(),
+            run_started_at: chrono::Utc::now(),
+            run_completed_at: Some(chrono::Utc::now()),
+            simulator_commit: "abc".into(),
+            zebra_commit: "z".into(),
+            zaino_commit: "i".into(),
+            zallet_commit: "t".into(),
+            scenario_name: "passtest".into(),
+            scenario_config_hash: "sha:0".into(),
+            target_tps: 10.0,
+            timeouts: RunTimeouts::default(),
+            phase_boundaries: Vec::new(),
+            load_and_drain_completed_at: None,
+            compose_config_hash: String::new(),
+            image_digests: Vec::new(),
+            host_cpu_count: 0,
+            host_memory_limit_bytes: None,
+            state: StateIdentifier::default(),
+            assertion: Some(AssertionOutcome {
+                passed: true,
+                violations: Vec::new(),
+            }),
+        };
+
+        let md = generate_summary(&rd_pass, &manifest).unwrap();
+        assert!(
+            md.contains("## Result\n**PASS**"),
+            "expected a PASS verdict near the top: {md}"
+        );
+
+        let rd_fail = RunDir::create(base.path(), "failtest").unwrap();
+        std::fs::write(rd_fail.rpc_calls_path(), "").unwrap();
+        std::fs::write(rd_fail.metrics_path(), "").unwrap();
+        manifest.run_id = rd_fail.run_id.clone();
+        manifest.assertion = Some(AssertionOutcome {
+            passed: false,
+            violations: vec!["confirmed 54 < min_confirmed 60".to_string()],
+        });
+
+        let md = generate_summary(&rd_fail, &manifest).unwrap();
+        assert!(
+            md.contains("## Result\n**FAIL**"),
+            "expected a FAIL verdict near the top: {md}"
+        );
+        assert!(
+            md.contains("- confirmed 54 < min_confirmed 60"),
+            "expected the violation text rendered: {md}"
+        );
+        // The verdict must appear before the metadata section, not buried
+        // after other tables — this is the whole point of the fix.
+        assert!(md.find("## Result").unwrap() < md.find("## Run metadata").unwrap());
+    }
+
+    #[test]
+    fn generate_summary_shows_dispatch_rate_and_confirmed_from_metrics_jsonl() {
         use chrono::Utc;
 
         let base = tempfile::tempdir().unwrap();
@@ -400,8 +627,15 @@ mod tests {
         mwriter.write_record(&MetricSample {
             run_id: rd.run_id.clone(),
             timestamp: Utc::now(),
-            metric_name: "tps_achieved".into(),
+            metric_name: "scheduled_dispatch_rate".into(),
             value: 42.5,
+            labels: HashMap::new(),
+        });
+        mwriter.write_record(&MetricSample {
+            run_id: rd.run_id.clone(),
+            timestamp: Utc::now(),
+            metric_name: "confirmed_tx_throughput".into(),
+            value: 7.5,
             labels: HashMap::new(),
         });
         mwriter.write_record(&MetricSample {
@@ -413,6 +647,7 @@ mod tests {
         });
 
         let manifest = RunManifest {
+            env_id: String::new(),
             run_id: rd.run_id.clone(),
             run_started_at: Utc::now(),
             run_completed_at: Some(Utc::now()),
@@ -424,12 +659,24 @@ mod tests {
             scenario_config_hash: "".into(),
             target_tps: 50.0,
             timeouts: RunTimeouts::default(),
+            phase_boundaries: Vec::new(),
+            load_and_drain_completed_at: None,
+            compose_config_hash: String::new(),
+            image_digests: Vec::new(),
+            host_cpu_count: 0,
+            host_memory_limit_bytes: None,
+            state: StateIdentifier::default(),
+            assertion: None,
         };
         generate_summary(&rd, &manifest).unwrap();
         let md = std::fs::read_to_string(rd.summary_path()).unwrap();
         assert!(
-            md.contains("42.5") || md.contains("42"),
-            "achieved TPS value must appear in summary"
+            md.contains("42.5"),
+            "scheduled dispatch rate value must appear in summary"
+        );
+        assert!(
+            md.contains("7.5"),
+            "confirmed tx throughput value must appear in summary"
         );
         assert!(
             md.contains("100"),
@@ -445,6 +692,7 @@ mod tests {
         std::fs::write(rd.rpc_calls_path(), "").unwrap();
         std::fs::write(rd.metrics_path(), "").unwrap();
         let manifest = RunManifest {
+            env_id: String::new(),
             run_id: rd.run_id.clone(),
             run_started_at: Utc::now(),
             run_completed_at: None,
@@ -456,6 +704,14 @@ mod tests {
             scenario_config_hash: "".into(),
             target_tps: 0.0,
             timeouts: RunTimeouts::default(),
+            phase_boundaries: Vec::new(),
+            load_and_drain_completed_at: None,
+            compose_config_hash: String::new(),
+            image_digests: Vec::new(),
+            host_cpu_count: 0,
+            host_memory_limit_bytes: None,
+            state: StateIdentifier::default(),
+            assertion: None,
         };
         generate_summary(&rd, &manifest).unwrap();
         assert!(rd.summary_path().exists());
@@ -473,6 +729,7 @@ mod tests {
         .unwrap();
         std::fs::write(rd.metrics_path(), "").unwrap();
         let manifest = RunManifest {
+            env_id: String::new(),
             run_id: rd.run_id.clone(),
             run_started_at: Utc::now(),
             run_completed_at: None,
@@ -484,6 +741,14 @@ mod tests {
             scenario_config_hash: "".into(),
             target_tps: 0.0,
             timeouts: RunTimeouts::default(),
+            phase_boundaries: Vec::new(),
+            load_and_drain_completed_at: None,
+            compose_config_hash: String::new(),
+            image_digests: Vec::new(),
+            host_cpu_count: 0,
+            host_memory_limit_bytes: None,
+            state: StateIdentifier::default(),
+            assertion: None,
         };
         generate_summary(&rd, &manifest).unwrap();
         assert!(rd.summary_path().exists());
@@ -497,6 +762,7 @@ mod tests {
         std::fs::write(rd.rpc_calls_path(), "").unwrap();
         std::fs::write(rd.metrics_path(), "").unwrap();
         let manifest = RunManifest {
+            env_id: String::new(),
             run_id: rd.run_id.clone(),
             run_started_at: Utc::now(),
             run_completed_at: None,
@@ -508,6 +774,14 @@ mod tests {
             scenario_config_hash: "".into(),
             target_tps: 0.0,
             timeouts: RunTimeouts::default(),
+            phase_boundaries: Vec::new(),
+            load_and_drain_completed_at: None,
+            compose_config_hash: String::new(),
+            image_digests: Vec::new(),
+            host_cpu_count: 0,
+            host_memory_limit_bytes: None,
+            state: StateIdentifier::default(),
+            assertion: None,
         };
         let md = generate_summary(&rd, &manifest).unwrap();
         assert!(
@@ -517,7 +791,7 @@ mod tests {
     }
 
     #[test]
-    fn generate_summary_proving_times_non_na_when_samples_present() {
+    fn generate_summary_shielded_proving_times_non_na_when_samples_present() {
         use chrono::Utc;
         let base = tempfile::tempdir().unwrap();
         let rd = RunDir::create(base.path(), "proving").unwrap();
@@ -528,7 +802,7 @@ mod tests {
             mwriter.write_record(&MetricSample {
                 run_id: rd.run_id.clone(),
                 timestamp: Utc::now(),
-                metric_name: "withdrawal_proving_time_ms".into(),
+                metric_name: "shielded_proving_time_ms".into(),
                 value: ms as f64,
                 labels: HashMap::new(),
             });
@@ -536,6 +810,7 @@ mod tests {
         drop(mwriter);
 
         let manifest = RunManifest {
+            env_id: String::new(),
             run_id: rd.run_id.clone(),
             run_started_at: Utc::now(),
             run_completed_at: Some(Utc::now()),
@@ -547,16 +822,36 @@ mod tests {
             scenario_config_hash: "".into(),
             target_tps: 0.0,
             timeouts: RunTimeouts::default(),
+            phase_boundaries: Vec::new(),
+            load_and_drain_completed_at: None,
+            compose_config_hash: String::new(),
+            image_digests: Vec::new(),
+            host_cpu_count: 0,
+            host_memory_limit_bytes: None,
+            state: StateIdentifier::default(),
+            assertion: None,
         };
         let md = generate_summary(&rd, &manifest).unwrap();
+        let shielded_section = md
+            .split("## Shielded transaction proving times")
+            .nth(1)
+            .expect("shielded section must be present");
         assert!(
-            !md.contains("P50: N/A"),
-            "proving times must not be N/A when samples are present"
+            !shielded_section.starts_with("\n- P50: N/A"),
+            "shielded proving times must not be N/A when samples are present"
         );
         // sorted=[100,200,300,400,500] n=5; p50: idx floor(0.5*5)=2 → 300
         assert!(
-            md.contains("300"),
+            shielded_section.contains("300"),
             "p50 of [100..500] must be 300; summary:\n{md}"
+        );
+        let wallet_section = md
+            .split("## Wallet operation times (no shielded proof)")
+            .nth(1)
+            .expect("wallet operation section must be present");
+        assert!(
+            wallet_section.starts_with("\n- P50: N/A"),
+            "wallet operation times must be N/A when no such samples were recorded"
         );
     }
 
@@ -589,6 +884,7 @@ mod tests {
         drop(mwriter);
 
         let manifest = RunManifest {
+            env_id: String::new(),
             run_id: rd.run_id.clone(),
             run_started_at: Utc::now(),
             run_completed_at: Some(Utc::now()),
@@ -600,6 +896,14 @@ mod tests {
             scenario_config_hash: "".into(),
             target_tps: 0.0,
             timeouts: RunTimeouts::default(),
+            phase_boundaries: Vec::new(),
+            load_and_drain_completed_at: None,
+            compose_config_hash: String::new(),
+            image_digests: Vec::new(),
+            host_cpu_count: 0,
+            host_memory_limit_bytes: None,
+            state: StateIdentifier::default(),
+            assertion: None,
         };
         let md = generate_summary(&rd, &manifest).unwrap();
         assert!(
@@ -633,10 +937,14 @@ mod tests {
             success: false,
             error_code: Some(-3),
             error_message: Some("invalid tx".into()),
+            phase: crate::data_model::Phase::Load,
+            intent_id: None,
+            attempt_number: 1,
         });
         drop(rwriter);
 
         let manifest = RunManifest {
+            env_id: String::new(),
             run_id: rd.run_id.clone(),
             run_started_at: Utc::now(),
             run_completed_at: Some(Utc::now()),
@@ -648,6 +956,14 @@ mod tests {
             scenario_config_hash: "".into(),
             target_tps: 0.0,
             timeouts: RunTimeouts::default(),
+            phase_boundaries: Vec::new(),
+            load_and_drain_completed_at: None,
+            compose_config_hash: String::new(),
+            image_digests: Vec::new(),
+            host_cpu_count: 0,
+            host_memory_limit_bytes: None,
+            state: StateIdentifier::default(),
+            assertion: None,
         };
         let md = generate_summary(&rd, &manifest).unwrap();
         assert!(
@@ -661,6 +977,86 @@ mod tests {
         assert!(
             md.contains("sendrawtransaction"),
             "method name must appear with error code; got:\n{md}"
+        );
+    }
+
+    #[test]
+    fn generate_summary_rpc_latency_table_excludes_setup_phase_retries() {
+        // Reproduces the exact defect shape the Foundation flagged (Track 3's
+        // "60 intents produced 101 z_sendmany calls including 28 failed
+        // retries, reported as a 27.7% failure rate"): two failed
+        // Funding-phase z_sendmany calls (the funding fan-out's own
+        // anchor-confirmation retries) plus one successful Load-phase call
+        // for the same method. The workload table must reflect only the
+        // Load-phase call; the setup-phase retries must appear in the
+        // separate setup-phase table instead, not inflate the headline count.
+        use crate::data_model::{Backend, Phase, RpcCall};
+        use chrono::Utc;
+
+        let base = tempfile::tempdir().unwrap();
+        let rd = RunDir::create(base.path(), "phasescope").unwrap();
+
+        let call = |phase: Phase, success: bool, error_code: Option<i64>| RpcCall {
+            call_id: "c".into(),
+            run_id: rd.run_id.clone(),
+            method: "z_sendmany".into(),
+            backend: Backend::Zallet,
+            params_hash: None,
+            request_at: Utc::now(),
+            response_at: None,
+            latency_ms: Some(10),
+            success,
+            error_code,
+            error_message: None,
+            phase,
+            intent_id: None,
+            attempt_number: 1,
+        };
+
+        let writer = JsonlWriter::<RpcCall>::open(&rd.rpc_calls_path()).unwrap();
+        writer.write_record(&call(Phase::Funding, false, Some(-4)));
+        writer.write_record(&call(Phase::Funding, false, Some(-4)));
+        writer.write_record(&call(Phase::Load, true, None));
+        std::fs::write(rd.metrics_path(), "").unwrap();
+
+        let manifest = RunManifest {
+            env_id: String::new(),
+            run_id: rd.run_id.clone(),
+            run_started_at: Utc::now(),
+            run_completed_at: Some(Utc::now()),
+            simulator_commit: "".into(),
+            zebra_commit: "".into(),
+            zaino_commit: "".into(),
+            zallet_commit: "".into(),
+            scenario_name: "phasescope".into(),
+            scenario_config_hash: "".into(),
+            target_tps: 0.0,
+            timeouts: RunTimeouts::default(),
+            phase_boundaries: Vec::new(),
+            load_and_drain_completed_at: None,
+            compose_config_hash: String::new(),
+            image_digests: Vec::new(),
+            host_cpu_count: 0,
+            host_memory_limit_bytes: None,
+            state: StateIdentifier::default(),
+            assertion: None,
+        };
+        let md = generate_summary(&rd, &manifest).unwrap();
+
+        let latency_section = md.split("## Setup-phase RPC activity").next().unwrap();
+        assert!(
+            latency_section.contains("| z_sendmany | Zallet |") && latency_section.contains("| 1 | 0 |"),
+            "workload table must show exactly 1 call, 0 errors for z_sendmany; got:\n{latency_section}"
+        );
+        assert!(
+            md.contains("## Setup-phase RPC activity"),
+            "setup-phase retries must still be visible somewhere; got:\n{md}"
+        );
+        let setup_section = &md[md.find("## Setup-phase RPC activity").unwrap()..];
+        assert!(
+            setup_section.contains("| z_sendmany | Zallet |")
+                && setup_section.contains("| 2 | 2 |"),
+            "setup-phase table must show the 2 failed Funding-phase calls; got:\n{setup_section}"
         );
     }
 
@@ -682,6 +1078,7 @@ mod tests {
             error: None,
             timeout_context: None,
             recorded_at: Utc::now(),
+            failure_class: None,
         });
         iwriter.write_record(&IntentRecord {
             run_id: rd.run_id.clone(),
@@ -691,6 +1088,7 @@ mod tests {
             error: None,
             timeout_context: Some("operation op-1 did not complete within the deadline".into()),
             recorded_at: Utc::now(),
+            failure_class: Some(crate::data_model::IntentFailureClass::Timeout),
         });
         iwriter.write_record(&IntentRecord {
             run_id: rd.run_id.clone(),
@@ -702,10 +1100,12 @@ mod tests {
                 "tx abc did not reach 3 confirmations within the deadline".into(),
             ),
             recorded_at: Utc::now(),
+            failure_class: Some(crate::data_model::IntentFailureClass::Timeout),
         });
         drop(iwriter);
 
         let manifest = RunManifest {
+            env_id: String::new(),
             run_id: rd.run_id.clone(),
             run_started_at: Utc::now(),
             run_completed_at: Some(Utc::now()),
@@ -717,6 +1117,14 @@ mod tests {
             scenario_config_hash: "".into(),
             target_tps: 0.0,
             timeouts: RunTimeouts::default(),
+            phase_boundaries: Vec::new(),
+            load_and_drain_completed_at: None,
+            compose_config_hash: String::new(),
+            image_digests: Vec::new(),
+            host_cpu_count: 0,
+            host_memory_limit_bytes: None,
+            state: StateIdentifier::default(),
+            assertion: None,
         };
         let md = generate_summary(&rd, &manifest).unwrap();
         assert!(
@@ -743,6 +1151,7 @@ mod tests {
         std::fs::write(rd.rpc_calls_path(), "").unwrap();
         std::fs::write(rd.metrics_path(), "").unwrap();
         let manifest = RunManifest {
+            env_id: String::new(),
             run_id: rd.run_id.clone(),
             run_started_at: Utc::now(),
             run_completed_at: Some(Utc::now()),
@@ -754,6 +1163,14 @@ mod tests {
             scenario_config_hash: "".into(),
             target_tps: 0.0,
             timeouts: RunTimeouts::default(),
+            phase_boundaries: Vec::new(),
+            load_and_drain_completed_at: None,
+            compose_config_hash: String::new(),
+            image_digests: Vec::new(),
+            host_cpu_count: 0,
+            host_memory_limit_bytes: None,
+            state: StateIdentifier::default(),
+            assertion: None,
         };
         let returned = generate_summary(&rd, &manifest).unwrap();
         let on_disk = std::fs::read_to_string(rd.summary_path()).unwrap();
@@ -771,6 +1188,7 @@ mod tests {
         // Deliberately do NOT create rpc_calls.jsonl.
         std::fs::write(rd.metrics_path(), "").unwrap();
         let manifest = RunManifest {
+            env_id: String::new(),
             run_id: rd.run_id.clone(),
             run_started_at: Utc::now(),
             run_completed_at: Some(Utc::now()),
@@ -782,6 +1200,14 @@ mod tests {
             scenario_config_hash: "".into(),
             target_tps: 0.0,
             timeouts: RunTimeouts::default(),
+            phase_boundaries: Vec::new(),
+            load_and_drain_completed_at: None,
+            compose_config_hash: String::new(),
+            image_digests: Vec::new(),
+            host_cpu_count: 0,
+            host_memory_limit_bytes: None,
+            state: StateIdentifier::default(),
+            assertion: None,
         };
         let md = generate_summary(&rd, &manifest).unwrap();
         assert!(
@@ -799,6 +1225,7 @@ mod tests {
         std::fs::write(rd.rpc_calls_path(), "").unwrap();
         std::fs::write(rd.metrics_path(), "").unwrap();
         let manifest = RunManifest {
+            env_id: String::new(),
             run_id: rd.run_id.clone(),
             run_started_at: Utc::now(),
             run_completed_at: Some(Utc::now()),
@@ -810,6 +1237,14 @@ mod tests {
             scenario_config_hash: "".into(),
             target_tps: 0.0,
             timeouts: RunTimeouts::default(),
+            phase_boundaries: Vec::new(),
+            load_and_drain_completed_at: None,
+            compose_config_hash: String::new(),
+            image_digests: Vec::new(),
+            host_cpu_count: 0,
+            host_memory_limit_bytes: None,
+            state: StateIdentifier::default(),
+            assertion: None,
         };
         // Must not panic or return Err.
         let md = generate_summary(&rd, &manifest).unwrap();

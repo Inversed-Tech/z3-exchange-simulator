@@ -9,6 +9,8 @@
 
 use std::collections::{HashMap, HashSet};
 
+use crate::data_model::{Phase, RpcCall};
+
 use super::load_curve::load_degradation_candidates;
 use super::loader::RunData;
 use super::rpc_matrix::{build_matrix, Category, MatrixStatus};
@@ -21,6 +23,7 @@ pub enum FindingCategory {
     FlowTypeDisparity,
     LoadDegradation,
     DataCompleteness,
+    KnownLimitation,
 }
 
 impl std::fmt::Display for FindingCategory {
@@ -32,6 +35,7 @@ impl std::fmt::Display for FindingCategory {
             FindingCategory::FlowTypeDisparity => write!(f, "Flow-type disparity"),
             FindingCategory::LoadDegradation => write!(f, "Load degradation"),
             FindingCategory::DataCompleteness => write!(f, "Data completeness"),
+            FindingCategory::KnownLimitation => write!(f, "Known limitation"),
         }
     }
 }
@@ -84,6 +88,12 @@ pub struct Finding {
     pub severity: Severity,
     pub summary: String,
     pub evidence: Vec<String>,
+    /// A short label distinguishing this finding from what its category
+    /// would otherwise suggest — currently used only for a regtest
+    /// block-generation latency finding, so a reader cannot mistake it for a
+    /// production-relevant latency signal (see `uniformly_slow_candidates`).
+    /// `None` for every other finding.
+    pub context: Option<String>,
 }
 
 pub(crate) const TAIL_LATENCY_MULTIPLE: f64 = 5.0;
@@ -131,8 +141,34 @@ fn run_occurrence(runs: &[RunData], method: &str) -> (usize, usize) {
 /// rather than being part of the measured workload — see
 /// docs/rpc/method-scope.md — so a failed `generate` call is excluded here
 /// the same way it is excluded from the stress latency histograms.
+///
+/// Calls matching a `KNOWN_LIMITATIONS` entry (see `known_limitation_findings`)
+/// are excluded from this rate computation entirely — via
+/// `without_known_limitations`, not a post-hoc adjustment to `build_matrix`'s
+/// already-aggregated counts — so a tolerated, already-reported defect never
+/// also inflates a fresh `RpcFailure` finding for the same method. Today's
+/// one entry (`z_listunspent`/`Warmup`) never reaches this function's
+/// Load/Drain-scoped matrix anyway, but a future entry scoped to a workload
+/// phase would, without this filter, be double-reported: once correctly as
+/// `KnownLimitation`, and once incorrectly as a rate-scored `RpcFailure` —
+/// exactly the masking problem this mechanism exists to prevent.
 fn rpc_failure_candidates(runs: &[RunData]) -> Vec<Finding> {
-    build_matrix(runs)
+    rpc_failure_candidates_with_limitations(runs, KNOWN_LIMITATIONS)
+}
+
+/// `rpc_failure_candidates`'s actual logic, taking the known-limitations
+/// table as a parameter so a test can exercise the exclusion mechanism
+/// against a synthetic, workload-phase-scoped entry — proving the general
+/// mechanism, not merely that today's one real entry (`z_listunspent`,
+/// `Warmup`-scoped) happens to never reach this function's Load/Drain
+/// matrix anyway.
+fn rpc_failure_candidates_with_limitations(
+    runs: &[RunData],
+    limitations: &[KnownLimitation],
+) -> Vec<Finding> {
+    let runs = without_known_limitations(runs, limitations);
+    let runs = &runs;
+    build_matrix(runs, Phase::is_workload)
         .into_iter()
         .filter(|row| row.category != Category::RegtestControl)
         .filter(|row| {
@@ -164,6 +200,7 @@ fn rpc_failure_candidates(runs: &[RunData]) -> Vec<Finding> {
                         "failed in {runs_with_failure}/{runs_with_call} run(s) that called this method"
                     ),
                 ],
+                context: None,
             }
         })
         .collect()
@@ -183,12 +220,20 @@ fn timeout_candidates(runs: &[RunData]) -> Vec<Finding> {
             if intent.outcome != "timed_out" {
                 continue;
             }
+            // "(ZK proving)" only applies when this flow actually creates a
+            // shielded proof — an async z_sendmany-operation wait happens
+            // for transparent sends too (Track 5 of the Foundation
+            // feedback: don't label a transparent flow's wait as proving).
             let stage = intent
                 .timeout_context
                 .as_deref()
                 .map(|c| {
                     if c.starts_with("operation ") {
-                        "async operation (ZK proving) wait".to_string()
+                        if intent.flow_type.is_shielded() {
+                            "async operation (ZK proving) wait".to_string()
+                        } else {
+                            "async operation (wallet operation completion) wait".to_string()
+                        }
                     } else if c.starts_with("tx ") {
                         "on-chain confirmation wait".to_string()
                     } else {
@@ -219,6 +264,7 @@ fn timeout_candidates(runs: &[RunData]) -> Vec<Finding> {
                     format!("flow_type={flow}, stage={stage}, count={count}, of_total={total}"),
                     format!("observed in {} run(s)", contributing_runs.len()),
                 ],
+                context: None,
             }
         })
         .collect();
@@ -232,7 +278,7 @@ fn timeout_candidates(runs: &[RunData]) -> Vec<Finding> {
 /// noise from a single slow call, and excludes regtest-control methods for
 /// the same reason `rpc_failure_candidates` does.
 fn latency_outlier_candidates(runs: &[RunData]) -> Vec<Finding> {
-    build_matrix(runs)
+    build_matrix(runs, Phase::is_workload)
         .into_iter()
         .filter(|row| row.category != Category::RegtestControl)
         .filter(|row| row.calls >= MIN_TAIL_LATENCY_SAMPLE)
@@ -266,6 +312,7 @@ fn latency_outlier_candidates(runs: &[RunData]) -> Vec<Finding> {
                         ),
                         format!("observed across {runs_with_call} run(s)"),
                     ],
+                    context: None,
                 })
             }
             _ => None,
@@ -294,7 +341,7 @@ pub(crate) const UNIFORM_SLOWNESS_FLOOR_MS: f64 = 1000.0;
 /// RPC method sharing the same backend (see
 /// docs/concurrent-generate-pileup.md).
 fn uniformly_slow_candidates(runs: &[RunData]) -> Vec<Finding> {
-    build_matrix(runs)
+    build_matrix(runs, Phase::is_workload)
         .into_iter()
         .filter(|row| row.calls >= MIN_TAIL_LATENCY_SAMPLE)
         .filter_map(|row| {
@@ -309,6 +356,17 @@ fn uniformly_slow_candidates(runs: &[RunData]) -> Vec<Finding> {
                 }
             }
             let (runs_with_call, _) = run_occurrence(runs, row.method);
+            // Regtest-control methods (`generate` and friends) are the one
+            // place this function *includes* rather than excludes the
+            // category — a slow `generate` is a real operational signal
+            // (see docs/concurrent-generate-pileup.md), but it is not a
+            // production latency signal, and a reader must not mistake it
+            // for one.
+            let context = (row.category == Category::RegtestControl).then(|| {
+                "regtest block-generation latency (not a production latency signal — see \
+                 docs/concurrent-generate-pileup.md)"
+                    .to_string()
+            });
             Some(Finding {
                 category: FindingCategory::LatencyOutlier,
                 severity: Severity::High,
@@ -330,6 +388,7 @@ fn uniformly_slow_candidates(runs: &[RunData]) -> Vec<Finding> {
                     ),
                     format!("observed across {runs_with_call} run(s)"),
                 ],
+                context,
             })
         })
         .collect()
@@ -385,6 +444,7 @@ fn flow_type_disparity_candidates(runs: &[RunData]) -> Vec<Finding> {
                         "flow_type={flow} confirmed={confirmed} total={total} overall_rate={:.3}",
                         overall_rate
                     )],
+                    context: None,
                 })
             } else {
                 None
@@ -411,6 +471,126 @@ fn data_completeness_candidates(runs: &[RunData]) -> Vec<Finding> {
                 r.parse_warnings.len()
             ),
             evidence: r.parse_warnings.clone(),
+            context: None,
+        })
+        .collect()
+}
+
+/// One known, harness-tolerated defect that must never surface as a fresh
+/// `RpcFailure` finding. Matching on method name alone is deliberately not
+/// enough: `z_listunspent` is issued from two call sites with materially
+/// different risk profiles — the unfiltered call in `lifecycle::warmup`
+/// (the actual known defect below) and `z_list_unspent_for_addresses`'s
+/// filtered call in `run_sweep` (added specifically to *avoid* that
+/// defect), both recorded under the identical method string. A candidate
+/// call must match all three of `method`, `phase`, and `error_substring` to
+/// be excluded from ordinary scoring — a method-only or phase-only match
+/// still flows into `rpc_failure_candidates` unaffected, so a genuinely new
+/// failure sharing just the method or the phase is never masked.
+///
+/// Add to this list only when a defect is (a) already tolerated in runner
+/// code, (b) documented in `docs/`, and (c) precise enough that a call
+/// matching all three fields is unambiguously *this* known defect.
+struct KnownLimitation {
+    method: &'static str,
+    phase: Phase,
+    error_substring: &'static str,
+    explanation: &'static str,
+}
+
+const KNOWN_LIMITATIONS: &[KnownLimitation] = &[KnownLimitation {
+    method: "z_listunspent",
+    phase: Phase::Warmup,
+    error_substring: "get_memo",
+    explanation: "non-UTF8 shielded-coinbase memo bytes fail WalletDb::get_memo wallet-wide \
+                  during warmup — the account fan-out that follows still proves spendability; \
+                  see docs/regtest-funding-plan.md",
+}];
+
+/// Whether `call` matches any entry in `limitations` — the shared predicate
+/// behind both `known_limitation_findings` (which reports these calls
+/// explicitly) and `without_known_limitations` (which excludes them from
+/// ordinary rate-based scoring), so the two can never drift apart on what
+/// counts as "this known defect."
+fn matches_known_limitation(call: &RpcCall, limitations: &[KnownLimitation]) -> bool {
+    limitations.iter().any(|limitation| {
+        call.method == limitation.method
+            && call.phase == limitation.phase
+            && call
+                .error_message
+                .as_deref()
+                .is_some_and(|msg| msg.contains(limitation.error_substring))
+    })
+}
+
+/// Flags every `KNOWN_LIMITATIONS` entry actually observed in the provided
+/// runs as a `Low`-severity `KnownLimitation` finding, so the defect is
+/// surfaced explicitly rather than silently absent from the report — never
+/// as a fresh `High`-severity `RpcFailure` candidate. Operates directly on
+/// raw `RpcCall` rows (not `build_matrix`'s aggregates), since matching
+/// requires the per-call error message `MatrixRow` does not retain.
+fn known_limitation_findings(runs: &[RunData]) -> Vec<Finding> {
+    KNOWN_LIMITATIONS
+        .iter()
+        .filter_map(|limitation| {
+            let mut matching_calls = 0u64;
+            let mut matching_runs: HashSet<&str> = HashSet::new();
+            for run in runs {
+                for call in &run.rpc_calls {
+                    if call.method != limitation.method || call.phase != limitation.phase {
+                        continue;
+                    }
+                    let Some(msg) = &call.error_message else {
+                        continue;
+                    };
+                    if msg.contains(limitation.error_substring) {
+                        matching_calls += 1;
+                        matching_runs.insert(run.manifest.run_id.as_str());
+                    }
+                }
+            }
+            if matching_calls == 0 {
+                return None;
+            }
+            Some(Finding {
+                category: FindingCategory::KnownLimitation,
+                severity: Severity::Low,
+                summary: format!(
+                    "{}: {matching_calls} known, tolerated {:?}-phase failure(s) — {}",
+                    limitation.method, limitation.phase, limitation.explanation
+                ),
+                evidence: vec![format!(
+                    "observed in {} run(s), matched on method={}, phase={:?}, error substring=\"{}\"",
+                    matching_runs.len(),
+                    limitation.method,
+                    limitation.phase,
+                    limitation.error_substring
+                )],
+                context: None,
+            })
+        })
+        .collect()
+}
+
+/// A copy of `runs` with every `RpcCall` matching a `KNOWN_LIMITATIONS`
+/// entry (see `matches_known_limitation`) removed from `rpc_calls`, for
+/// `rpc_failure_candidates` to build its matrix from instead of the raw
+/// runs — so a known, already-reported defect is excluded from the rate
+/// computation entirely (never counted toward either the numerator or the
+/// denominator), not merely prevented from being scored High. A per-row,
+/// post-hoc adjustment to `build_matrix`'s already-aggregated counts isn't
+/// used here: `MatrixRow` deduplicates intent-linked retries to one
+/// representative call per intent, so reconstructing the correct
+/// pre-exclusion counts from the aggregate alone would require
+/// re-implementing that same dedup logic. Filtering the raw calls before
+/// they ever reach `build_matrix` reuses it unmodified instead.
+fn without_known_limitations(runs: &[RunData], limitations: &[KnownLimitation]) -> Vec<RunData> {
+    runs.iter()
+        .map(|run| {
+            let mut run = run.clone();
+            run.rpc_calls
+                .retain(|call| !matches_known_limitation(call, limitations));
+            run
         })
         .collect()
 }
@@ -429,6 +609,7 @@ pub fn flag_candidates(runs: &[RunData]) -> Vec<Finding> {
     out.extend(flow_type_disparity_candidates(runs));
     out.extend(load_degradation_candidates(runs));
     out.extend(data_completeness_candidates(runs));
+    out.extend(known_limitation_findings(runs));
     out
 }
 
@@ -436,11 +617,12 @@ pub fn flag_candidates(runs: &[RunData]) -> Vec<Finding> {
 mod tests {
     use super::*;
     use crate::data_model::{Backend, FlowType, IntentRecord, RpcCall};
-    use crate::metrics::{RunManifest, RunTimeouts};
+    use crate::metrics::{RunManifest, RunTimeouts, StateIdentifier};
     use chrono::Utc;
 
     fn base_manifest(run_id: &str) -> RunManifest {
         RunManifest {
+            env_id: String::new(),
             run_id: run_id.into(),
             run_started_at: Utc::now(),
             run_completed_at: Some(Utc::now()),
@@ -452,6 +634,14 @@ mod tests {
             scenario_config_hash: "sha256:x".into(),
             target_tps: 1.0,
             timeouts: RunTimeouts::default(),
+            phase_boundaries: Vec::new(),
+            load_and_drain_completed_at: None,
+            compose_config_hash: String::new(),
+            image_digests: Vec::new(),
+            host_cpu_count: 0,
+            host_memory_limit_bytes: None,
+            state: StateIdentifier::default(),
+            assertion: None,
         }
     }
 
@@ -484,6 +674,32 @@ mod tests {
             success,
             error_code,
             error_message: None,
+            phase: crate::data_model::Phase::Load,
+            intent_id: None,
+            attempt_number: 1,
+        }
+    }
+
+    fn call_with_phase_and_error(
+        method: &str,
+        phase: crate::data_model::Phase,
+        error_message: &str,
+    ) -> RpcCall {
+        RpcCall {
+            call_id: "c".into(),
+            run_id: "r".into(),
+            method: method.to_string(),
+            backend: Backend::Zallet,
+            params_hash: None,
+            request_at: Utc::now(),
+            response_at: Some(Utc::now()),
+            latency_ms: None,
+            success: false,
+            error_code: Some(-20),
+            error_message: Some(error_message.to_string()),
+            phase,
+            intent_id: None,
+            attempt_number: 1,
         }
     }
 
@@ -496,6 +712,7 @@ mod tests {
             error: None,
             timeout_context: timeout_context.map(String::from),
             recorded_at: Utc::now(),
+            failure_class: None,
         }
     }
 
@@ -549,7 +766,11 @@ mod tests {
 
     #[test]
     fn rpc_failure_evidence_reports_run_occurrence() {
-        let r1 = run("r1", vec![call("z_sendmany", false, None, Some(-4))], vec![]);
+        let r1 = run(
+            "r1",
+            vec![call("z_sendmany", false, None, Some(-4))],
+            vec![],
+        );
         let r2 = run("r2", vec![call("z_sendmany", true, Some(10), None)], vec![]);
         let findings = flag_candidates(&[r1, r2]);
         let f = findings
@@ -570,6 +791,146 @@ mod tests {
         assert!(!findings
             .iter()
             .any(|f| f.category == FindingCategory::RpcFailure));
+    }
+
+    #[test]
+    fn known_z_listunspent_warmup_error_produces_low_severity_known_limitation_not_high_rpc_failure(
+    ) {
+        let r = run(
+            "r1",
+            vec![call_with_phase_and_error(
+                "z_listunspent",
+                crate::data_model::Phase::Warmup,
+                "WalletDb::get_memo failed / Invalid UTF-8: invalid utf-8 sequence",
+            )],
+            vec![],
+        );
+        let findings = flag_candidates(&[r]);
+        let known = findings
+            .iter()
+            .find(|f| f.category == FindingCategory::KnownLimitation)
+            .expect("expected a KnownLimitation finding");
+        assert_eq!(known.severity, Severity::Low);
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.category == FindingCategory::RpcFailure
+                    && f.summary.contains("z_listunspent")),
+            "the known warmup defect must not also surface as an RpcFailure finding"
+        );
+    }
+
+    #[test]
+    fn load_phase_z_listunspent_failure_is_not_masked_as_known_limitation() {
+        // Same method, but Phase::Load (as run_sweep's filtered call would
+        // be) with an unrelated error — must flow into ordinary RpcFailure
+        // scoring, not be silently downgraded to a known limitation.
+        let r = run(
+            "r1",
+            vec![call_with_phase_and_error(
+                "z_listunspent",
+                crate::data_model::Phase::Load,
+                "connection refused",
+            )],
+            vec![],
+        );
+        let findings = flag_candidates(&[r]);
+        assert!(!findings
+            .iter()
+            .any(|f| f.category == FindingCategory::KnownLimitation));
+        assert!(findings
+            .iter()
+            .any(|f| f.category == FindingCategory::RpcFailure
+                && f.summary.contains("z_listunspent")));
+    }
+
+    #[test]
+    fn load_phase_z_listunspent_failure_with_the_known_error_substring_is_still_not_masked() {
+        // Phase alone must disqualify a match even when the error substring
+        // happens to coincide — all three of method, phase, and error
+        // substring are required together.
+        let r = run(
+            "r1",
+            vec![call_with_phase_and_error(
+                "z_listunspent",
+                crate::data_model::Phase::Load,
+                "WalletDb::get_memo failed / Invalid UTF-8: invalid utf-8 sequence",
+            )],
+            vec![],
+        );
+        let findings = flag_candidates(&[r]);
+        assert!(!findings
+            .iter()
+            .any(|f| f.category == FindingCategory::KnownLimitation));
+        assert!(findings
+            .iter()
+            .any(|f| f.category == FindingCategory::RpcFailure
+                && f.summary.contains("z_listunspent")));
+    }
+
+    #[test]
+    fn rpc_failure_candidates_excludes_a_workload_phase_known_limitation_from_scoring() {
+        // Regression test for the double-reporting bug this filter exists to
+        // prevent: today's one real KNOWN_LIMITATIONS entry is Warmup-scoped,
+        // so it never reaches this function's Load/Drain-scoped matrix
+        // regardless of this filter — that would make the fix look correct
+        // by coincidence, not by design. A synthetic, Load-scoped entry
+        // proves the mechanism actually generalizes: without the filter, a
+        // future workload-phase entry would be reported twice (once as
+        // KnownLimitation, once as a rate-scored RpcFailure) for the exact
+        // same calls.
+        let synthetic_limitations = [KnownLimitation {
+            method: "z_sendmany",
+            phase: Phase::Load,
+            error_substring: "synthetic known defect",
+            explanation: "test-only entry, not a real limitation",
+        }];
+        let r = run(
+            "r1",
+            vec![call_with_phase_and_error(
+                "z_sendmany",
+                Phase::Load,
+                "synthetic known defect: something",
+            )],
+            vec![],
+        );
+        let findings = rpc_failure_candidates_with_limitations(&[r], &synthetic_limitations);
+        assert!(
+            findings.is_empty(),
+            "a call matching a workload-phase known limitation must not also \
+             surface as a rate-scored RpcFailure finding: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn rpc_failure_candidates_still_scores_workload_phase_failures_that_do_not_match_any_limitation(
+    ) {
+        // Companion regression guard: the exclusion mechanism must not
+        // become a blanket "ignore this method" filter — a failure that
+        // doesn't match any known-limitation entry (different error, here)
+        // must still flow into ordinary rate-based scoring.
+        let synthetic_limitations = [KnownLimitation {
+            method: "z_sendmany",
+            phase: Phase::Load,
+            error_substring: "synthetic known defect",
+            explanation: "test-only entry, not a real limitation",
+        }];
+        let r = run(
+            "r1",
+            vec![call_with_phase_and_error(
+                "z_sendmany",
+                Phase::Load,
+                "an unrelated failure",
+            )],
+            vec![],
+        );
+        let findings = rpc_failure_candidates_with_limitations(&[r], &synthetic_limitations);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.category == FindingCategory::RpcFailure
+                    && f.summary.contains("z_sendmany"))
+        );
     }
 
     #[test]
@@ -602,7 +963,38 @@ mod tests {
             .find(|f| f.category == FindingCategory::Timeout)
             .expect("expected a timeout finding");
         assert!(f.summary.contains("async operation"));
+        assert!(
+            f.summary.contains("ZK proving"),
+            "shielded flow: {}",
+            f.summary
+        );
         assert_eq!(f.severity, Severity::High); // 1/1 = 100%
+    }
+
+    #[test]
+    fn transparent_timeout_is_not_labeled_zk_proving() {
+        // Track 5 of the Foundation feedback: a transparent flow's async
+        // z_sendmany-operation wait must not be described as proving time.
+        let r = run(
+            "r1",
+            vec![],
+            vec![intent(
+                FlowType::TToT,
+                "timed_out",
+                Some("operation op-1 did not complete within the deadline"),
+            )],
+        );
+        let findings = flag_candidates(&[r]);
+        let f = findings
+            .iter()
+            .find(|f| f.category == FindingCategory::Timeout)
+            .expect("expected a timeout finding");
+        assert!(f.summary.contains("wallet operation completion"));
+        assert!(
+            !f.summary.contains("ZK proving"),
+            "transparent flow mislabeled as proving: {}",
+            f.summary
+        );
     }
 
     #[test]
@@ -613,8 +1005,9 @@ mod tests {
         let findings = flag_candidates(&[r]);
         let f = findings
             .iter()
-            .find(|f| f.category == FindingCategory::LatencyOutlier
-                && f.summary.contains("z_sendmany"))
+            .find(|f| {
+                f.category == FindingCategory::LatencyOutlier && f.summary.contains("z_sendmany")
+            })
             .expect("expected a latency outlier finding");
         assert_eq!(f.severity, Severity::High); // ratio >= 10x
     }
@@ -697,6 +1090,42 @@ mod tests {
     }
 
     #[test]
+    fn generate_latency_finding_carries_regtest_context_label() {
+        let calls = vec![call("generate", true, Some(15000), None); 6];
+        let r = run("r1", calls, vec![]);
+        let findings = flag_candidates(&[r]);
+        let f = findings
+            .iter()
+            .find(|f| {
+                f.category == FindingCategory::LatencyOutlier && f.summary.contains("generate")
+            })
+            .expect("expected a latency outlier finding for generate");
+        let ctx = f
+            .context
+            .as_deref()
+            .expect("a regtest-control latency finding must carry a context label");
+        assert!(
+            ctx.contains("not a production latency signal"),
+            "context: {ctx}"
+        );
+    }
+
+    #[test]
+    fn non_regtest_control_latency_findings_carry_no_context() {
+        let mut calls = vec![call("z_sendmany", true, Some(1200), None); 5];
+        calls.push(call("z_sendmany", true, Some(15000), None));
+        let r = run("r1", calls, vec![]);
+        let findings = flag_candidates(&[r]);
+        let f = findings
+            .iter()
+            .find(|f| {
+                f.category == FindingCategory::LatencyOutlier && f.summary.contains("z_sendmany")
+            })
+            .expect("expected a latency outlier finding for z_sendmany");
+        assert!(f.context.is_none());
+    }
+
+    #[test]
     fn does_not_double_flag_a_method_caught_by_both_checks() {
         // P50 1200ms (clears the uniform-slowness floor), P99 15000ms (12.5x
         // ratio, clears the tail-latency threshold too) — already reported by
@@ -737,7 +1166,9 @@ mod tests {
         let findings = flag_candidates(&[r]);
         let f = findings
             .iter()
-            .find(|f| f.category == FindingCategory::FlowTypeDisparity && f.summary.contains("ZToT"))
+            .find(|f| {
+                f.category == FindingCategory::FlowTypeDisparity && f.summary.contains("ZToT")
+            })
             .expect("expected a flow type disparity finding");
         assert_eq!(f.severity, Severity::High); // 100% vs 50% overall = 50pp gap
     }

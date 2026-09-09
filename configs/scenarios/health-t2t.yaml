@@ -32,3 +32,12 @@ activity_profiles:
 amounts:
   min_zatoshis: 10000
   max_zatoshis: 1000000
+
+
+# Baselined against run 20260905T145655Z-health-t2t: attempted 25, confirmed 25,
+# failed 0, timed_out 0 (see experiments/runs/20260905T145655Z-health-t2t/).
+expectations:
+  min_confirmed: 22
+  max_terminal_failures: 0
+  max_timeouts: 0
+  allowed_error_classes: []

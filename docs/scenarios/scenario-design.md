@@ -32,13 +32,25 @@ Scenarios are YAML files in `configs/scenarios/` and are the primary CLI input.
 | `observability.record_component_logs` | bool | Whether to capture Z3 component process logs |
 | `observability.metric_sampling_interval_secs` | integer | Metric snapshot interval in seconds |
 | `observability.mempool_saturation_threshold` | integer | Pending tx count that triggers a saturation event in the log |
+| `expectations.min_confirmed` | integer | Minimum confirmed transactions required to pass |
+| `expectations.max_terminal_failures` | integer | Maximum terminal (non-retry) transaction failures tolerated, per failed intent — never per RPC retry attempt |
+| `expectations.max_timeouts` | integer | Maximum timeouts tolerated |
+| `expectations.allowed_error_classes` | list of string | Failure classes (`insufficient_balance`, `mempool_conflict`, `timeout`, `other`) pre-approved as not counting toward `max_terminal_failures`. Optional — defaults to an empty list if omitted |
 
 `flows.*` values must sum to 1.0. `activity_profiles.*` values must also sum to 1.0.
 Every field above is required (parse error if omitted) except `warmup_blocks`, which
-defaults to `10`. The YAML parser does not reject unrecognized keys — a typo'd field
-name is silently ignored rather than raising an error, so always confirm a new or edited
-scenario with `make validate-scenario SCENARIO=<path>` (or `make scenario-dry-run`, which
-also prints the parsed account/duration/TPS values) rather than eyeballing the file.
+defaults to `10`, and `expectations.allowed_error_classes`, which defaults to an empty
+list. The `expectations` block itself is mandatory — a scenario file that omits it fails
+to parse, rather than silently running with no pass/fail criterion. The YAML parser does
+not reject unrecognized keys — a typo'd field name is silently ignored rather than
+raising an error, so always confirm a new or edited scenario with `make validate-scenario
+SCENARIO=<path>` (or `make scenario-dry-run`, which also prints the parsed
+account/duration/TPS values) rather than eyeballing the file.
+
+A run's pass/fail result (`z3sim run`'s "Result: PASS/FAIL" line, exit code `2` on
+failure) is computed by comparing the run's actual `confirmed`/`timed_out` counts and
+per-class terminal-failure breakdown against this block — see
+`scenarios::runner::result::RunStats::evaluate`.
 
 ### Validation rules
 

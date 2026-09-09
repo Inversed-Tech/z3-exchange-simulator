@@ -37,12 +37,60 @@ scenario configuration used. Required for any finding to be reportable.
     "max_operation_wait_ms": 120000,
     "confirmation_poll_interval_ms": 1000,
     "max_confirmation_wait_ms": 60000
+  },
+  "phase_boundaries": [
+    { "phase": "bootstrap", "started_at": "2026-06-02T14:00:00Z" },
+    { "phase": "readiness", "started_at": "2026-06-02T14:00:04Z" },
+    { "phase": "warmup", "started_at": "2026-06-02T14:00:06Z" },
+    { "phase": "funding", "started_at": "2026-06-02T14:00:40Z" },
+    { "phase": "load", "started_at": "2026-06-02T14:00:55Z" },
+    { "phase": "drain", "started_at": "2026-06-02T14:01:00Z" }
+  ],
+  "load_and_drain_completed_at": "2026-06-02T14:01:02Z",
+  "compose_config_hash": "sha256:<hash of the effective, merged docker compose config>",
+  "image_digests": [
+    { "service": "zebra", "image": "zfnd/zebra:6.0.0", "id": "sha256:ab12cd..." },
+    { "service": "zaino", "image": "zingodevops/zainod:0.6.0", "id": "sha256:34ef56..." },
+    { "service": "zallet", "image": "z3sim/zallet:beta.2-local", "id": "sha256:78gh90..." },
+    { "service": "rpc-router", "image": "z3sim/rpc-router:local", "id": "sha256:12ij34..." }
+  ],
+  "host_cpu_count": 8,
+  "host_memory_limit_bytes": null,
+  "state": {
+    "reset_epoch": 3,
+    "chain_height_at_start": 1245,
+    "hot_wallet_balance_at_start_zat": 5000000000,
+    "freshness": "reused"
   }
 }
 ```
 
 **Run ID format:** `<YYYYMMDDTHHMMSSZ>-<scenario-name>`. Sortable, human-readable, and
 unique per run (assuming no two runs of the same scenario start in the same second).
+
+**`phase_boundaries`** records the wall-clock start time of each lifecycle phase this run
+passed through, in order: `bootstrap` (stack start, before it reports ready) →
+`readiness` (hot-wallet resolution) → `warmup` (mining warmup blocks) → `funding`
+(the hot-wallet-to-synthetic-account funding fan-out) → `load` (the measured workload) →
+`drain` (draining in-flight intents after dispatch stops). Every `RpcCall` in
+`rpc_calls.jsonl` carries the same `phase` it was issued during, so workload-scoped
+report views (the RPC compatibility matrix, load curve, degradation detection) can
+exclude setup-phase activity by construction rather than by convention. A run
+directory written before phase tagging existed has no `phase_boundaries` (an old
+manifest still deserializes — the field defaults to empty) and every `RpcCall` in it
+deserializes with `phase: "unknown"`, which every phase-scoped view excludes rather
+than mislabeling as `load`.
+
+**`load_and_drain_completed_at`** records the wall-clock instant the Drain phase's own
+work (draining in-flight intents) finished — the same instant `confirmed_tx_throughput`'s
+elapsed-time window stops. This is deliberately **not** the same as `run_completed_at`:
+the gap between the two is Z3 stack teardown (`docker compose down`), which is
+environment/host overhead, not part of the measured workload. The findings report's
+"Setup phase timing" section uses this field, rather than `run_completed_at`, as the
+Drain row's own end boundary, and shows any residual gap as a separate Teardown row —
+so the Drain duration shown there always reconciles with `confirmed_tx_throughput`.
+`None`/absent for a manifest predating this field, or a run whose load phase never
+completed (setup failed before Drain was reached).
 
 **`simulator_commit` is embedded at compile time** (`build.rs` shells out to
 `git rev-parse HEAD` at build time and bakes the result into the binary via
@@ -56,6 +104,60 @@ run time.
 **`timeouts`** records the RPC transport timeout and the confirmation/operation
 polling patience actually in effect for the run, so a low confirmation rate can be
 distinguished from an impatient client.
+
+**`compose_config_hash`** is the SHA-256 hex digest of this run's effective, merged
+`docker compose config` (images, env vars, ports, network layout, container-side
+paths), computed by `z3::Z3Stack::compose_config_hash`. Checkout-location-dependent
+bind-mount source paths (`${Z3_CONFIG_DIR}`-rooted config file mounts) are stripped
+before hashing, so two checkouts of identical logical configuration cloned to
+different filesystem paths produce the same hash — a real configuration change (a
+different image tag, a different port) still changes it. Empty on a manifest
+predating this field, or when the hash could not be computed (this is evidence, not
+a correctness dependency, so a failure here degrades to a warning rather than
+failing the run).
+
+**`image_digests`** is the image (`repository:tag`) and local content-addressed
+image ID Docker actually ran for each stack component, from `docker compose images
+--format json` (`z3::Z3Stack::image_digests`, the same helper `z3sim print-versions`
+uses — see Track 1). Labeled `id`, not `digest`, deliberately: it is not guaranteed
+to equal a pullable registry manifest digest (storage-driver dependent), and the
+locally-built Zallet/RPC Router images have no registry digest to compare against
+at all — it remains a unique, reproducible content hash of the image bytes that ran.
+
+**`host_cpu_count`** / **`host_memory_limit_bytes`** record the number of logical
+CPUs available to the `z3sim` process (`std::thread::available_parallelism()`) and,
+when running under a constrained Linux cgroup (a containerized CI runner, for
+instance), its memory limit in bytes — `null` on an unconstrained bare-metal or VM
+host, which is the common case for where `z3sim` itself runs (only the Z3 stack's
+own containers are resource-constrained by design).
+
+**`state`** records this run's starting chain-state provenance: `reset_epoch`
+(incremented once per `scripts/dev/regtest-reset.sh` execution against this run's
+specific environment, persisted at `configs/local/reset-epoch-<env_id>` — scoped per
+environment id, like `run-<env_id>.lock`, so a `--fresh-env` run never reads another
+environment's reset provenance; `0` if this specific environment has never been
+reset), `chain_height_at_start` (observed immediately after the RPC client is constructed,
+before any warmup mining), `hot_wallet_balance_at_start_zat` (the hot wallet's total
+balance once `warmup()` confirms it funded), and `freshness` — `"fresh"` when this
+run is the first to observe chain state since the last reset, `"reused"` when a
+prior run already advanced the chain since then. This is deliberately cheap rather
+than exact (no Docker-volume content hash): it distinguishes fresh/reused/which-reset-
+generation without needing to reconstruct that judgment from raw numbers. Defaulted
+(`reset_epoch: 0`, `freshness: "fresh"`) on a manifest predating this field.
+
+---
+
+## Console progress
+
+Every multi-minute phase with a known total (warmup block-mining, the hot-wallet
+balance wait, funding rounds, the load phase's dispatch loop) reports visible
+progress via `scenarios::runner::progress::ProgressLine`: current phase, a short
+detail string ("N/total blocks mined", "funding round N/total", ...), elapsed time,
+and — where a ceiling is known — the timeout budget. On a real terminal this
+redraws one line in place (`\r`); when stderr is not a TTY (piped, redirected, CI)
+it falls back to one `tracing::info!` line per update instead. This supersedes the
+warmup balance-check loop's old every-30-second `eprintln!` — the mechanism is now
+one line, updated continuously, rather than a periodic diagnostic print.
 
 ---
 
@@ -88,10 +190,17 @@ One JSON object per line, one line per RPC call. Written incrementally during th
 so partial data is preserved if a run crashes.
 
 ```json
-{"call_id":"a1b2c3","run_id":"20260602T140000Z-smoke","method":"getblockchaininfo","component":"Zebra","request_at":"2026-06-02T14:00:01.000Z","response_at":"2026-06-02T14:00:01.012Z","latency_ms":12,"success":true,"error_code":null,"error_message":null}
-{"call_id":"d4e5f6","run_id":"20260602T140000Z-smoke","method":"z_sendmany","component":"Zallet","request_at":"2026-06-02T14:00:02.000Z","response_at":"2026-06-02T14:00:02.008Z","latency_ms":8,"success":true,"error_code":null,"error_message":null}
-{"call_id":"g7h8i9","run_id":"20260602T140000Z-smoke","method":"getnewaddress","component":"Zallet","request_at":"2026-06-02T14:00:03.000Z","response_at":null,"latency_ms":null,"success":false,"error_code":-32601,"error_message":"Method not found"}
+{"call_id":"a1b2c3","run_id":"20260602T140000Z-smoke","method":"getblockchaininfo","component":"Zebra","request_at":"2026-06-02T14:00:01.000Z","response_at":"2026-06-02T14:00:01.012Z","latency_ms":12,"success":true,"error_code":null,"error_message":null,"phase":"warmup"}
+{"call_id":"d4e5f6","run_id":"20260602T140000Z-smoke","method":"z_sendmany","component":"Zallet","request_at":"2026-06-02T14:00:02.000Z","response_at":"2026-06-02T14:00:02.008Z","latency_ms":8,"success":true,"error_code":null,"error_message":null,"phase":"load"}
+{"call_id":"g7h8i9","run_id":"20260602T140000Z-smoke","method":"getnewaddress","component":"Zallet","request_at":"2026-06-02T14:00:03.000Z","response_at":null,"latency_ms":null,"success":false,"error_code":-32601,"error_message":"Method not found","phase":"load"}
 ```
+
+`phase` names the lifecycle stage the call was issued during — one of `bootstrap`,
+`readiness`, `warmup`, `funding`, `load`, `drain`, or `unknown` (a run predating phase
+tagging) — see `phase_boundaries` above. Report views scoped to the measured workload
+(the RPC compatibility matrix, load curve, degradation detection) include only `load`
+and `drain` calls; setup-phase calls (`bootstrap`/`readiness`/`warmup`/`funding`) are
+shown separately, in their own unscored appendix.
 
 This file is the primary input for:
 - latency histograms (P50/P95/P99 per method),
@@ -129,10 +238,12 @@ the method's routing table.
 | `confirmed_txs_total` | `flow_type` | Cumulative confirmed transactions |
 | `failed_txs_total` | `flow_type`, `reason` | Cumulative failed transactions |
 | `deposit_confirmation_time_ms` | — | Time from deposit detection to credit |
-| `proving_time_ms` | — | ZK proof generation time for shielded txs |
+| `shielded_proving_time_ms` | `account_id`, `flow_type` | ZK spend/output proof generation time for a withdrawal whose flow touches a shielded pool on either end (`FlowType::is_shielded()` — t2z, z2t, z2z, not only fully-shielded z2z) |
+| `wallet_operation_time_ms` | `account_id`, `flow_type` | The same measured window (accepted `z_sendmany` call through operation completion) for a purely transparent (t2t) withdrawal, where no ZK proof is generated — kept as a separate metric name so this time is never mislabeled as shielded proving time |
 | `active_accounts` | — | Accounts actively transacting at sample time |
 | `block_height` | — | Current chain height |
-| `tps_achieved` | — | Observed transactions per second vs. target |
+| `scheduled_dispatch_rate` | — | Intents dispatched per second of actual load-phase elapsed time (not the configured duration) — a scheduler-behavior figure, not a confirmed-transaction rate |
+| `confirmed_tx_throughput` | — | Confirmed transactions per second of Load+Drain wall-clock time — the only metric this report labels "TPS" |
 | `mempool_saturation_event` | `threshold` | Recorded once when mempool depth crosses the saturation threshold; value is the observed depth at crossing |
 | `process_cpu_percent` | `process` | CPU usage of each Docker container (Zebra, Zaino, Zallet) |
 | `process_memory_mb` | `process` | Memory usage of each Docker container |
@@ -140,6 +251,19 @@ the method's routing table.
 Metric sampling interval: **5 seconds** by default, configurable per-scenario via
 `observability.metric_sampling_interval_secs` in the scenario YAML. Use 1s for burst
 scenarios where fine-grained mempool data is needed; 15s for long steady-state runs.
+
+### Known limitations in the findings report
+
+The findings report (`src/report/findings.rs`) never surfaces a pre-approved, already
+documented defect as a fresh `High`-severity `RpcFailure` candidate. A small explicit table,
+`KNOWN_LIMITATIONS`, names each such defect by RPC method, the lifecycle phase (see `Phase`
+above) it is known to occur in, and a substring of its actual error message — a candidate call
+must match all three fields to be excluded from ordinary rate-based scoring and instead
+rendered as a `Low`-severity `KnownLimitation` finding. Matching on method or phase alone is
+deliberately insufficient: `z_listunspent`, for example, is called both from an unfiltered,
+known-defective site during warmup and from a filtered, defect-avoiding site during the load
+phase's sweep flow, under the identical method name — only the phase-and-error-substring
+combination distinguishes the tolerated case from a genuinely new failure.
 
 ---
 
@@ -184,13 +308,25 @@ the Foundation and component teams without requiring them to parse JSONL files.
 - Z3 commits: Zebra <sha>, Zaino <sha>, Zallet <sha>
 
 ## Load results
-- Target TPS: <n>
-- Achieved TPS: <n>
+- Target dispatch rate: <n> intents/s
+- Scheduled dispatch rate: <n> intents/s (actual load-phase elapsed time, not the configured duration)
+- Confirmed tx throughput (TPS, from `confirmed_tx_throughput`): <n>
 - Total transactions attempted: <n>
 - Confirmed: <n> (<pct>%)
 - Failed: <n> (<pct>%)
 
 ## RPC latency (P50 / P95 / P99)
+Scoped to Load/Drain-phase calls only — the measured workload. Setup-phase retries
+(e.g. the funding fan-out's own anchor-confirmation retries) never inflate this table's
+Calls/Errors counts.
+| Method | Component | P50 ms | P95 ms | P99 ms | Errors |
+|---|---|---|---|---|---|
+| ...     | ...       | ...    | ...    | ...    | ...    |
+
+## Setup-phase RPC activity
+Present only when the run recorded setup-phase (`Bootstrap`/`Readiness`/`Warmup`/`Funding`)
+calls. Same table shape as above, scoped to those phases instead — informational, not
+mixed into the workload table.
 | Method | Component | P50 ms | P95 ms | P99 ms | Errors |
 |---|---|---|---|---|---|
 | ...     | ...       | ...    | ...    | ...    | ...    |
@@ -214,6 +350,9 @@ the Foundation and component teams without requiring them to parse JSONL files.
 - ...
 
 ## Shielded transaction proving times
+- P50: <ms>, P95: <ms>, P99: <ms>
+
+## Wallet operation times (no shielded proof)
 - P50: <ms>, P95: <ms>, P99: <ms>
 ```
 

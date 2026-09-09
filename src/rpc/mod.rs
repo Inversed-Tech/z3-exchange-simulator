@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::sync::{
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicU64, AtomicU8, Ordering},
     Arc,
 };
 use std::time::Duration;
@@ -8,7 +8,7 @@ use std::time::Duration;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
-use crate::data_model::{Backend, RpcCall};
+use crate::data_model::{Backend, Phase, RpcCall};
 use crate::metrics::MetricsRecorder;
 
 // ── Private envelope types ────────────────────────────────────────────────────
@@ -269,11 +269,15 @@ pub struct PoolBalance {
 impl AccountBalance {
     /// Total spendable shielded balance (Sapling + Orchard + Ironwood), in zatoshis.
     pub fn shielded_zatoshis(&self) -> u64 {
-        [&self.pools.sapling, &self.pools.orchard, &self.pools.ironwood]
-            .into_iter()
-            .filter_map(|p| p.as_ref())
-            .map(|p| p.value_zat)
-            .sum()
+        [
+            &self.pools.sapling,
+            &self.pools.orchard,
+            &self.pools.ironwood,
+        ]
+        .into_iter()
+        .filter_map(|p| p.as_ref())
+        .map(|p| p.value_zat)
+        .sum()
     }
 
     /// Spendable transparent balance, in zatoshis.
@@ -522,6 +526,34 @@ fn routing_table() -> HashMap<&'static str, Backend> {
 /// recorded in the run manifest instead of duplicated as a magic number.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Links a recorded `RpcCall` to the transaction intent it was issued on
+/// behalf of, and which attempt of that intent's retry sequence this is.
+/// `Default` is the unlinked case (`intent_id: None, attempt_number: 1`) —
+/// what every public `RpcClient` method except `z_send_many_attempt` passes.
+#[derive(Clone)]
+struct RetryContext {
+    intent_id: Option<String>,
+    attempt_number: u32,
+}
+
+impl Default for RetryContext {
+    fn default() -> Self {
+        Self {
+            intent_id: None,
+            attempt_number: 1,
+        }
+    }
+}
+
+impl RetryContext {
+    fn linked(intent_id: &str, attempt_number: u32) -> Self {
+        Self {
+            intent_id: Some(intent_id.to_string()),
+            attempt_number,
+        }
+    }
+}
+
 pub struct RpcClient {
     http: reqwest::Client,
     base_url: String,
@@ -536,6 +568,13 @@ pub struct RpcClient {
     /// the routing table. Used for clients pointed directly at Zaino's JSON-RPC
     /// mirror, where the router's method→backend mapping does not apply.
     backend_override: Option<Backend>,
+    /// Current lifecycle phase, read on every call to tag the recorded
+    /// `RpcCall`. Defaults to a private, unshared atomic initialized to
+    /// `Phase::Bootstrap`; `attach_phase_tracker` rebinds it to a
+    /// `PhaseTracker`'s shared handle so `tracker.mark(...)` retags every
+    /// subsequent call from any task holding a clone of this same
+    /// `Arc<RpcClient>` — see `crate::scenarios::runner::phase`.
+    current_phase: Arc<AtomicU8>,
 }
 
 impl RpcClient {
@@ -559,7 +598,26 @@ impl RpcClient {
             call_counter: AtomicU64::new(0),
             auth: None,
             backend_override: None,
+            current_phase: Arc::new(AtomicU8::new(Phase::Bootstrap as u8)),
         }
+    }
+
+    /// Rebinds this client's phase source to `atomic` — typically a
+    /// `PhaseTracker`'s `shared_atomic()` handle. Takes `&mut self`, so it
+    /// must be called on an owned client before it is wrapped in `Arc` (the
+    /// usual next step after construction); every RPC call issued afterward,
+    /// from any task holding a clone of that `Arc`, reads the same atomic and
+    /// is tagged with whatever phase the tracker last marked.
+    pub fn attach_phase_tracker(&mut self, atomic: Arc<AtomicU8>) {
+        self.current_phase = atomic;
+    }
+
+    /// The phase to tag the next recorded `RpcCall` with. Falls back to
+    /// `Phase::Unknown` on an out-of-range value, which should never occur —
+    /// only `PhaseTracker::mark` and this client's own constructor ever write
+    /// to the atomic, and both only ever store a valid `Phase` discriminant.
+    fn phase(&self) -> Phase {
+        Phase::try_from(self.current_phase.load(Ordering::Relaxed)).unwrap_or(Phase::Unknown)
     }
 
     /// Build a client pointed at Zaino's zcashd-style JSON-RPC mirror (regtest
@@ -616,11 +674,27 @@ impl RpcClient {
     /// Send one JSON-RPC call, parse the result, and record an RpcCall entry.
     ///
     /// This is the single chokepoint all public methods go through — timing,
-    /// error classification, and metrics recording all happen here.
+    /// error classification, and metrics recording all happen here. Thin
+    /// wrapper over `call_attempt` passing the default (unlinked) retry
+    /// context — see that method's doc comment.
     async fn call<T: for<'de> Deserialize<'de>>(
         &self,
         method: &'static str,
         params: serde_json::Value,
+    ) -> Result<T, RpcError> {
+        self.call_attempt(method, params, RetryContext::default())
+            .await
+    }
+
+    /// Like `call`, but tags the recorded `RpcCall` with `attempt`'s
+    /// intent/attempt-number linkage instead of the unlinked default. Used by
+    /// `RpcClient::z_send_many_attempt` — the only public method that needs
+    /// this linkage today (see `scenarios::exchange::send_many_with_anchor_retries`).
+    async fn call_attempt<T: for<'de> Deserialize<'de>>(
+        &self,
+        method: &'static str,
+        params: serde_json::Value,
+        attempt: RetryContext,
     ) -> Result<T, RpcError> {
         let n = self.call_counter.fetch_add(1, Ordering::Relaxed);
         let call_id = format!("{method}-{n}");
@@ -680,6 +754,9 @@ impl RpcClient {
                 success: outcome.is_ok(),
                 error_code,
                 error_message,
+                phase: self.phase(),
+                intent_id: attempt.intent_id,
+                attempt_number: attempt.attempt_number,
             });
         }
 
@@ -747,6 +824,9 @@ impl RpcClient {
                 success: outcome.is_ok(),
                 error_code,
                 error_message,
+                phase: self.phase(),
+                intent_id: None,
+                attempt_number: 1,
             });
         }
 
@@ -889,6 +969,21 @@ impl RpcClient {
         total_blocks: u64,
         chunk_size: u32,
     ) -> Result<(), RpcError> {
+        self.generate_in_chunks_with_progress(total_blocks, chunk_size, |_mined, _total| {})
+            .await
+    }
+
+    /// [`Self::generate_in_chunks`], additionally invoking `on_chunk(mined,
+    /// total_blocks)` after each chunk completes — the seam
+    /// `scenarios::runner::lifecycle::mine_blocks` uses to report warmup
+    /// mining progress without duplicating this function's chunking/retry
+    /// logic.
+    pub async fn generate_in_chunks_with_progress(
+        &self,
+        total_blocks: u64,
+        chunk_size: u32,
+        on_chunk: impl FnMut(u64, u64),
+    ) -> Result<(), RpcError> {
         const MAX_ATTEMPTS_PER_CHUNK: u32 = 12;
         const RETRY_INTERVAL: Duration = Duration::from_secs(5);
         self.generate_in_chunks_with_retry_policy(
@@ -896,6 +991,7 @@ impl RpcClient {
             chunk_size,
             MAX_ATTEMPTS_PER_CHUNK,
             RETRY_INTERVAL,
+            on_chunk,
         )
         .await
     }
@@ -909,8 +1005,10 @@ impl RpcClient {
         chunk_size: u32,
         max_attempts_per_chunk: u32,
         retry_interval: Duration,
+        mut on_chunk: impl FnMut(u64, u64),
     ) -> Result<(), RpcError> {
         let mut remaining = total_blocks;
+        let mut mined = 0u64;
         while remaining > 0 {
             let chunk = remaining.min(chunk_size as u64) as u32;
             let mut attempts = 0u32;
@@ -919,12 +1017,22 @@ impl RpcClient {
                 match self.generate(chunk).await {
                     Ok(_) => break,
                     Err(RpcError::Transport(_)) if attempts < max_attempts_per_chunk => {
+                        // Re-report the last completed chunk's progress here
+                        // too, not only once the current chunk finishes: a
+                        // chunk stuck retrying (up to
+                        // `max_attempts_per_chunk * retry_interval`) would
+                        // otherwise leave the caller's progress line frozen
+                        // for that whole stretch instead of showing a fresh
+                        // elapsed time every `retry_interval`.
+                        on_chunk(mined, total_blocks);
                         tokio::time::sleep(retry_interval).await;
                     }
                     Err(e) => return Err(e),
                 }
             }
             remaining -= chunk as u64;
+            mined += chunk as u64;
+            on_chunk(mined, total_blocks);
         }
         Ok(())
     }
@@ -1105,6 +1213,34 @@ impl RpcClient {
         self.call(
             "z_sendmany",
             serde_json::json!([from, recipients, null, null, privacy_policy]),
+        )
+        .await
+    }
+
+    /// Like `z_send_many`/`z_send_many_with_policy`, but tags the recorded
+    /// `RpcCall` with `intent_id` and `attempt_number` — used by
+    /// `scenarios::exchange::send_many_with_anchor_retries` so a retried
+    /// intent's attempts can be collapsed to one terminal outcome in the
+    /// RPC compatibility matrix instead of each attempt counting as a
+    /// separate call (see `report::rpc_matrix::build_matrix`).
+    /// `privacy_policy: None` omits the policy argument, matching
+    /// `z_send_many`; `Some(p)` matches `z_send_many_with_policy`.
+    pub async fn z_send_many_attempt(
+        &self,
+        from: &str,
+        recipients: &[Recipient],
+        privacy_policy: Option<&str>,
+        intent_id: &str,
+        attempt_number: u32,
+    ) -> Result<String, RpcError> {
+        let params = match privacy_policy {
+            Some(p) => serde_json::json!([from, recipients, null, null, p]),
+            None => serde_json::json!([from, recipients, null, null]),
+        };
+        self.call_attempt(
+            "z_sendmany",
+            params,
+            RetryContext::linked(intent_id, attempt_number),
         )
         .await
     }
@@ -1413,6 +1549,63 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert!(!calls[0].success);
         assert!(calls[0].error_message.is_some());
+    }
+
+    // ── phase tagging ─────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn new_client_tags_calls_bootstrap_by_default() {
+        use wiremock::{matchers, Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(matchers::method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": { "chain": "regtest", "blocks": 1, "headers": 1 },
+                "error": null,
+                "id": 1
+            })))
+            .mount(&server)
+            .await;
+
+        let rec = MockRecorder::new();
+        client_with_recorder(&server.uri(), rec.clone())
+            .get_blockchain_info()
+            .await
+            .unwrap();
+
+        assert_eq!(rec.recorded_calls()[0].phase, Phase::Bootstrap);
+    }
+
+    #[tokio::test]
+    async fn attach_phase_tracker_retags_subsequent_calls_immediately() {
+        use wiremock::{matchers, Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(matchers::method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": { "chain": "regtest", "blocks": 1, "headers": 1 },
+                "error": null,
+                "id": 1
+            })))
+            .mount(&server)
+            .await;
+
+        let rec = MockRecorder::new();
+        let mut client = client_with_recorder(&server.uri(), rec.clone());
+        let atomic = Arc::new(AtomicU8::new(Phase::Bootstrap as u8));
+        client.attach_phase_tracker(atomic.clone());
+
+        client.get_blockchain_info().await.unwrap();
+        // Simulates a PhaseTracker::mark(Phase::Load) call from elsewhere —
+        // the client shares the same atomic, so this must take effect
+        // without any further plumbing.
+        atomic.store(Phase::Load as u8, Ordering::Relaxed);
+        client.get_blockchain_info().await.unwrap();
+
+        let calls = rec.recorded_calls();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].phase, Phase::Bootstrap);
+        assert_eq!(calls[1].phase, Phase::Load);
     }
 
     // ── routing table ─────────────────────────────────────────────────────────
@@ -1956,6 +2149,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn z_send_many_attempt_tags_recorded_call_with_intent_and_attempt_number() {
+        use wiremock::{matchers, Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(matchers::method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": "opid-abcdef", "error": null, "id": 1
+            })))
+            .mount(&server)
+            .await;
+        let recipients = vec![Recipient {
+            address: "u1dest".into(),
+            amount: 0.5,
+            memo: None,
+        }];
+        let recorder = MockRecorder::new();
+        let op_id = client_with_recorder(&server.uri(), recorder.clone())
+            .z_send_many_attempt("uuid-1234", &recipients, None, "intent-42", 3)
+            .await
+            .unwrap();
+        assert_eq!(op_id, "opid-abcdef");
+
+        let calls = recorder.recorded_calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].method, "z_sendmany");
+        assert_eq!(calls[0].intent_id.as_deref(), Some("intent-42"));
+        assert_eq!(calls[0].attempt_number, 3);
+    }
+
+    #[tokio::test]
+    async fn z_send_many_via_plain_call_is_unlinked() {
+        use wiremock::{matchers, Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(matchers::method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": "opid-abcdef", "error": null, "id": 1
+            })))
+            .mount(&server)
+            .await;
+        let recipients = vec![Recipient {
+            address: "u1dest".into(),
+            amount: 0.5,
+            memo: None,
+        }];
+        let recorder = MockRecorder::new();
+        client_with_recorder(&server.uri(), recorder.clone())
+            .z_send_many("uuid-1234", &recipients)
+            .await
+            .unwrap();
+
+        let calls = recorder.recorded_calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].intent_id, None);
+        assert_eq!(calls[0].attempt_number, 1);
+    }
+
+    #[tokio::test]
     async fn z_get_operation_status_parses_executing_operation() {
         use wiremock::{matchers, Mock, MockServer, ResponseTemplate};
         let server = MockServer::start().await;
@@ -2213,6 +2462,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn generate_in_chunks_with_progress_reports_cumulative_mined_per_chunk() {
+        use wiremock::{matchers, Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(matchers::method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [], "error": null, "id": 1
+            })))
+            .mount(&server)
+            .await;
+
+        let progress = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(u64, u64)>::new()));
+        let progress_clone = progress.clone();
+        client(&server.uri())
+            .generate_in_chunks_with_progress(12, 5, move |mined, total| {
+                progress_clone.lock().unwrap().push((mined, total));
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(*progress.lock().unwrap(), vec![(5, 12), (10, 12), (12, 12)]);
+    }
+
+    #[tokio::test]
     async fn generate_in_chunks_propagates_non_transport_error_immediately() {
         use wiremock::{matchers, Mock, MockServer, ResponseTemplate};
         let server = MockServer::start().await;
@@ -2267,7 +2539,7 @@ mod tests {
         );
 
         short_timeout_client
-            .generate_in_chunks_with_retry_policy(5, 5, 3, Duration::from_millis(1))
+            .generate_in_chunks_with_retry_policy(5, 5, 3, Duration::from_millis(1), |_, _| {})
             .await
             .unwrap();
 
@@ -2280,13 +2552,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn generate_in_chunks_reports_progress_during_a_retry_not_only_on_chunk_completion() {
+        use wiremock::{matchers, Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        // Two client-side timeouts before the chunk finally succeeds — a
+        // single chunk stuck retrying, the scenario `on_chunk` must not stay
+        // silent through.
+        Mock::given(matchers::method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"result": [], "error": null, "id": 1}))
+                    .set_delay(Duration::from_millis(200)),
+            )
+            .up_to_n_times(2)
+            .mount(&server)
+            .await;
+        Mock::given(matchers::method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [], "error": null, "id": 1
+            })))
+            .mount(&server)
+            .await;
+
+        let short_timeout_client = RpcClient::new(
+            server.uri(),
+            "test-run",
+            None,
+            Some(Duration::from_millis(20)),
+        );
+
+        let progress = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(u64, u64)>::new()));
+        let progress_clone = progress.clone();
+        short_timeout_client
+            .generate_in_chunks_with_retry_policy(5, 5, 3, Duration::from_millis(1), move |m, t| {
+                progress_clone.lock().unwrap().push((m, t));
+            })
+            .await
+            .unwrap();
+
+        let calls = progress.lock().unwrap().clone();
+        assert!(
+            calls.len() >= 2,
+            "expected at least one progress call during the retries plus one on completion, \
+             got: {calls:?}"
+        );
+        assert_eq!(
+            calls.last(),
+            Some(&(5, 5)),
+            "the final call must still report the chunk as complete"
+        );
+    }
+
+    #[tokio::test]
     async fn generate_in_chunks_gives_up_after_exhausting_retries() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         drop(listener);
 
         let err = client(&format!("http://{addr}"))
-            .generate_in_chunks_with_retry_policy(5, 5, 1, Duration::from_millis(1))
+            .generate_in_chunks_with_retry_policy(5, 5, 1, Duration::from_millis(1), |_, _| {})
             .await
             .unwrap_err();
         assert!(matches!(err, RpcError::Transport(_)));

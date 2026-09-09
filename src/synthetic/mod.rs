@@ -107,8 +107,8 @@ impl std::error::Error for PopulationError {}
 mod tests {
     use super::*;
     use crate::data_model::{
-        AccountStatus, ActivityProfile, ActivityProfileConfig, AmountRangeConfig, FlowConfig,
-        ObservabilityConfig, ScenarioConfig,
+        AccountStatus, ActivityProfile, ActivityProfileConfig, AmountRangeConfig,
+        ExpectationsConfig, FlowConfig, ObservabilityConfig, ScenarioConfig,
     };
     use chrono::Utc;
 
@@ -179,6 +179,7 @@ mod tests {
             config_hash: String::new(),
             source_path: String::new(),
             warmup_blocks: 10,
+            expectations: ExpectationsConfig::default(),
         }
     }
 

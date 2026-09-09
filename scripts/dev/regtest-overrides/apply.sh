@@ -28,12 +28,15 @@
 #   5. Copies docker-compose.regtest.override.yml (Zaino 0.6.0 private-bind
 #      fix) into the stack directory.
 #
-# Run order on a fresh machine:
+# Run order on a fresh machine — or just run scripts/dev/bootstrap.sh, which
+# sequences all of this (plus a dependency check) as one command:
 #   bash scripts/dev/clone-z3.sh
 #   bash scripts/dev/regtest-overrides/apply.sh          # this script
 #   bash scripts/dev/zallet-release-image/build.sh       # local Zallet image
-#   (cd external/z3 && ./scripts/regtest-init.sh)
-#   bash scripts/dev/regtest-miner-setup.sh
+#   ./target/debug/z3sim print-versions                  # brings the stack up
+#                                                         # and bootstraps the
+#                                                         # wallet/miner (see
+#                                                         # Z3Config::ensure_wallet_bootstrapped)
 #
 # Requirements: the stack's own setup-network.sh requirements (rage-keygen,
 # openssl) plus GNU sed.
@@ -118,7 +121,10 @@ fi
 PLACEHOLDER="__GENERATED_BY_INIT_SH__"
 if grep -q "pwhash = \"${PLACEHOLDER}\"" "$ZALLET_TOML"; then
     command -v openssl > /dev/null 2>&1 || die "openssl is required to generate the zallet RPC pwhash"
-    RPC_PASSWORD="$(grep -E '^Z3_REGTEST_RPC_ROUTER_PASSWORD=' "$ENV_FILE" | cut -d= -f2)"
+    # `|| true`: the shipped .env.regtest has no Z3_REGTEST_RPC_ROUTER_PASSWORD
+    # line at all — under `set -euo pipefail` a bare failing grep would abort
+    # the script before the default below can apply.
+    RPC_PASSWORD="$(grep -E '^Z3_REGTEST_RPC_ROUTER_PASSWORD=' "$ENV_FILE" | cut -d= -f2 || true)"
     RPC_PASSWORD="${RPC_PASSWORD:-zebra}"
     SALT="$(openssl rand -hex 16)"
     HASH="$(printf '%s' "$RPC_PASSWORD" | openssl dgst -sha256 -mac HMAC -macopt "key:$SALT" | awk '{print $NF}')"
@@ -166,12 +172,54 @@ else
     log "==> .env.regtest: appended override layer to COMPOSE_FILE."
 fi
 
-# 5. Drop the Zaino bind-fix compose layer into the stack directory.
+# 5. Drop the Zaino bind-fix compose layer into the stack directory. Its
+# subnet/static-IP (${Z3_SIM_SUBNET}/${Z3_SIM_ZAINO_IP}) and the four
+# per-environment host ports below are NOT patched into .env.regtest here:
+# `z3sim run` derives them from its own resolved env_id (src/z3/env_id.rs)
+# and passes them as process environment variables directly to each
+# `docker compose` invocation it makes (src/z3/mod.rs::Z3Config::for_run),
+# which take precedence over this file's values — so two environments never
+# collide without this file ever needing a per-environment rewrite, and
+# without a second, independent copy of the derivation formula to keep in
+# sync with the Rust implementation. This file's checked-in defaults
+# (172.28.0.0/16 etc.) remain what a bare `docker compose` invocation outside
+# `z3sim` uses.
 cp "$SCRIPT_DIR/docker-compose.regtest.override.yml" "$Z3_DIR/docker-compose.regtest.override.yml"
 log "==> Copied docker-compose.regtest.override.yml into $Z3_DIR."
+
+# 6. regtest-init.sh: fix its broken idempotence against Zallet >= beta. The
+# pinned script (written for alpha.3) treats a `/data/*.age` file as the
+# already-initialized marker — but beta Zallet stores the encrypted mnemonic
+# INSIDE wallet.db, so no .age file ever exists, ALREADY_INIT is always 0,
+# and every invocation takes the full path: delete wallet.db, re-run
+# init-wallet-encryption + generate-mnemonic — a brand-new wallet, all
+# accounts destroyed. `z3sim run` re-runs this script on every invocation
+# (Z3Config::ensure_wallet_bootstrapped), so the hot_wallet account that
+# regtest-miner-setup.sh created is gone by the time the runner looks for it,
+# and Zebra keeps mining to the dead account's UA — every scenario dies in
+# warmup with "hot wallet has 0 balance". Use wallet.db itself as the marker
+# for both the cleanup and the ALREADY_INIT check. (Trade-off: an init
+# interrupted between wallet creation and mnemonic generation now needs a
+# `make regtest-reset` to recover instead of a bare re-run — the reset path
+# wipes the volume, so the marker is gone and init runs in full.)
+INIT_SH="$Z3_DIR/scripts/regtest-init.sh"
+if grep -qF "test -s /data/wallet.db || rm -f" "$INIT_SH"; then
+    log "==> regtest-init.sh: wallet.db-marker idempotence already patched."
+else
+    grep -qF "sh -c 'rm -f /data/.lock /data/wallet.db'" "$INIT_SH" \
+        || die "regtest-init.sh cleanup line not found — the pinned script changed; update apply.sh step 6"
+    grep -qF "sh -c 'ls /data/*.age 2>/dev/null | wc -l')" "$INIT_SH" \
+        || die "regtest-init.sh ALREADY_INIT line not found — the pinned script changed; update apply.sh step 6"
+    sed -i "s@sh -c 'rm -f /data/.lock /data/wallet.db'@sh -c 'test -s /data/wallet.db || rm -f /data/.lock /data/wallet.db'@" "$INIT_SH"
+    sed -i "s@sh -c 'ls /data/\*.age 2>/dev/null | wc -l')@sh -c 'test -s /data/wallet.db \&\& echo 1 || echo 0')@" "$INIT_SH"
+    grep -qF "test -s /data/wallet.db && echo 1 || echo 0" "$INIT_SH" \
+        || die "failed to patch regtest-init.sh's ALREADY_INIT check"
+    log "==> regtest-init.sh: idempotence marker switched from *.age to wallet.db."
+fi
 
 log ""
 log "Override set applied. Next steps:"
 log "  bash scripts/dev/zallet-release-image/build.sh ${ZALLET_VERSION}"
-log "  (cd ${Z3_DIR} && ./scripts/regtest-init.sh)"
-log "  bash scripts/dev/regtest-miner-setup.sh"
+log "  cargo build && ./target/debug/z3sim print-versions   # brings the stack up and"
+log "                                                        # bootstraps the wallet/miner"
+log "(or just run scripts/dev/bootstrap.sh, which sequences all of the above)"

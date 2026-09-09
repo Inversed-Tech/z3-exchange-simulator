@@ -32,3 +32,16 @@ activity_profiles:
 amounts:
   min_zatoshis: 10000
   max_zatoshis: 1000000
+
+
+# Baselined against run 20260906T080053Z-health-z2t: attempted 6, confirmed 2,
+# failed 4 (all mempool_conflict — an account hit twice racing its own prior
+# sweep, exactly the "by design" noise this scenario's own sizing accepts;
+# see the description above), timed_out 0. Small sample size and inherently
+# high variance by design, so thresholds are wide: the point of this scenario
+# is proving the ZToT flow works at all, not a tight pass/fail bar.
+expectations:
+  min_confirmed: 1
+  max_terminal_failures: 5
+  max_timeouts: 0
+  allowed_error_classes: []

@@ -2,6 +2,8 @@
 name = "z3-exchange-simulator"
 version = "0.1.0"
 edition = "2021"
+# std::fs::File::try_lock (src/z3/run_lock.rs), stabilized in 1.89.
+rust-version = "1.89"
 description = "Exchange-scale load simulator for the Z3 Zcash stack (Zebra, Zaino, Zallet)"
 license = "MIT"
 readme = "README.md"

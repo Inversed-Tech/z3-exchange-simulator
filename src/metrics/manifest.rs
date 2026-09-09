@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 use super::error::MetricsError;
+use crate::z3::ImageInfo;
 
 /// The RPC transport timeout and confirmation/operation polling patience
 /// actually in effect for a run, recorded so a low confirmation rate can be
@@ -29,6 +30,213 @@ pub struct RunManifest {
     pub scenario_config_hash: String,
     pub target_tps: f64,
     pub timeouts: RunTimeouts,
+    /// Wall-clock start time of each lifecycle phase this run passed through
+    /// (see `crate::data_model::Phase`), in the order they occurred. Absent
+    /// (empty) on manifests written before phase instrumentation landed —
+    /// `#[serde(default)]` lets those older manifests keep deserializing.
+    #[serde(default)]
+    pub phase_boundaries: Vec<PhaseBoundary>,
+    /// Wall-clock instant `load_phase()` returned — i.e. the moment the
+    /// Drain phase's own work (not the Z3 stack's subsequent teardown)
+    /// finished. This, not `run_completed_at` (which includes teardown
+    /// time), is the correct end boundary for the Drain phase's *measured*
+    /// duration and for `confirmed_tx_throughput`'s elapsed-time window —
+    /// both stop counting at this same instant. `None` when the run never
+    /// reached this point (setup failed) or predates this field.
+    #[serde(default)]
+    pub load_and_drain_completed_at: Option<DateTime<Utc>>,
+    /// This run's `z3::env_id` — the identity behind its isolated Compose
+    /// project, network, volumes, ports, and subnet (see `z3::env_id`).
+    /// Ties a manifest back to the specific isolated environment that
+    /// produced it, which matters once more than one is running on a host
+    /// (see `z3::env_id::compose_project_for_env` to recover the exact
+    /// Compose project name, e.g. `z3-sim-<env_id>`). Empty on manifests
+    /// written before this field existed, or when setup failed before an
+    /// environment id was resolved.
+    #[serde(default)]
+    pub env_id: String,
+    /// SHA-256 hex digest of this run's effective `docker compose config`
+    /// (images, env vars, ports, network layout, container-side paths),
+    /// with checkout-location-dependent bind-mount source paths stripped
+    /// first — see `z3::Z3Stack::compose_config_hash`. Two checkouts of
+    /// identical logical configuration at different filesystem paths
+    /// produce the same hash. Empty on manifests written before this field
+    /// existed, or when the hash could not be computed (degrades to a
+    /// warning rather than failing the run — this is evidence, not a
+    /// correctness dependency).
+    #[serde(default)]
+    pub compose_config_hash: String,
+    /// The image (repository:tag) and local content-addressed image ID
+    /// Docker actually ran for each stack component — see
+    /// `z3::Z3Stack::image_digests`. Empty on manifests written before this
+    /// field existed, or when it could not be read.
+    #[serde(default)]
+    pub image_digests: Vec<ImageInfo>,
+    /// Number of logical CPUs available to the process that ran this run,
+    /// from `std::thread::available_parallelism()`. `0` on manifests
+    /// written before this field existed.
+    #[serde(default)]
+    pub host_cpu_count: u32,
+    /// The host's memory limit in bytes, when running under a constrained
+    /// cgroup (a containerized CI runner, for instance). `None` on an
+    /// unconstrained bare-metal or VM host, and on manifests written before
+    /// this field existed.
+    #[serde(default)]
+    pub host_memory_limit_bytes: Option<u64>,
+    /// Whether this run's starting chain state was freshly reset or reused
+    /// from a prior run, and which reset generation it belongs to — see
+    /// `StateIdentifier`. Defaulted on manifests written before this field
+    /// existed.
+    #[serde(default)]
+    pub state: StateIdentifier,
+    /// The scenario's pass/fail evaluation (see
+    /// `scenarios::runner::result::AssertionOutcome`), persisted so the
+    /// findings-report pipeline — which loads runs from disk, not from the
+    /// in-memory `RunResult` a single invocation returns — can render it.
+    /// `None` when the run never reached assertion evaluation (setup
+    /// failed) or predates this field.
+    #[serde(default)]
+    pub assertion: Option<crate::scenarios::runner::result::AssertionOutcome>,
+}
+
+/// One lifecycle phase's start time, as recorded by
+/// `crate::scenarios::runner::phase::PhaseTracker`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PhaseBoundary {
+    pub phase: crate::data_model::Phase,
+    pub started_at: DateTime<Utc>,
+}
+
+/// State/snapshot provenance for a run's starting chain: distinguishes a
+/// freshly-reset environment from one carrying over state from a prior run,
+/// and ties both to a specific reset generation.
+///
+/// Deliberately cheap rather than exact (no Docker-volume content hash): a
+/// reset-epoch counter plus the chain height recorded at that reset, the
+/// actual chain height and hot-wallet balance observed at this run's start,
+/// and an explicit fresh/reused classification computed from those numbers
+/// — sufficient to distinguish fresh/reused/which-reset-generation without
+/// leaving the judgment itself for a report reader to infer.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct StateIdentifier {
+    /// Incremented once per `scripts/dev/regtest-reset.sh` execution
+    /// against this run's specific environment; persisted at
+    /// `configs/local/reset-epoch-<env_id>` (gitignored, alongside
+    /// `env-id` — see `z3::env_id::reset_epoch_path`), scoped per
+    /// environment id so a `--fresh-env` run never reads another
+    /// environment's reset provenance. `0` when this specific environment
+    /// has never been reset.
+    pub reset_epoch: u64,
+    /// Chain height observed at the start of this run (before warmup mining).
+    pub chain_height_at_start: u64,
+    /// Hot wallet's total balance (zatoshis) observed at the end of warmup,
+    /// once it is confirmed funded.
+    pub hot_wallet_balance_at_start_zat: u64,
+    /// Whether this run's starting chain state was freshly reset or carried
+    /// over from a prior run since the last reset — see
+    /// `StateFreshness::classify`.
+    pub freshness: StateFreshness,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StateFreshness {
+    /// This run is the first to observe chain state since the last reset:
+    /// `chain_height_at_start` does not exceed the height recorded at reset
+    /// time.
+    Fresh,
+    /// A prior run already advanced the chain since the last reset:
+    /// `chain_height_at_start` exceeds the height recorded at reset time.
+    Reused,
+}
+
+impl Default for StateFreshness {
+    /// Matches `StateIdentifier::default()`'s all-zero fields: height 0 does
+    /// not exceed height-at-reset 0, so `Fresh` is the classification
+    /// `classify` itself would produce for that case.
+    fn default() -> Self {
+        StateFreshness::Fresh
+    }
+}
+
+impl StateFreshness {
+    pub fn classify(chain_height_at_start: u64, height_at_reset: u64) -> Self {
+        if chain_height_at_start <= height_at_reset {
+            StateFreshness::Fresh
+        } else {
+            StateFreshness::Reused
+        }
+    }
+}
+
+/// Reads a `configs/local/reset-epoch-<env_id>` file (see
+/// `z3::env_id::reset_epoch_path`, written by `regtest-reset.sh`'s last
+/// step for that specific environment): two whitespace-separated fields,
+/// `{epoch} {height_at_reset}`.
+///
+/// Returns `None` for a missing file or a malformed line — "no baseline has
+/// ever been recorded for this environment" — rather than silently
+/// defaulting to `(0, 0)`. That distinction matters: `(0, 0)` is not a safe
+/// stand-in for "never reset," because a freshly bootstrapped (but never
+/// explicitly reset) environment's chain height is *not* 0 by the time a
+/// run reads it — `regtest-init.sh`'s own NU5/Orchard-activation mining
+/// already advances it past 0 first. Silently comparing against `(0, 0)`
+/// would misclassify that environment's very first run as `Reused`. The
+/// caller (`runner::run()`) uses `None` to lazily establish a real baseline
+/// instead — see `write_reset_state`.
+pub fn read_reset_state(path: &Path) -> Option<(u64, u64)> {
+    let content = std::fs::read_to_string(path).ok()?;
+    let mut fields = content.split_whitespace();
+    let epoch = fields.next().and_then(|s| s.parse().ok())?;
+    let height_at_reset = fields.next().and_then(|s| s.parse().ok())?;
+    Some((epoch, height_at_reset))
+}
+
+/// Writes `configs/local/reset-epoch-<env_id>`'s two-field format
+/// (`"{epoch} {height_at_reset}"`), matching `regtest-reset.sh`'s own
+/// format exactly so a later real reset overwrites this file in place.
+///
+/// Used by [`resolve_reset_state`] to lazily establish an initial baseline
+/// (`epoch = 0`, `height_at_reset` = the run's own starting chain height)
+/// the first time an environment is used without ever having gone through
+/// `regtest-reset.sh` — see `read_reset_state`'s doc comment for why `(0,
+/// 0)` is not a safe default to compare against instead.
+pub fn write_reset_state(path: &Path, epoch: u64, height_at_reset: u64) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, format!("{epoch} {height_at_reset}\n"))
+}
+
+/// Resolves this run's `(reset_epoch, height_at_reset)` baseline for
+/// `StateFreshness::classify`: reads it from `path` if a prior reset (or an
+/// earlier run's own lazy-init, below) already recorded one, or otherwise
+/// establishes one now at `chain_height_at_start` — this run's own starting
+/// chain height.
+///
+/// The lazy-init path exists because a missing file does not mean "the
+/// chain is at height 0": `regtest-init.sh`'s own NU5/Orchard-activation
+/// mining already advances a freshly bootstrapped environment's chain past
+/// height 0 before any run ever reads `chain_height_at_start`. Comparing
+/// that height against a hardcoded `(0, 0)` would misclassify this
+/// environment's very first run as `Reused` instead of `Fresh`. Writing the
+/// baseline here — once, the first time it's missing — makes this run (and
+/// every subsequent one, until an explicit reset) compare against the
+/// correct reference point instead.
+///
+/// Best-effort: a write failure degrades to using the just-computed
+/// baseline for this run's own classification only (logged, not
+/// propagated) — this is evidence, not a correctness dependency, and a
+/// failed write here does not fail an otherwise-healthy run. The next run
+/// against this same environment simply repeats the same lazy-init.
+pub fn resolve_reset_state(path: &Path, chain_height_at_start: u64) -> (u64, u64) {
+    if let Some(v) = read_reset_state(path) {
+        return v;
+    }
+    if let Err(e) = write_reset_state(path, 0, chain_height_at_start) {
+        tracing::warn!("failed to record initial reset-epoch baseline: {e}");
+    }
+    (0, chain_height_at_start)
 }
 
 pub fn write_manifest(path: &Path, manifest: &RunManifest) -> Result<(), MetricsError> {
@@ -114,6 +322,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("manifest.json");
         let m = RunManifest {
+            env_id: "a1b2c3d4".into(),
             run_id: "20260610T000000Z-smoke".into(),
             run_started_at: Utc::now(),
             run_completed_at: None,
@@ -125,12 +334,55 @@ mod tests {
             scenario_config_hash: "sha256:deadbeef".into(),
             target_tps: 10.0,
             timeouts: RunTimeouts::default(),
+            phase_boundaries: Vec::new(),
+            load_and_drain_completed_at: None,
+            compose_config_hash: String::new(),
+            image_digests: Vec::new(),
+            host_cpu_count: 0,
+            host_memory_limit_bytes: None,
+            state: StateIdentifier::default(),
+            assertion: None,
         };
         write_manifest(&path, &m).unwrap();
         let back = read_manifest(&path).unwrap();
         assert_eq!(back.run_id, m.run_id);
         assert_eq!(back.zebra_commit, "zebra-sha");
         assert!(back.run_completed_at.is_none());
+        assert_eq!(back.env_id, "a1b2c3d4");
+    }
+
+    #[test]
+    fn read_manifest_without_env_id_field_defaults_to_empty() {
+        // Backward compatibility: a manifest written before this field
+        // existed must still deserialize, with env_id defaulting to "" —
+        // same contract as every other #[serde(default)] field here.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("manifest.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "run_id": "20260610T000000Z-smoke",
+                "run_started_at": "2026-06-10T00:00:00Z",
+                "run_completed_at": null,
+                "simulator_commit": "abc123",
+                "zebra_commit": "zebra-sha",
+                "zaino_commit": "zaino-sha",
+                "zallet_commit": "zallet-sha",
+                "scenario_name": "smoke",
+                "scenario_config_hash": "sha256:deadbeef",
+                "target_tps": 10.0,
+                "timeouts": {
+                    "rpc_timeout_ms": 0,
+                    "operation_poll_interval_ms": 0,
+                    "max_operation_wait_ms": 0,
+                    "confirmation_poll_interval_ms": 0,
+                    "max_confirmation_wait_ms": 0
+                }
+            }"#,
+        )
+        .unwrap();
+        let back = read_manifest(&path).unwrap();
+        assert_eq!(back.env_id, "");
     }
 
     #[test]
@@ -223,6 +475,7 @@ overrides:
         write_manifest(
             &path,
             &RunManifest {
+                env_id: String::new(),
                 run_id: "test".into(),
                 run_started_at: Utc::now(),
                 run_completed_at: None,
@@ -234,6 +487,14 @@ overrides:
                 scenario_config_hash: "".into(),
                 target_tps: 0.0,
                 timeouts: RunTimeouts::default(),
+                phase_boundaries: Vec::new(),
+                load_and_drain_completed_at: None,
+                compose_config_hash: String::new(),
+                image_digests: Vec::new(),
+                host_cpu_count: 0,
+                host_memory_limit_bytes: None,
+                state: StateIdentifier::default(),
+                assertion: None,
             },
         )
         .unwrap();
@@ -248,11 +509,107 @@ overrides:
     }
 
     #[test]
+    fn state_freshness_classify() {
+        assert_eq!(StateFreshness::classify(100, 100), StateFreshness::Fresh);
+        assert_eq!(StateFreshness::classify(99, 100), StateFreshness::Fresh);
+        assert_eq!(StateFreshness::classify(101, 100), StateFreshness::Reused);
+    }
+
+    #[test]
+    fn read_reset_state_parses_epoch_and_height() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("reset-epoch");
+        std::fs::write(&path, "3 12345\n").unwrap();
+        assert_eq!(read_reset_state(&path), Some((3, 12345)));
+    }
+
+    #[test]
+    fn read_reset_state_none_when_file_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("does-not-exist");
+        assert_eq!(read_reset_state(&path), None);
+    }
+
+    #[test]
+    fn read_reset_state_none_when_file_malformed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("reset-epoch");
+        std::fs::write(&path, "not-a-number\n").unwrap();
+        assert_eq!(read_reset_state(&path), None);
+    }
+
+    #[test]
+    fn write_reset_state_round_trips_through_read_reset_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested").join("reset-epoch-abcd1234");
+        write_reset_state(&path, 0, 2).unwrap();
+        assert_eq!(read_reset_state(&path), Some((0, 2)));
+    }
+
+    #[test]
+    fn write_reset_state_matches_regtest_reset_sh_format() {
+        // regtest-reset.sh writes "printf '%s %s\n' "$NEXT_EPOCH" "$HEIGHT_AT_RESET"`
+        // — both functions must produce byte-identical output for the same
+        // values, since either can be the one that first creates this file.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("reset-epoch");
+        write_reset_state(&path, 4, 2).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "4 2\n");
+    }
+
+    #[test]
+    fn resolve_reset_state_treats_a_bootstrapped_never_reset_environment_as_fresh() {
+        // Regression test for the exact bug this fixes: regtest-init.sh's
+        // own NU5/Orchard-activation mining leaves a freshly bootstrapped
+        // (but never explicitly reset) environment at chain height 2, not
+        // 0, by the time a run reads chain_height_at_start. Comparing that
+        // height against a hardcoded (0, 0) default — instead of lazily
+        // baselining against this run's own starting height — would
+        // misclassify this, the environment's very first run, as Reused.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("reset-epoch-abcd1234");
+        assert_eq!(read_reset_state(&path), None, "no baseline recorded yet");
+
+        let chain_height_at_start = 2;
+        let (reset_epoch, height_at_reset) = resolve_reset_state(&path, chain_height_at_start);
+        assert_eq!(reset_epoch, 0);
+        assert_eq!(height_at_reset, chain_height_at_start);
+        assert_eq!(
+            StateFreshness::classify(chain_height_at_start, height_at_reset),
+            StateFreshness::Fresh
+        );
+        // The baseline must actually persist, so a *second* run against this
+        // same never-reset environment reads it back rather than
+        // re-baselining against its own (now-advanced) height.
+        assert_eq!(read_reset_state(&path), Some((0, chain_height_at_start)));
+    }
+
+    #[test]
+    fn resolve_reset_state_detects_reuse_once_a_baseline_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("reset-epoch-abcd1234");
+        // A prior run already established this baseline (or an explicit
+        // reset recorded it).
+        write_reset_state(&path, 0, 2).unwrap();
+
+        // A later run's chain has advanced past the baseline via load-phase
+        // mining, with no reset in between.
+        let chain_height_at_start = 50;
+        let (reset_epoch, height_at_reset) = resolve_reset_state(&path, chain_height_at_start);
+        assert_eq!((reset_epoch, height_at_reset), (0, 2));
+        assert_eq!(
+            StateFreshness::classify(chain_height_at_start, height_at_reset),
+            StateFreshness::Reused
+        );
+    }
+
+    #[test]
     fn two_phase_write_completed_at_updates_correctly() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("manifest.json");
         let started = Utc::now();
         let mut m = RunManifest {
+            env_id: String::new(),
             run_id: "phase-test".into(),
             run_started_at: started,
             run_completed_at: None,
@@ -264,6 +621,14 @@ overrides:
             scenario_config_hash: "hash".into(),
             target_tps: 5.0,
             timeouts: RunTimeouts::default(),
+            phase_boundaries: Vec::new(),
+            load_and_drain_completed_at: None,
+            compose_config_hash: String::new(),
+            image_digests: Vec::new(),
+            host_cpu_count: 0,
+            host_memory_limit_bytes: None,
+            state: StateIdentifier::default(),
+            assertion: None,
         };
         write_manifest(&path, &m).unwrap();
         let partial = read_manifest(&path).unwrap();
@@ -286,6 +651,7 @@ overrides:
         let path = dir.path().join("manifest.json");
         let completed = Utc::now();
         let m = RunManifest {
+            env_id: String::new(),
             run_id: "complete-test".into(),
             run_started_at: Utc::now(),
             run_completed_at: Some(completed),
@@ -297,6 +663,14 @@ overrides:
             scenario_config_hash: "".into(),
             target_tps: 0.0,
             timeouts: RunTimeouts::default(),
+            phase_boundaries: Vec::new(),
+            load_and_drain_completed_at: None,
+            compose_config_hash: String::new(),
+            image_digests: Vec::new(),
+            host_cpu_count: 0,
+            host_memory_limit_bytes: None,
+            state: StateIdentifier::default(),
+            assertion: None,
         };
         write_manifest(&path, &m).unwrap();
         let back = read_manifest(&path).unwrap();

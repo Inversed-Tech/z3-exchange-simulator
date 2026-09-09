@@ -14,6 +14,7 @@ use crate::scenarios::runner::{
     load_scenario, validate_scenario, ConfigError, LoadShape, RunOptions, RunnerError,
 };
 use crate::synthetic::{write_fixtures, AccountGenerator, FixtureError, GeneratorError};
+use crate::z3::{env_id, run_lock, Z3Config, Z3Error, Z3Stack};
 
 // ── Cli types ─────────────────────────────────────────────────────────────────
 
@@ -40,8 +41,15 @@ pub struct Cli {
 pub enum Commands {
     Run(RunArgs),
     GenerateFixtures(GenerateFixturesArgs),
-    ValidateScenario { path: PathBuf },
+    ValidateScenario {
+        path: PathBuf,
+    },
     Report(ReportArgs),
+    /// Bring up this checkout's Z3 stack (bootstrapping the wallet and miner
+    /// if needed) and print the exact image each component is running.
+    /// Thin wrapper used by `scripts/dev/bootstrap.sh`'s final phase — see
+    /// `docs/regtest-funding-plan.md`.
+    PrintVersions(PrintVersionsArgs),
 }
 
 #[derive(clap::Args)]
@@ -98,6 +106,46 @@ pub struct RunArgs {
     /// Reuse an existing Zallet hot wallet from a prior run
     #[arg(long)]
     pub hot_wallet_uuid: Option<String>,
+    /// Discard this checkout's cached environment id and start a fresh,
+    /// disposable environment (distinct Compose project, ports, and subnet)
+    /// instead of reusing the stable, per-checkout one
+    #[arg(long)]
+    pub fresh_env: bool,
+    /// Test-only overrides for `RunOptions::{compose_dir, env_id_cache_path,
+    /// run_lock_dir, reset_epoch_dir}` — never real CLI flags (`#[arg(skip)]`,
+    /// so no such flags exist and these are always `None` for anything parsed
+    /// from the actual command line). Let a unit test exercising this dispatch
+    /// path fully sandbox where `setup()` reads/writes: `compose_dir` pointed
+    /// at a path guaranteed not to exist fails fast (see
+    /// `z3::Z3Config::check_preconditions`) instead of reaching a real
+    /// `external/z3` checkout and real Docker/bootstrap-script state that
+    /// might happen to already be configured on the machine running tests;
+    /// `env_id_cache_path`/`run_lock_dir`/`reset_epoch_dir` pointed at a
+    /// tempdir keep the same test from reading or writing the real checkout's
+    /// `configs/local/`.
+    #[arg(skip)]
+    pub compose_dir: Option<PathBuf>,
+    #[arg(skip)]
+    pub env_id_cache_path: Option<PathBuf>,
+    #[arg(skip)]
+    pub run_lock_dir: Option<PathBuf>,
+    #[arg(skip)]
+    pub reset_epoch_dir: Option<PathBuf>,
+}
+
+#[derive(clap::Args, Default)]
+pub struct PrintVersionsArgs {
+    /// Test-only overrides for `compose_dir`/`env_id_cache_path`/
+    /// `run_lock_dir` — never real CLI flags (`#[arg(skip)]`). See
+    /// `RunArgs`'s equivalent fields for why: this keeps a test exercising
+    /// this command from reaching a real `external/z3` checkout or writing
+    /// into the real checkout's `configs/local/`.
+    #[arg(skip)]
+    pub compose_dir: Option<PathBuf>,
+    #[arg(skip)]
+    pub env_id_cache_path: Option<PathBuf>,
+    #[arg(skip)]
+    pub run_lock_dir: Option<PathBuf>,
 }
 
 #[derive(clap::Args)]
@@ -138,6 +186,16 @@ pub enum CliError {
     Io(std::io::Error),
     /// SIGINT received; teardown completed; triggers exit 130.
     Interrupted,
+    /// `print-versions` failed to resolve the environment, bootstrap the
+    /// wallet, bring the stack up, or query its running images.
+    Z3(Z3Error),
+    /// The run completed (no infrastructure error) but failed its scenario's
+    /// `expectations` — a "the tool worked, the workload didn't pass"
+    /// outcome, distinct from `RunnerError`. Carries every violated
+    /// threshold's message (see `AssertionOutcome::violations`); triggers
+    /// exit code 2 in `main.rs`, distinct from the generic `FAILURE` (1)
+    /// every other `CliError` variant maps to.
+    AssertionFailed(Vec<String>),
 }
 
 impl std::fmt::Display for CliError {
@@ -160,6 +218,18 @@ impl std::fmt::Display for CliError {
             CliError::InvalidArgs(s) => write!(f, "invalid arguments: {s}"),
             CliError::Io(e) => write!(f, "{e}"),
             CliError::Interrupted => write!(f, "interrupted"),
+            CliError::Z3(e) => write!(f, "{e}"),
+            CliError::AssertionFailed(violations) => {
+                write!(
+                    f,
+                    "scenario assertions failed ({} violation(s)):",
+                    violations.len()
+                )?;
+                for v in violations {
+                    write!(f, "\n  {v}")?;
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -173,6 +243,7 @@ impl std::error::Error for CliError {
             CliError::Generator(e) => Some(e),
             CliError::Report(e) => Some(e),
             CliError::Io(e) => Some(e),
+            CliError::Z3(e) => Some(e),
             _ => None,
         }
     }
@@ -251,7 +322,12 @@ fn report_command(args: &ReportArgs) -> Result<(), CliError> {
     let runs = load_runs(&args.runs).map_err(CliError::Report)?;
 
     let assets_dir = {
-        let stem = args.out.file_stem().unwrap_or_default().to_string_lossy().into_owned();
+        let stem = args
+            .out
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
         let dir_name = format!("{stem}_assets");
         match args.out.parent() {
             Some(parent) if !parent.as_os_str().is_empty() => parent.join(dir_name),
@@ -327,7 +403,103 @@ fn generate_fixtures_command(args: &GenerateFixturesArgs) -> Result<(), CliError
     Ok(())
 }
 
+// ── print_versions_command ────────────────────────────────────────────────────
+
+/// Bring this checkout's env-id-derived Z3 stack up (bootstrapping the
+/// wallet/miner if this is the first time this environment has been used),
+/// then print the resolved image each component is actually running.
+///
+/// Deliberately reuses the SAME env-id resolution `z3sim run` uses (stable,
+/// cache-based — see `env_id::resolve_env_id`): whatever environment this
+/// brings up and bootstraps here is the exact one a subsequent `z3sim run`
+/// on this checkout reuses, so bootstrap's own work is never wasted or
+/// duplicated under a second, different project name.
+///
+/// Acquires the same per-`env_id` `RunLock` `lifecycle::setup` does, in the
+/// same order (resolve env_id, then lock, before anything touches Docker) —
+/// without it, a concurrent `z3sim run` against the same (stable) `env_id`
+/// and this command's own `bring_up`/teardown-on-error could race Docker
+/// operations against each other with no "environment busy" signal, exactly
+/// what Track 2's lock exists to prevent. Held for this function's duration
+/// via the returned guard's ordinary `Drop`.
+async fn print_versions_command(args: &PrintVersionsArgs) -> Result<(), CliError> {
+    let compose_dir = args
+        .compose_dir
+        .clone()
+        .unwrap_or_else(|| PathBuf::from("external/z3"));
+    let env_id_cache_path = args
+        .env_id_cache_path
+        .clone()
+        .unwrap_or_else(|| PathBuf::from("configs/local/env-id"));
+    let run_lock_dir = args
+        .run_lock_dir
+        .clone()
+        .unwrap_or_else(|| PathBuf::from("configs/local"));
+
+    let resolved_env_id =
+        env_id::resolve_env_id(&env_id_cache_path, false).map_err(CliError::Z3)?;
+    let _run_lock = run_lock::acquire(&resolved_env_id, &run_lock_dir).map_err(CliError::Z3)?;
+    let log_dir = PathBuf::from("configs/local/bootstrap-logs");
+    let mut z3_config = Z3Config::for_run("bootstrap", log_dir, &resolved_env_id, compose_dir)
+        .map_err(CliError::Z3)?;
+    // Opt into subnet retry-on-conflict (see Z3Config::subnet_cache_dir) —
+    // same directory env-id/reset-epoch/run-lock already use for per-`env_id`
+    // gitignored local state.
+    z3_config.subnet_cache_dir = run_lock_dir;
+
+    z3_config
+        .ensure_wallet_bootstrapped()
+        .await
+        .map_err(CliError::Z3)?;
+
+    // On failure, best-effort tear the stack back down before returning —
+    // `bring_up` may have brought some containers up before the health check
+    // timed out, and mirrors the same failure-cleanup convention
+    // `lifecycle::setup` uses around `Z3Stack::start`.
+    let mut stack = Z3Stack::new(z3_config, None);
+    if let Err(e) = stack.bring_up().await {
+        let _ = stack.stop().await;
+        return Err(CliError::Z3(e));
+    }
+
+    let images = stack.image_digests().await.map_err(CliError::Z3)?;
+    println!(
+        "Running images for environment {resolved_env_id} (image IDs are local content \
+         hashes, not necessarily pullable registry digests — see \
+         docs/regtest-funding-plan.md):"
+    );
+    for img in &images {
+        let label = match img.service.as_str() {
+            "zebra" => "Zebra",
+            "zaino" => "Zaino",
+            "zallet" => "Zallet",
+            "rpc-router" => "RPC Router",
+            other => other,
+        };
+        println!("  {label:<10}: {} (image id {})", img.image, img.id);
+    }
+    Ok(())
+}
+
 // ── run_command ───────────────────────────────────────────────────────────────
+
+/// Apply `RunArgs`'s test-only path overrides (see their doc comments) onto
+/// `opts`, if set. A no-op for anything parsed from the real command line,
+/// since clap's `#[arg(skip)]` never populates these from `--flag` input.
+fn apply_test_path_overrides(opts: &mut RunOptions, args: &RunArgs) {
+    if let Some(dir) = &args.compose_dir {
+        opts.compose_dir = dir.clone();
+    }
+    if let Some(path) = &args.env_id_cache_path {
+        opts.env_id_cache_path = path.clone();
+    }
+    if let Some(dir) = &args.run_lock_dir {
+        opts.run_lock_dir = dir.clone();
+    }
+    if let Some(dir) = &args.reset_epoch_dir {
+        opts.reset_epoch_dir = dir.clone();
+    }
+}
 
 async fn run_command(
     args: RunArgs,
@@ -340,7 +512,7 @@ async fn run_command(
     let load_shape = build_load_shape(&args)?;
 
     if args.dry_run {
-        let opts = RunOptions {
+        let mut opts = RunOptions {
             output_base: args.output_base.clone(),
             load_shape,
             max_in_flight: args.max_in_flight,
@@ -348,8 +520,10 @@ async fn run_command(
             dry_run: true,
             hot_wallet_uuid: args.hot_wallet_uuid.clone(),
             cancel: None,
+            fresh_env: args.fresh_env,
             ..RunOptions::default() // covers polling: None only
         };
+        apply_test_path_overrides(&mut opts, &args);
         runner_run(config, opts).await.map_err(CliError::Run)?;
         return Ok(());
     }
@@ -368,7 +542,7 @@ async fn run_command(
 
     eprintln!("Starting run — press Ctrl-C to interrupt");
 
-    let opts = RunOptions {
+    let mut opts = RunOptions {
         output_base: args.output_base.clone(),
         load_shape,
         max_in_flight: args.max_in_flight,
@@ -376,8 +550,10 @@ async fn run_command(
         dry_run: false,
         hot_wallet_uuid: args.hot_wallet_uuid.clone(),
         cancel: Some(token.clone()),
+        fresh_env: args.fresh_env,
         ..RunOptions::default() // covers polling: None only
     };
+    apply_test_path_overrides(&mut opts, &args);
     let result = runner_run(config, opts).await;
     ctrl_c_handle.abort();
 
@@ -397,7 +573,16 @@ async fn run_command(
     println!("Confirmed: {}", r.stats.confirmed);
     println!("Failed   : {}", r.stats.failed);
     println!("Timed out: {}", r.stats.timed_out);
-    Ok(())
+    if r.assertion.passed {
+        println!("Result   : PASS");
+        Ok(())
+    } else {
+        println!(
+            "Result   : FAIL — {}; see report for full list",
+            r.assertion.violations[0]
+        );
+        Err(CliError::AssertionFailed(r.assertion.violations.clone()))
+    }
 }
 
 // ── dispatch ──────────────────────────────────────────────────────────────────
@@ -408,6 +593,7 @@ pub async fn dispatch(cli: Cli) -> Result<(), CliError> {
         Commands::GenerateFixtures(args) => generate_fixtures_command(&args),
         Commands::ValidateScenario { path } => validate_scenario_command(&path),
         Commands::Report(args) => report_command(&args),
+        Commands::PrintVersions(args) => print_versions_command(&args).await,
     }
 }
 
@@ -448,6 +634,10 @@ observability:
   record_component_logs: true
   metric_sampling_interval_secs: 5
   mempool_saturation_threshold: 500
+expectations:
+  min_confirmed: 0
+  max_terminal_failures: 0
+  max_timeouts: 0
 "#;
         let mut f = NamedTempFile::new().unwrap();
         f.write_all(yaml).unwrap();
@@ -467,10 +657,27 @@ observability:
             provision_concurrency: 8,
             output_base,
             hot_wallet_uuid: None,
+            fresh_env: false,
+            compose_dir: None,
+            env_id_cache_path: None,
+            run_lock_dir: None,
+            reset_epoch_dir: None,
         }
     }
 
+    /// `RunArgs` for tests that exercise the live (non-dry-run) `run_command`
+    /// path. Fully sandboxed against the real checkout: `compose_dir` is
+    /// pinned to a path guaranteed not to exist (must never reach a real
+    /// `external/z3` checkout or touch real Docker/bootstrap-script state,
+    /// regardless of what happens to be configured on the machine running
+    /// the tests — see `z3::Z3Config::check_preconditions`), and
+    /// `env_id_cache_path`/`run_lock_dir`/`reset_epoch_dir` are pinned inside
+    /// `output_base` (the caller's own tempdir) so this never reads or writes
+    /// the real checkout's `configs/local/` either.
     fn live_run_args(scenario: PathBuf, output_base: PathBuf) -> RunArgs {
+        let env_id_cache_path = Some(output_base.join("env-id"));
+        let run_lock_dir = Some(output_base.clone());
+        let reset_epoch_dir = Some(output_base.clone());
         RunArgs {
             scenario,
             dry_run: false,
@@ -483,6 +690,13 @@ observability:
             provision_concurrency: 8,
             output_base,
             hot_wallet_uuid: None,
+            fresh_env: false,
+            compose_dir: Some(PathBuf::from(
+                "target/nonexistent-external-z3-for-tests-do-not-create",
+            )),
+            env_id_cache_path,
+            run_lock_dir,
+            reset_epoch_dir,
         }
     }
 
@@ -673,6 +887,11 @@ observability:
             provision_concurrency: 8,
             output_base: PathBuf::from("experiments/runs"),
             hot_wallet_uuid: None,
+            fresh_env: false,
+            compose_dir: None,
+            env_id_cache_path: None,
+            run_lock_dir: None,
+            reset_epoch_dir: None,
         };
         let err = build_load_shape(&args).unwrap_err();
         assert!(
@@ -899,6 +1118,10 @@ observability:
   record_component_logs: true
   metric_sampling_interval_secs: 5
   mempool_saturation_threshold: 500
+expectations:
+  min_confirmed: 0
+  max_terminal_failures: 0
+  max_timeouts: 0
 "#;
         let mut f = NamedTempFile::new().unwrap();
         f.write_all(yaml).unwrap();

@@ -14,7 +14,8 @@ use tokio::time::sleep;
 use uuid::Uuid;
 
 use crate::data_model::{
-    Balance, Deposit, DepositStatus, MetricSample, Sweep, SweepStatus, Withdrawal, WithdrawalStatus,
+    Balance, Deposit, DepositStatus, FlowType, MetricSample, Sweep, SweepStatus, Withdrawal,
+    WithdrawalStatus,
 };
 use crate::metrics::MetricsRecorder;
 use crate::rpc::{OperationResult, OperationStatus, Recipient, RpcClient, RpcError};
@@ -126,12 +127,23 @@ async fn send_many_with_anchor_retries(
     from: &str,
     recipients: &[Recipient],
     policy: Option<&str>,
+    intent_id: Option<&str>,
 ) -> Result<String, RpcError> {
     let mut last_err: Option<RpcError> = None;
-    for _ in 0..SEND_RETRIES {
-        let result = match policy {
-            Some(p) => rpc.z_send_many_with_policy(from, recipients, p).await,
-            None => rpc.z_send_many(from, recipients).await,
+    for attempt in 1..=SEND_RETRIES {
+        let result = match intent_id {
+            // Linked: every attempt of this intent's z_sendmany sequence is
+            // tagged so the RPC compatibility matrix can collapse them to one
+            // terminal outcome (see report::rpc_matrix::build_matrix) instead
+            // of counting each retry as a separate call.
+            Some(id) => {
+                rpc.z_send_many_attempt(from, recipients, policy, id, attempt)
+                    .await
+            }
+            None => match policy {
+                Some(p) => rpc.z_send_many_with_policy(from, recipients, p).await,
+                None => rpc.z_send_many(from, recipients).await,
+            },
         };
         match result {
             Ok(opid) => return Ok(opid),
@@ -298,6 +310,7 @@ pub async fn run_deposit(
     privacy_policy: &str,
     amount_zatoshis: u64,
     required_confirmations: u64,
+    intent_id: Option<&str>,
     run_id: &str,
     metrics: Option<Arc<dyn MetricsRecorder>>,
     polling: &PollingConfig,
@@ -325,9 +338,15 @@ pub async fn run_deposit(
         amount: zat_to_zec(amount_zatoshis),
         memo: None,
     }];
-    let op_id = send_many_with_anchor_retries(rpc, from_account, &recipients, Some(privacy_policy))
-        .await
-        .map_err(ExchangeError::Rpc)?;
+    let op_id = send_many_with_anchor_retries(
+        rpc,
+        from_account,
+        &recipients,
+        Some(privacy_policy),
+        intent_id,
+    )
+    .await
+    .map_err(ExchangeError::Rpc)?;
 
     // Wait for ZK proving to complete and extract the txid.
     let op = poll_operation_until_complete(rpc, &op_id, polling).await?;
@@ -371,8 +390,11 @@ pub async fn run_deposit(
 /// Sends `amount_zatoshis` from `from_account` to `destination_address` via
 /// `z_send_many`, then waits for confirmation — relying on the load phase's
 /// `background_miner` to mine it rather than mining here. Emits
-/// `withdrawal_proving_time_ms` and `withdrawal_broadcast_latency_ms` to the
-/// metrics recorder.
+/// `shielded_proving_time_ms` (when `flow_type.is_shielded()`) or
+/// `wallet_operation_time_ms` (otherwise) and `withdrawal_broadcast_latency_ms`
+/// to the metrics recorder — see `FlowType::is_shielded`'s doc comment for why
+/// a spend/output proof is generated whenever either leg touches a shielded
+/// pool, not only for a fully-shielded z2z send.
 ///
 /// `privacy_policy` must match the pools involved: `AllowFullyTransparent` for
 /// a t-addr `from` paying a t-addr, `AllowRevealedRecipients` for a UA
@@ -387,6 +409,7 @@ pub async fn run_withdrawal(
     destination_address: &str,
     privacy_policy: &str,
     amount_zatoshis: u64,
+    flow_type: FlowType,
     intent_id: Option<&str>,
     run_id: &str,
     metrics: Option<Arc<dyn MetricsRecorder>>,
@@ -413,9 +436,15 @@ pub async fn run_withdrawal(
 
     withdrawal.status = WithdrawalStatus::Processing;
 
-    let op_id = send_many_with_anchor_retries(rpc, from_account, &recipients, Some(privacy_policy))
-        .await
-        .map_err(ExchangeError::Rpc)?;
+    let op_id = send_many_with_anchor_retries(
+        rpc,
+        from_account,
+        &recipients,
+        Some(privacy_policy),
+        intent_id,
+    )
+    .await
+    .map_err(ExchangeError::Rpc)?;
 
     // Measure proving time from the accepted call to operation completion —
     // excludes any anchor-confirmation retries above, which are wait time,
@@ -453,12 +482,20 @@ pub async fn run_withdrawal(
 
     withdrawal.status = WithdrawalStatus::Confirmed;
 
+    let proving_metric_name = if flow_type.is_shielded() {
+        "shielded_proving_time_ms"
+    } else {
+        "wallet_operation_time_ms"
+    };
     emit(
         &metrics,
         run_id,
-        "withdrawal_proving_time_ms",
+        proving_metric_name,
         proving_ms as f64,
-        [("account_id", account_id)],
+        [
+            ("account_id", account_id.to_string()),
+            ("flow_type", flow_type.as_str().to_string()),
+        ],
     );
     emit(
         &metrics,
@@ -479,11 +516,13 @@ pub async fn run_withdrawal(
 /// The sent amount is the sum of all discovered notes minus `SWEEP_FEE_BUFFER_ZAT`
 /// to leave headroom for the ZIP-317 fee. Returns an error if no confirmed notes
 /// are found for the account. Emits `sweep_time_ms` to the metrics recorder.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_sweep(
     rpc: &RpcClient,
     from_account: &str,
     from_address: &str,
     hot_wallet_address: &str,
+    intent_id: Option<&str>,
     run_id: &str,
     metrics: Option<Arc<dyn MetricsRecorder>>,
     polling: &PollingConfig,
@@ -558,7 +597,7 @@ pub async fn run_sweep(
         memo: None,
     }];
 
-    let op_id = send_many_with_anchor_retries(rpc, from_address, &recipients, None)
+    let op_id = send_many_with_anchor_retries(rpc, from_address, &recipients, None, intent_id)
         .await
         .map_err(ExchangeError::Rpc)?;
 
@@ -1088,6 +1127,7 @@ mod tests {
             "FullPrivacy",
             1_000_000,
             3,
+            Some("intent-1"),
             "run-1",
             Some(rec.clone() as Arc<dyn MetricsRecorder>),
             &instant_polling(),
@@ -1156,6 +1196,7 @@ mod tests {
             "FullPrivacy",
             999_999_999_999,
             3,
+            Some("intent-1"),
             "run-1",
             None,
             &instant_polling(),
@@ -1169,7 +1210,7 @@ mod tests {
     // ── run_withdrawal ────────────────────────────────────────────────────────
 
     #[tokio::test]
-    async fn run_withdrawal_confirms_and_records_timing_metrics() {
+    async fn run_withdrawal_transparent_emits_wallet_operation_time_not_shielded_proving() {
         use wiremock::{matchers, Mock, MockServer, ResponseTemplate};
         let server = MockServer::start().await;
 
@@ -1231,6 +1272,7 @@ mod tests {
             "t1destaddr",
             "AllowFullyTransparent",
             500_000,
+            FlowType::TToT,
             Some("intent-1"),
             "run-1",
             Some(rec.clone() as Arc<dyn MetricsRecorder>),
@@ -1248,10 +1290,97 @@ mod tests {
         let samples = rec.samples();
         assert!(samples
             .iter()
-            .any(|s| s.metric_name == "withdrawal_proving_time_ms"));
+            .any(|s| s.metric_name == "wallet_operation_time_ms"));
+        assert!(!samples
+            .iter()
+            .any(|s| s.metric_name == "shielded_proving_time_ms"));
         assert!(samples
             .iter()
             .any(|s| s.metric_name == "withdrawal_broadcast_latency_ms"));
+    }
+
+    #[tokio::test]
+    async fn run_withdrawal_shielded_emits_shielded_proving_time_not_wallet_operation() {
+        use wiremock::{matchers, Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+
+        Mock::given(matchers::method("POST"))
+            .and(matchers::body_partial_json(
+                serde_json::json!({ "method": "z_sendmany" }),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": "opid-wdl-2", "error": null, "id": 1
+            })))
+            .mount(&server)
+            .await;
+
+        Mock::given(matchers::method("POST"))
+            .and(matchers::body_partial_json(
+                serde_json::json!({ "method": "z_getoperationstatus" }),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [{
+                    "id": "opid-wdl-2", "status": "success",
+                    "result": { "txid": "wdltxid2" }, "error": null
+                }],
+                "error": null, "id": 1
+            })))
+            .mount(&server)
+            .await;
+
+        Mock::given(matchers::method("POST"))
+            .and(matchers::body_partial_json(
+                serde_json::json!({ "method": "z_getoperationresult" }),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [{
+                    "id": "opid-wdl-2", "status": "success",
+                    "result": { "txid": "wdltxid2" }, "error": null
+                }],
+                "error": null, "id": 1
+            })))
+            .mount(&server)
+            .await;
+
+        Mock::given(matchers::method("POST"))
+            .and(matchers::body_partial_json(
+                serde_json::json!({ "method": "getrawtransaction" }),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": { "txid": "wdltxid2", "hex": "dead", "confirmations": 1 },
+                "error": null, "id": 1
+            })))
+            .mount(&server)
+            .await;
+
+        let rec = MockRecorder::new();
+        // ZToT's second leg: the hot wallet (shielded treasury) pays out to a
+        // transparent recipient — `from_account` is the shielded source here,
+        // which is exactly what makes this leg's flow_type ZToT even though
+        // the recipient is transparent (see `FlowType::is_shielded`).
+        run_withdrawal(
+            &rpc(&server.uri()),
+            "acc-1",
+            "hot-wallet-uuid",
+            "t1destaddr",
+            "AllowRevealedRecipients",
+            500_000,
+            FlowType::ZToT,
+            Some("intent-2"),
+            "run-1",
+            Some(rec.clone() as Arc<dyn MetricsRecorder>),
+            &instant_polling(),
+        )
+        .await
+        .unwrap();
+
+        let samples = rec.samples();
+        assert!(samples
+            .iter()
+            .any(|s| s.metric_name == "shielded_proving_time_ms"));
+        assert!(!samples
+            .iter()
+            .any(|s| s.metric_name == "wallet_operation_time_ms"));
     }
 
     #[tokio::test]
@@ -1290,6 +1419,7 @@ mod tests {
             "t1dest",
             "AllowFullyTransparent",
             100,
+            FlowType::TToT,
             None,
             "run-1",
             None,
@@ -1359,6 +1489,7 @@ mod tests {
             "t1dest",
             "AllowFullyTransparent",
             100,
+            FlowType::TToT,
             None,
             "run-1",
             None,
@@ -1441,6 +1572,7 @@ mod tests {
             "sweep-account",
             "u1sweepfrom",
             "u1hotwallet",
+            Some("intent-1"),
             "run-1",
             Some(rec.clone() as Arc<dyn MetricsRecorder>),
             &instant_polling(),
@@ -1529,6 +1661,7 @@ mod tests {
             "sweep-account",
             "u1sweepfrom",
             "u1hotwallet",
+            Some("intent-1"),
             "run-1",
             None,
             &instant_polling(),
@@ -1561,6 +1694,7 @@ mod tests {
             "empty-account",
             "u1sweepfrom",
             "u1hotwallet",
+            Some("intent-1"),
             "run-1",
             None,
             &instant_polling(),
@@ -1595,6 +1729,7 @@ mod tests {
             "my-account",
             "u1sweepfrom",
             "u1hotwallet",
+            Some("intent-1"),
             "run-1",
             None,
             &instant_polling(),
@@ -1667,6 +1802,7 @@ mod tests {
             "my-account",
             "u1sweepfrom",
             "u1hotwallet",
+            Some("intent-1"),
             "run-1",
             None,
             &instant_polling(),
@@ -1730,6 +1866,7 @@ mod tests {
             "my-account",
             "u1sweepfrom",
             "u1hotwallet",
+            Some("intent-1"),
             "run-1",
             None,
             &instant_polling(),
