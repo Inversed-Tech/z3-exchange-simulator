@@ -220,12 +220,20 @@ fn timeout_candidates(runs: &[RunData]) -> Vec<Finding> {
             if intent.outcome != "timed_out" {
                 continue;
             }
+            // "(ZK proving)" only applies when this flow actually creates a
+            // shielded proof — an async z_sendmany-operation wait happens
+            // for transparent sends too (Track 5 of the Foundation
+            // feedback: don't label a transparent flow's wait as proving).
             let stage = intent
                 .timeout_context
                 .as_deref()
                 .map(|c| {
                     if c.starts_with("operation ") {
-                        "async operation (ZK proving) wait".to_string()
+                        if intent.flow_type.is_shielded() {
+                            "async operation (ZK proving) wait".to_string()
+                        } else {
+                            "async operation (wallet operation completion) wait".to_string()
+                        }
                     } else if c.starts_with("tx ") {
                         "on-chain confirmation wait".to_string()
                     } else {
@@ -955,7 +963,38 @@ mod tests {
             .find(|f| f.category == FindingCategory::Timeout)
             .expect("expected a timeout finding");
         assert!(f.summary.contains("async operation"));
+        assert!(
+            f.summary.contains("ZK proving"),
+            "shielded flow: {}",
+            f.summary
+        );
         assert_eq!(f.severity, Severity::High); // 1/1 = 100%
+    }
+
+    #[test]
+    fn transparent_timeout_is_not_labeled_zk_proving() {
+        // Track 5 of the Foundation feedback: a transparent flow's async
+        // z_sendmany-operation wait must not be described as proving time.
+        let r = run(
+            "r1",
+            vec![],
+            vec![intent(
+                FlowType::TToT,
+                "timed_out",
+                Some("operation op-1 did not complete within the deadline"),
+            )],
+        );
+        let findings = flag_candidates(&[r]);
+        let f = findings
+            .iter()
+            .find(|f| f.category == FindingCategory::Timeout)
+            .expect("expected a timeout finding");
+        assert!(f.summary.contains("wallet operation completion"));
+        assert!(
+            !f.summary.contains("ZK proving"),
+            "transparent flow mislabeled as proving: {}",
+            f.summary
+        );
     }
 
     #[test]

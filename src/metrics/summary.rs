@@ -45,9 +45,18 @@ struct IntentAgg {
 /// stall reads "operation <id> did not complete ..."; a confirmation-depth
 /// stall reads "tx <id> did not reach ... confirmations". Bucketing avoids a
 /// summary table exploding into one row per distinct intent/tx id.
-fn timeout_stage(context: &str) -> &'static str {
+/// `is_shielded` gates the "(ZK proving)" qualifier — an async
+/// `z_sendmany`-operation wait applies to transparent sends too (they go
+/// through the same operation-id polling), so only a flow that actually
+/// creates a shielded proof may be described as proving time (Track 5 of
+/// the Foundation feedback).
+fn timeout_stage(context: &str, is_shielded: bool) -> &'static str {
     if context.starts_with("operation ") {
-        "async operation (ZK proving) wait"
+        if is_shielded {
+            "async operation (ZK proving) wait"
+        } else {
+            "async operation (wallet operation completion) wait"
+        }
     } else if context.starts_with("tx ") {
         "on-chain confirmation wait"
     } else {
@@ -222,7 +231,9 @@ pub fn generate_summary(run_dir: &RunDir, manifest: &RunManifest) -> Result<Stri
                         "timed_out" => {
                             agg.timed_out += 1;
                             if let Some(ctx) = &record.timeout_context {
-                                *timeout_stage_counts.entry(timeout_stage(ctx)).or_default() += 1;
+                                *timeout_stage_counts
+                                    .entry(timeout_stage(ctx, record.flow_type.is_shielded()))
+                                    .or_default() += 1;
                             }
                         }
                         _ => {}
@@ -263,6 +274,22 @@ pub fn generate_summary(run_dir: &RunDir, manifest: &RunManifest) -> Result<Stri
     let mut md = String::new();
 
     md.push_str(&format!("# Run Summary: {}\n\n", manifest.run_id));
+
+    md.push_str("## Result\n");
+    match &manifest.assertion {
+        Some(a) if a.passed => md.push_str("**PASS**\n\n"),
+        Some(a) => {
+            md.push_str("**FAIL**\n");
+            for v in &a.violations {
+                md.push_str(&format!("- {v}\n"));
+            }
+            md.push('\n');
+        }
+        None => md.push_str(
+            "No assertion recorded — the run never reached evaluation (setup failed) or this \
+             scenario predates `expectations`.\n\n",
+        ),
+    }
 
     md.push_str("## Run metadata\n");
     md.push_str(&format!("- Scenario: {}\n", manifest.scenario_name));
@@ -503,6 +530,89 @@ mod tests {
             md.contains("## Shielded transaction proving times"),
             "missing proving times section"
         );
+    }
+
+    #[test]
+    fn timeout_stage_labels_proving_only_for_shielded_flows() {
+        // Track 5 of the Foundation feedback: an async z_sendmany-operation
+        // wait applies to transparent sends too, so only a shielded flow
+        // may be described as "(ZK proving)".
+        assert_eq!(
+            timeout_stage("operation op-1 did not complete within the deadline", true),
+            "async operation (ZK proving) wait"
+        );
+        assert_eq!(
+            timeout_stage("operation op-1 did not complete within the deadline", false),
+            "async operation (wallet operation completion) wait"
+        );
+        assert_eq!(
+            timeout_stage("tx abcd did not confirm within the deadline", false),
+            "on-chain confirmation wait"
+        );
+    }
+
+    #[test]
+    fn generate_summary_renders_result_verdict() {
+        use crate::scenarios::runner::result::AssertionOutcome;
+
+        let base = tempfile::tempdir().unwrap();
+        let rd_pass = RunDir::create(base.path(), "passtest").unwrap();
+        std::fs::write(rd_pass.rpc_calls_path(), "").unwrap();
+        std::fs::write(rd_pass.metrics_path(), "").unwrap();
+
+        let mut manifest = RunManifest {
+            env_id: String::new(),
+            run_id: rd_pass.run_id.clone(),
+            run_started_at: chrono::Utc::now(),
+            run_completed_at: Some(chrono::Utc::now()),
+            simulator_commit: "abc".into(),
+            zebra_commit: "z".into(),
+            zaino_commit: "i".into(),
+            zallet_commit: "t".into(),
+            scenario_name: "passtest".into(),
+            scenario_config_hash: "sha:0".into(),
+            target_tps: 10.0,
+            timeouts: RunTimeouts::default(),
+            phase_boundaries: Vec::new(),
+            load_and_drain_completed_at: None,
+            compose_config_hash: String::new(),
+            image_digests: Vec::new(),
+            host_cpu_count: 0,
+            host_memory_limit_bytes: None,
+            state: StateIdentifier::default(),
+            assertion: Some(AssertionOutcome {
+                passed: true,
+                violations: Vec::new(),
+            }),
+        };
+
+        let md = generate_summary(&rd_pass, &manifest).unwrap();
+        assert!(
+            md.contains("## Result\n**PASS**"),
+            "expected a PASS verdict near the top: {md}"
+        );
+
+        let rd_fail = RunDir::create(base.path(), "failtest").unwrap();
+        std::fs::write(rd_fail.rpc_calls_path(), "").unwrap();
+        std::fs::write(rd_fail.metrics_path(), "").unwrap();
+        manifest.run_id = rd_fail.run_id.clone();
+        manifest.assertion = Some(AssertionOutcome {
+            passed: false,
+            violations: vec!["confirmed 54 < min_confirmed 60".to_string()],
+        });
+
+        let md = generate_summary(&rd_fail, &manifest).unwrap();
+        assert!(
+            md.contains("## Result\n**FAIL**"),
+            "expected a FAIL verdict near the top: {md}"
+        );
+        assert!(
+            md.contains("- confirmed 54 < min_confirmed 60"),
+            "expected the violation text rendered: {md}"
+        );
+        // The verdict must appear before the metadata section, not buried
+        // after other tables — this is the whole point of the fix.
+        assert!(md.find("## Result").unwrap() < md.find("## Run metadata").unwrap());
     }
 
     #[test]
