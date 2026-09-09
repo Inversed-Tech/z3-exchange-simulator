@@ -271,6 +271,28 @@ if grep -q '^ZEBRA_MINING__MINER_ADDRESS=' "$ENV_FILE"; then
     log "==> Restored the placeholder miner address for re-initialization."
 fi
 
+# regtest-init.sh sources .env.regtest itself (same `set -a; . "$ENV_FILE"`
+# noted above for COMPOSE_PROJECT_NAME) — that unconditionally overwrites the
+# Z3_SIM_SUBNET/Z3_SIM_ZAINO_IP this script exported as process env above with
+# whatever stale value the file already holds, silently reintroducing the
+# shared-subnet collision risk this script exists to close. Write it into the
+# file too, mirroring Z3Config::sync_bootstrap_env_file on the Rust side
+# (confirmed live: without this on that side, a subnet retry loop failed
+# identically 20 times in a row because only the process env was changing).
+if [ -n "$ENV_ID" ]; then
+    if grep -q '^Z3_SIM_SUBNET=' "$ENV_FILE"; then
+        sed -i.bak "s|^Z3_SIM_SUBNET=.*|Z3_SIM_SUBNET=${Z3_SIM_SUBNET}|" "$ENV_FILE"
+    else
+        printf 'Z3_SIM_SUBNET=%s\n' "$Z3_SIM_SUBNET" >> "$ENV_FILE"
+    fi
+    if grep -q '^Z3_SIM_ZAINO_IP=' "$ENV_FILE"; then
+        sed -i.bak "s|^Z3_SIM_ZAINO_IP=.*|Z3_SIM_ZAINO_IP=${Z3_SIM_ZAINO_IP}|" "$ENV_FILE"
+    else
+        printf 'Z3_SIM_ZAINO_IP=%s\n' "$Z3_SIM_ZAINO_IP" >> "$ENV_FILE"
+    fi
+    rm -f "${ENV_FILE}.bak"
+fi
+
 log "==> Re-initializing the regtest wallet from scratch..."
 (cd "$Z3_DIR" && ./scripts/regtest-init.sh)
 
