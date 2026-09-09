@@ -132,6 +132,31 @@ MINER_TADDR="$(rpc z_listunifiedreceivers "[\"${MINER_UA}\"]" | jq -r ".result.$
 [ -n "$MINER_TADDR" ] && [ "$MINER_TADDR" != "null" ] || { $COMPOSE down; die "failed to derive ${MINER_POOL} receiver for ${MINER_UUID}"; }
 log "   hot_wallet ${MINER_POOL} receiver: ${MINER_TADDR}"
 
+# Zebra keeps the most recent ~100 blocks (its non-finalized state) in memory
+# only, and regtest stack restarts routinely lose it — the chain rolls back to
+# the finalized floor (measured on the GCP runner: a chain at height 2 came
+# back at height 0 after the reset flow's own restarts;
+# docs/regtest-funding-plan.md records the same for SIGKILL). Once the miner
+# address below is an Orchard UA, a rollback under the NU5 activation height
+# (2) wedges the stack permanently: Zebra cannot mine ANY block to an Orchard
+# address pre-NU5 ("Cannot create Orchard transactions … before NU5
+# activation" panics its RPC worker), so nothing can ever advance the chain
+# again. Mine past the finalization depth with the still-configured
+# placeholder transparent address FIRST, so every activation height is
+# finalized on disk before coinbase switches to the UA. Transparent blocks
+# carry no proving cost — this takes seconds; chunked generate calls stay well
+# inside HTTP timeouts. Direct Zebra RPC (not the router): mirrors
+# regtest-init.sh's own mining step.
+ZEBRA_HOST_RPC="$(grep -E '^Z3_ZEBRA_HOST_RPC_PORT=' "$ENV_FILE" | cut -d= -f2 || true)"
+ZEBRA_HOST_RPC="${ZEBRA_HOST_RPC:-29232}"
+log "==> Finalizing the activation heights (105 placeholder-mined blocks)..."
+for _ in 1 2 3 4 5; do
+    curl -s -u zebra:zebra -X POST -H "Content-Type: application/json" \
+        -d '{"jsonrpc":"2.0","method":"generate","params":[21],"id":1}' \
+        "http://${RPC_HOST}:${ZEBRA_HOST_RPC}" | grep -q '"result"' \
+        || { $COMPOSE down; die "placeholder-address mining failed — check the zebra container logs"; }
+done
+
 # Persist so every future `docker compose up -d` uses the funded miner address.
 tmp="$(mktemp "${TMPDIR:-/tmp}/env.regtest.XXXXXX")"
 sed -E "s|^ZEBRA_MINING__MINER_ADDRESS=.*|ZEBRA_MINING__MINER_ADDRESS=${MINER_TADDR}|" "$ENV_FILE" > "$tmp"
