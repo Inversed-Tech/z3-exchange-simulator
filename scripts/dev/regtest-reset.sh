@@ -158,6 +158,23 @@ fi
 log "==> Wiping the regtest stack (containers and volumes)..."
 (cd "$Z3_DIR" && $COMPOSE down -v)
 
+# `down -v` only removes volumes Compose itself created. regtest-init.sh's
+# transient `docker run -v <name>:/data busybox` probes create the zallet
+# volume BEFORE Compose ever does on a fresh environment, so it carries no
+# Compose labels — Compose then warns "already exists but was not created by
+# Docker Compose" and silently skips it on every reset, carrying the previous
+# wallet (full scan history, all accounts) into the supposedly fresh
+# environment. Measured fallout: a wallet scanned to height 3020 paired with
+# a fresh height-105 chain makes Zallet refuse account creation with
+# "A rewind for your wallet may only target height <unavailable> or greater"
+# (run 20260909T064725Z-mixed). Sweep any survivors explicitly.
+leftover="$(docker volume ls -q | grep "^${COMPOSE_PROJECT_NAME}-" || true)"
+if [ -n "$leftover" ]; then
+    printf '%s\n' "$leftover" | xargs docker volume rm > /dev/null
+    log "==> Removed leftover volumes Compose did not own:"
+    printf '%s\n' "$leftover" | while read -r vol; do log "      ${vol}"; done
+fi
+
 # regtest-init.sh sources .env.regtest itself (`set -a; . "$ENV_FILE"`) to
 # resolve its own COMPOSE_PROJECT_NAME — that assignment unconditionally
 # overwrites whatever value we exported into its environment, so passing
