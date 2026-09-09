@@ -37,6 +37,17 @@ const COINBASE_MATURITY_BLOCKS: u64 = 100;
 const WARMUP_BALANCE_CHECK_ATTEMPTS: u32 = 150;
 const WARMUP_BALANCE_CHECK_INTERVAL: Duration = Duration::from_secs(2);
 
+/// How many times `warmup()`'s "is Zallet responding" probe retries
+/// `getwalletinfo`, and how long it sleeps between attempts. One bad response
+/// is not conclusive: while Zallet is mid-scan after a stack (re)start, the
+/// rpc-router briefly answers wallet methods with a non-JSON error body —
+/// observed as a fatal "RPC response parse error" at the end of warmup on the
+/// first run after `make regtest-reset` (runs 20260909T062617Z-mixed,
+/// 20260909T063406Z-burst). A liveness probe must tolerate transient garbage,
+/// or it fails exactly when it has something to wait for.
+const WARMUP_WALLET_PROBE_ATTEMPTS: u32 = 20;
+const WARMUP_WALLET_PROBE_INTERVAL: Duration = Duration::from_secs(3);
+
 // ── SetupState ────────────────────────────────────────────────────────────────
 
 /// Everything needed to run the load phase, produced by [`setup`].
@@ -577,10 +588,29 @@ pub async fn warmup(
         .await
         .map_err(|e| RunnerError::Warmup(format!("get_blockchain_info failed: {e}")))?;
 
-    // Confirm Zallet is responding.
-    rpc.get_wallet_info()
-        .await
-        .map_err(|e| RunnerError::Warmup(format!("get_wallet_info failed: {e}")))?;
+    // Confirm Zallet is responding — with retries, because this is a liveness
+    // probe: see WARMUP_WALLET_PROBE_ATTEMPTS for why a single bad response
+    // right after a stack (re)start must not fail the run.
+    let mut wallet_probe = Ok(());
+    for attempt in 0..WARMUP_WALLET_PROBE_ATTEMPTS {
+        match rpc.get_wallet_info().await {
+            Ok(_) => {
+                wallet_probe = Ok(());
+                break;
+            }
+            Err(e) => {
+                wallet_probe = Err(e);
+                if attempt + 1 < WARMUP_WALLET_PROBE_ATTEMPTS {
+                    sleep(WARMUP_WALLET_PROBE_INTERVAL).await;
+                }
+            }
+        }
+    }
+    wallet_probe.map_err(|e| {
+        RunnerError::Warmup(format!(
+            "get_wallet_info failed after {WARMUP_WALLET_PROBE_ATTEMPTS} attempts: {e}"
+        ))
+    })?;
 
     // Verify that warmup mining funded the hot wallet specifically. generate()
     // returns once Zebra has mined the blocks, but Zallet's sync is
