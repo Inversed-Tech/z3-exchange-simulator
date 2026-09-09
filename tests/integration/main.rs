@@ -823,6 +823,99 @@ fn test_bootstrap_normalizes_phase2_failure_exit_code_to_one() {
     );
 }
 
+/// Subnet retry-on-conflict (FINDING-1 in the Foundation feedback audit):
+/// `Z3Stack::bring_up` must recover when Docker rejects the derived subnet
+/// as overlapping another network, by retrying with a different one, and it
+/// must record the winning attempt so a later bring-up of the SAME
+/// environment (a stable rerun, or `scripts/dev/regtest-reset.sh` after a
+/// wipe) starts from that subnet rather than re-discovering the identical
+/// conflict.
+///
+/// Uses a fixed, disposable `env_id` this test fully owns — never resolved
+/// via the real `configs/local/env-id` cache — so it can deliberately
+/// pre-occupy that env_id's attempt-0 subnet with a throwaway Docker
+/// network before calling `bring_up`, then observe the retry succeed. Only
+/// brings up containers and waits for RPC Router health (no wallet
+/// bootstrap, no scenario) — bounded and fast relative to a full scenario
+/// run.
+///
+/// Run with: `cargo test -- --ignored test_subnet_retry_recovers_from_a_conflict`
+#[tokio::test]
+#[ignore = "requires a live external/z3 checkout and a Docker daemon that can create networks/volumes; run with: cargo test -- --ignored test_subnet_retry_recovers_from_a_conflict"]
+async fn test_subnet_retry_recovers_from_a_conflict() {
+    use z3_exchange_simulator::z3::env_id::{derive_subnet_for_attempt, subnet_attempt_cache_path};
+    use z3_exchange_simulator::z3::{Z3Config, Z3Stack};
+
+    let env_id = "abcdef01";
+    let cache_dir = tempfile::TempDir::new().unwrap();
+    let blocker_name = "z3sim-test-subnet-blocker";
+
+    // Best-effort pre-clean from a prior failed run of this same test.
+    let _ = std::process::Command::new("docker")
+        .args(["network", "rm", blocker_name])
+        .output();
+
+    // Deliberately occupy attempt 0's subnet, forcing bring_up's first
+    // attempt to fail exactly the way a real host-level collision would.
+    let blocked = derive_subnet_for_attempt(env_id, 0).unwrap();
+    let create = std::process::Command::new("docker")
+        .args([
+            "network",
+            "create",
+            "--subnet",
+            &blocked.subnet,
+            blocker_name,
+        ])
+        .output()
+        .expect("failed to invoke docker network create");
+    assert!(
+        create.status.success(),
+        "failed to pre-block the subnet (test cannot proceed): {}",
+        String::from_utf8_lossy(&create.stderr)
+    );
+
+    let mut config = Z3Config::for_run(
+        "subnet-retry-test",
+        cache_dir.path().join("logs"),
+        env_id,
+        PathBuf::from("external/z3"),
+    )
+    .unwrap();
+    config.subnet_cache_dir = cache_dir.path().to_path_buf();
+    let mut stack = Z3Stack::new(config, None);
+
+    let result = stack.bring_up().await;
+
+    // Clean up regardless of outcome, before any assertion can panic and
+    // skip it: the blocker network, and this environment's own
+    // containers/volumes if bring_up got that far.
+    let _ = stack.stop().await;
+    let project = compose_project_for_env(env_id);
+    let _ = std::process::Command::new("docker")
+        .args(["compose", "-p", &project, "down", "-v"])
+        .current_dir("external/z3")
+        .output();
+    let _ = std::process::Command::new("docker")
+        .args(["network", "rm", blocker_name])
+        .output();
+
+    result.expect("bring_up should have recovered by retrying with a different subnet");
+
+    let cache_path = subnet_attempt_cache_path(cache_dir.path(), env_id);
+    let recorded = std::fs::read_to_string(&cache_path).unwrap_or_else(|e| {
+        panic!(
+            "expected a cached subnet attempt at {}: {e}",
+            cache_path.display()
+        )
+    });
+    let recorded: u32 = recorded.trim().parse().unwrap();
+    assert!(
+        recorded > 0,
+        "expected a non-zero winning attempt recorded (attempt 0 was deliberately \
+         blocked), got {recorded}"
+    );
+}
+
 /// Dry-run test — does NOT start the Z3 stack and must always pass.
 #[tokio::test]
 async fn test_dry_run_does_not_start_z3() {

@@ -151,17 +151,54 @@ pub struct SubnetAssignment {
 /// Deterministically derive one of 100 non-overlapping `/24` subnets in
 /// `10.100.0.0/16`-`10.199.0.0/16` from `env_id` — chosen outside both
 /// Docker's own default bridge range and common home-router ranges.
+///
+/// This is `derive_subnet_for_attempt(env_id, 0)` — see that function for
+/// why a second, third, ... choice can matter: this base derivation has only
+/// 100 possible values and no awareness of what subnets are already in use
+/// on the host, so a collision with an unrelated Docker network (this
+/// checkout's own prior attempts, another project entirely, or Docker's own
+/// address-pool bookkeeping not having released a torn-down network yet) is
+/// possible. Callers that can retry on a Docker "Pool overlaps" error should
+/// use `derive_subnet_for_attempt` directly — see `Z3Stack::bring_up`.
 pub fn derive_subnet(env_id: &str) -> Result<SubnetAssignment, Z3Error> {
+    derive_subnet_for_attempt(env_id, 0)
+}
+
+/// Like `derive_subnet`, but `attempt` (0 = `derive_subnet`'s own choice)
+/// walks the same 100-value space by a fixed offset, so a caller that gets a
+/// "Pool overlaps" error from Docker can retry with a different candidate
+/// without picking a fresh, disposable `env_id` (which would also change the
+/// Compose project/network/volume/port identity this environment's caller
+/// may already be depending on — see `env_id::resolve_env_id`'s `fresh`
+/// flag for that separate, heavier-weight escape hatch). Cycles back to
+/// attempt 0's octet once `attempt` passes 99, so an unbounded attempt
+/// counter degrades to repeating candidates rather than panicking or
+/// producing an out-of-range octet.
+pub fn derive_subnet_for_attempt(env_id: &str, attempt: u32) -> Result<SubnetAssignment, Z3Error> {
     let byte_hex = env_id
         .get(4..6)
         .ok_or_else(|| Z3Error::InvalidEnvId(env_id.to_string()))?;
     let byte =
         u8::from_str_radix(byte_hex, 16).map_err(|_| Z3Error::InvalidEnvId(env_id.to_string()))?;
-    let octet = 100 + (byte % 100);
+    let octet = 100 + ((byte as u32 + attempt) % 100);
     Ok(SubnetAssignment {
         subnet: format!("10.{octet}.0.0/24"),
         zaino_ip: format!("10.{octet}.0.10"),
     })
+}
+
+/// Path to `env_id`'s cached, previously-successful subnet-derivation
+/// attempt number (see `derive_subnet_for_attempt`) — mirrors
+/// `reset_epoch_path`'s per-`env_id` scoping under `cache_dir` for the same
+/// reason: a `--fresh-env` environment and the stable one must never read or
+/// write each other's resolved subnet. Consumed by `Z3Stack::bring_up`
+/// (which writes it after a retry succeeds, and reads it before every
+/// attempt so a stable environment keeps using the same subnet across
+/// separate runs) and by `scripts/dev/regtest-reset.sh` (which must bring
+/// the SAME environment back up on the SAME subnet, not silently drift back
+/// to attempt 0's).
+pub fn subnet_attempt_cache_path(cache_dir: &Path, env_id: &str) -> PathBuf {
+    cache_dir.join(format!("subnet-attempt-{env_id}"))
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -372,6 +409,54 @@ mod tests {
                 .unwrap();
             assert!((100..200).contains(&octet), "{octet} out of window");
         }
+    }
+
+    #[test]
+    fn derive_subnet_for_attempt_zero_matches_derive_subnet() {
+        for env_id in ["00000000", "a1b2c3d4", "ffffffff"] {
+            assert_eq!(
+                derive_subnet_for_attempt(env_id, 0).unwrap(),
+                derive_subnet(env_id).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn derive_subnet_for_attempt_walks_distinct_candidates_before_wrapping() {
+        // 100 possible octets — the first 100 attempts (0..100) must all be
+        // pairwise distinct so a retry loop never wastes an attempt on a
+        // subnet it already tried; attempt 100 must cycle back to attempt 0.
+        let env_id = "a1b2c3d4";
+        let mut seen = std::collections::HashSet::new();
+        for attempt in 0..100 {
+            let a = derive_subnet_for_attempt(env_id, attempt).unwrap();
+            assert!(
+                seen.insert(a.subnet.clone()),
+                "attempt {attempt} repeated subnet {}",
+                a.subnet
+            );
+            assert!(
+                (100..200).contains(&a.subnet.split('.').nth(1).unwrap().parse::<u16>().unwrap())
+            );
+        }
+        assert_eq!(
+            derive_subnet_for_attempt(env_id, 100).unwrap(),
+            derive_subnet_for_attempt(env_id, 0).unwrap(),
+            "attempt 100 must wrap back to attempt 0's subnet"
+        );
+    }
+
+    #[test]
+    fn subnet_attempt_cache_path_is_scoped_per_env_id() {
+        let dir = std::path::Path::new("/tmp/whatever");
+        assert_eq!(
+            subnet_attempt_cache_path(dir, "a1b2c3d4"),
+            dir.join("subnet-attempt-a1b2c3d4")
+        );
+        assert_ne!(
+            subnet_attempt_cache_path(dir, "a1b2c3d4"),
+            subnet_attempt_cache_path(dir, "deadbeef")
+        );
     }
 
     #[test]

@@ -116,6 +116,16 @@ pub struct Z3Config {
     /// (see [`compose_env_overrides`]). Empty for [`Z3Config::from_contract`]
     /// configs (mainnet/testnet), which have no env-id-based isolation.
     pub compose_env_overrides: Vec<(String, String)>,
+    /// Directory holding this environment's cached subnet-derivation attempt
+    /// (see [`env_id::subnet_attempt_cache_path`]), consulted and updated by
+    /// [`Z3Stack::bring_up`] when a `docker compose up` fails on a Docker
+    /// subnet/address-pool conflict. Empty disables retry-on-conflict
+    /// entirely (the default for [`Z3Config::from_contract`], which has no
+    /// subnet override to retry in the first place, and for direct
+    /// [`Z3Config::for_run`] callers that don't opt in) — `bring_up` runs a
+    /// single, non-retried attempt in that case, exactly as before this
+    /// field existed.
+    pub subnet_cache_dir: PathBuf,
 }
 
 impl Z3Config {
@@ -163,6 +173,10 @@ impl Z3Config {
             health_check_timeout_secs: 180,
             resource_sample_interval_secs: 5,
             compose_env_overrides: compose_env_overrides(&ports, &subnet),
+            // Retry-on-conflict is opt-in — a caller that wants it (the
+            // real `z3sim run`/`print-versions` paths) sets this explicitly
+            // after construction; see the field's own doc comment.
+            subnet_cache_dir: PathBuf::new(),
         })
     }
 
@@ -209,6 +223,9 @@ impl Z3Config {
             health_check_timeout_secs: 180,
             resource_sample_interval_secs: 5,
             compose_env_overrides: Vec::new(),
+            // No env-id-based subnet override to retry in the first place
+            // (mainnet/testnet have no per-environment subnet isolation).
+            subnet_cache_dir: PathBuf::new(),
         })
     }
 
@@ -231,46 +248,37 @@ impl Z3Config {
         Ok(())
     }
 
-    /// Write this run's Compose project name and host ports into
+    /// Write this run's Compose project name, host ports, and subnet into
     /// `.env.regtest`, in place. Necessary because `regtest-init.sh` (sources
-    /// the file directly) and `regtest-miner-setup.sh` (greps it) predate
-    /// per-environment identity and read the file's own values rather than
-    /// accepting the `-p`/process-env overrides `Z3Stack`'s own `docker
-    /// compose` invocations use — without this, they always operate on
-    /// whatever project/ports the file's checked-in defaults name, never
-    /// this run's resolved `env_id`. Idempotent: replaces an existing `KEY=`
-    /// line in place, appends if missing. Skips `Z3_SIM_SUBNET`/
-    /// `Z3_SIM_ZAINO_IP` — neither script reads them; the transient
-    /// containers `regtest-init.sh` itself may briefly start get the correct
-    /// subnet from `compose_env_overrides`, passed as process env alongside
-    /// it (see [`Z3Config::ensure_wallet_bootstrapped`]).
+    /// the file directly via `set -a; . "$ENV_FILE"`) and
+    /// `regtest-miner-setup.sh` (greps it) predate per-environment identity
+    /// and read the file's own values rather than accepting the
+    /// `-p`/process-env overrides `Z3Stack`'s own `docker compose`
+    /// invocations use — without this, they always operate on whatever
+    /// project/ports/subnet the file's checked-in defaults name, never this
+    /// run's resolved `env_id`. Idempotent: replaces an existing `KEY=` line
+    /// in place, appends if missing.
+    ///
+    /// `Z3_SIM_SUBNET`/`Z3_SIM_ZAINO_IP` ARE written here (unlike every other
+    /// process-env-only override) precisely because of that `source`: a
+    /// process-env value set on `regtest-init.sh`'s own invocation is
+    /// unconditionally clobbered by whatever the file itself holds for the
+    /// same key the moment the script sources it — confirmed live, the hard
+    /// way, when `Z3Stack::bring_up`'s subnet retry loop retried a genuine
+    /// conflict twenty times in a row and failed identically every time,
+    /// because a stale `Z3_SIM_SUBNET` already checked into this checkout's
+    /// `.env.regtest` silently overrode every one of the twenty distinct
+    /// subnets this method's caller had actually derived and passed as
+    /// process env. See [`Z3Config::ensure_wallet_bootstrapped`], which now
+    /// calls this before every retry attempt, not just once up front.
     fn sync_bootstrap_env_file(&self) -> Result<(), Z3Error> {
         let env_file = self.compose_dir.join(ENV_FILE);
-        let contents = std::fs::read_to_string(&env_file)
-            .map_err(|_| Z3Error::EnvFileNotFound(env_file.clone()))?;
-
         let mut pairs = vec![(
             "COMPOSE_PROJECT_NAME".to_string(),
             self.compose_project.clone(),
         )];
-        pairs.extend(
-            self.compose_env_overrides
-                .iter()
-                .filter(|(k, _)| k != "Z3_SIM_SUBNET" && k != "Z3_SIM_ZAINO_IP")
-                .cloned(),
-        );
-
-        let mut lines: Vec<String> = contents.lines().map(str::to_string).collect();
-        for (key, value) in &pairs {
-            let prefix = format!("{key}=");
-            match lines.iter_mut().find(|l| l.starts_with(&prefix)) {
-                Some(line) => *line = format!("{key}={value}"),
-                None => lines.push(format!("{key}={value}")),
-            }
-        }
-        let mut new_contents = lines.join("\n");
-        new_contents.push('\n');
-        std::fs::write(&env_file, new_contents).map_err(Z3Error::EnvFileSync)
+        pairs.extend(self.compose_env_overrides.iter().cloned());
+        write_env_overrides_to_file(&env_file, &pairs)
     }
 
     /// Ensure this run's Compose project has an initialized wallet before
@@ -295,7 +303,7 @@ impl Z3Config {
     /// creating its Docker resources under the OTHER environment's project
     /// name. The lock is held only for this function's duration, not the
     /// whole run, so it costs at most a short wait once per environment.
-    pub async fn ensure_wallet_bootstrapped(&self) -> Result<(), Z3Error> {
+    pub async fn ensure_wallet_bootstrapped(&mut self) -> Result<(), Z3Error> {
         self.check_preconditions()?;
 
         // `File::lock` blocks the calling thread until acquired; run it on a
@@ -306,15 +314,77 @@ impl Z3Config {
                 .await
                 .map_err(|e| Z3Error::RunLockIo(std::io::Error::other(e.to_string())))??;
 
-        self.sync_bootstrap_env_file()?;
-
         let init_script = self.compose_dir.join("scripts").join("regtest-init.sh");
-        run_bootstrap_script(&init_script, &self.compose_env_overrides).await?;
-
         let miner_setup_script = PathBuf::from("scripts/dev/regtest-miner-setup.sh");
+
+        // regtest-init.sh creates this environment's network/volumes itself
+        // — retry it on a subnet conflict the same way Z3Stack::bring_up
+        // retries its own `docker compose up` (see
+        // run_init_script_with_subnet_retry's doc comment). Falls back to a
+        // single, non-retried attempt (today's pre-existing behavior) when
+        // this config isn't eligible — see `subnet_retry_env_id`.
+        self.run_init_script_with_subnet_retry(&init_script).await?;
+
+        // By now self.compose_env_overrides (and .env.regtest) hold
+        // whichever subnet actually succeeded above — regtest-miner-setup.sh
+        // must agree with regtest-init.sh on the same environment.
         run_bootstrap_script(&miner_setup_script, &self.compose_env_overrides).await?;
 
         Ok(())
+    }
+
+    /// Runs `script` (`regtest-init.sh`), retrying with a different derived
+    /// subnet on a Docker subnet-conflict-shaped failure (see
+    /// `is_subnet_conflict`) — the same retry-on-conflict mechanism as
+    /// `Z3Stack::up_with_subnet_retry`, needed here too because
+    /// `regtest-init.sh` creates this environment's network/volumes itself
+    /// (confirmed live: its failure output leads with `Network <project>
+    /// Creating` / `Error response from daemon: invalid pool request: Pool
+    /// overlaps...`), before `Z3Stack::bring_up`'s own `docker compose up`
+    /// ever runs.
+    ///
+    /// Rewrites `.env.regtest` (via `sync_bootstrap_env_file`) before EVERY
+    /// attempt, not just once — `regtest-init.sh` sources that file
+    /// directly, which unconditionally overrides whatever this attempt's
+    /// process-env subnet was with the file's own prior value otherwise (see
+    /// `sync_bootstrap_env_file`'s doc comment for the live failure this
+    /// caused: twenty retries in a row, all identically rejected, because
+    /// only the process env was changing).
+    ///
+    /// Mutates `self.compose_env_overrides` to the winning attempt's values
+    /// on success, so a caller reading it afterward (this function's own
+    /// caller, running `regtest-miner-setup.sh` next; or `Z3Stack::bring_up`,
+    /// reading the SAME cached attempt back via `subnet_attempt_cache_path`)
+    /// agrees with what actually succeeded.
+    async fn run_init_script_with_subnet_retry(&mut self, script: &Path) -> Result<(), Z3Error> {
+        let Some(env_id) = subnet_retry_env_id(self) else {
+            self.sync_bootstrap_env_file()?;
+            return run_bootstrap_script(script, &self.compose_env_overrides).await;
+        };
+        let cache_path = env_id::subnet_attempt_cache_path(&self.subnet_cache_dir, &env_id);
+        let mut attempt = read_cached_subnet_attempt(&cache_path);
+
+        loop {
+            apply_subnet_attempt_to(&mut self.compose_env_overrides, &env_id, attempt)?;
+            self.sync_bootstrap_env_file()?;
+            match run_bootstrap_script(script, &self.compose_env_overrides).await {
+                Ok(()) => {
+                    write_cached_subnet_attempt(&cache_path, attempt);
+                    return Ok(());
+                }
+                Err(Z3Error::BootstrapScript { stderr, script: s })
+                    if is_subnet_conflict(&stderr) && attempt + 1 < MAX_SUBNET_RETRY_ATTEMPTS =>
+                {
+                    tracing::warn!(
+                        "{} hit a subnet conflict on attempt {attempt} (env {env_id}); \
+                         retrying with a different subnet: {stderr}",
+                        s.display()
+                    );
+                    attempt += 1;
+                }
+                Err(e) => return Err(e),
+            }
+        }
     }
 }
 
@@ -343,6 +413,29 @@ async fn run_bootstrap_script(
         });
     }
     Ok(())
+}
+
+/// Idempotently replaces/appends `pairs` as `KEY=value` lines in `env_file`
+/// — shared by `Z3Config::sync_bootstrap_env_file` and
+/// `Z3Config::run_init_script_with_subnet_retry`, the two places this crate
+/// must keep `.env.regtest`'s own on-disk content in sync with what it just
+/// derived: `regtest-init.sh` sources this file directly (`set -a; .
+/// "$ENV_FILE"`), which unconditionally overrides an inherited process-env
+/// value for any key the file itself already sets.
+fn write_env_overrides_to_file(env_file: &Path, pairs: &[(String, String)]) -> Result<(), Z3Error> {
+    let contents = std::fs::read_to_string(env_file)
+        .map_err(|_| Z3Error::EnvFileNotFound(env_file.to_path_buf()))?;
+    let mut lines: Vec<String> = contents.lines().map(str::to_string).collect();
+    for (key, value) in pairs {
+        let prefix = format!("{key}=");
+        match lines.iter_mut().find(|l| l.starts_with(&prefix)) {
+            Some(line) => *line = format!("{key}={value}"),
+            None => lines.push(format!("{key}={value}")),
+        }
+    }
+    let mut new_contents = lines.join("\n");
+    new_contents.push('\n');
+    std::fs::write(env_file, new_contents).map_err(Z3Error::EnvFileSync)
 }
 
 // ── Error ─────────────────────────────────────────────────────────────────────
@@ -476,9 +569,59 @@ impl Z3Stack {
         tokio::fs::create_dir_all(&self.config.log_dir)
             .await
             .map_err(Z3Error::LogDirCreate)?;
-        self.run_compose(&["up", "-d"]).await?;
+        self.up_with_subnet_retry().await?;
         self.wait_until_ready().await?;
         Ok(())
+    }
+
+    /// `docker compose up -d`, retrying with a different derived subnet if
+    /// Docker rejects the current one as overlapping another network's
+    /// address pool (its own environment, a stale one Docker hasn't fully
+    /// released, or something unrelated entirely on the host) — see
+    /// `env_id::derive_subnet_for_attempt`.
+    ///
+    /// A no-op wrapper around a single `run_compose` call — today's exact
+    /// behavior — unless this config both opted into retry (a non-empty
+    /// `subnet_cache_dir`) and actually has a subnet to retry (its
+    /// `compose_project` is `z3-sim-<env_id>` shaped and
+    /// `compose_env_overrides` carries `Z3_SIM_SUBNET`). Neither holds for
+    /// `Z3Config::from_contract` (mainnet/testnet) or for a caller that
+    /// built its own `Z3Config` without setting `subnet_cache_dir`.
+    async fn up_with_subnet_retry(&mut self) -> Result<(), Z3Error> {
+        let Some(env_id) = subnet_retry_env_id(&self.config) else {
+            return self.run_compose(&["up", "-d"]).await;
+        };
+        let cache_path = env_id::subnet_attempt_cache_path(&self.config.subnet_cache_dir, &env_id);
+        let mut attempt = read_cached_subnet_attempt(&cache_path);
+
+        loop {
+            self.apply_subnet_attempt(&env_id, attempt)?;
+            match self.run_compose(&["up", "-d"]).await {
+                Ok(()) => {
+                    write_cached_subnet_attempt(&cache_path, attempt);
+                    return Ok(());
+                }
+                Err(Z3Error::ComposeCommand { stderr, args })
+                    if is_subnet_conflict(&stderr) && attempt + 1 < MAX_SUBNET_RETRY_ATTEMPTS =>
+                {
+                    tracing::warn!(
+                        "docker compose up hit a subnet conflict on attempt {attempt} \
+                         (env {env_id}); retrying with a different subnet: {stderr}"
+                    );
+                    let _ = args;
+                    attempt += 1;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// Recomputes `env_id`'s subnet for `attempt` and replaces the
+    /// `Z3_SIM_SUBNET`/`Z3_SIM_ZAINO_IP` entries in
+    /// `self.config.compose_env_overrides` in place — every other entry
+    /// (ports) is untouched, since only the subnet is ever retried.
+    fn apply_subnet_attempt(&mut self, env_id: &str, attempt: u32) -> Result<(), Z3Error> {
+        apply_subnet_attempt_to(&mut self.config.compose_env_overrides, env_id, attempt)
     }
 
     /// Resolve the image (repository:tag) and image ID Docker actually used
@@ -652,6 +795,100 @@ impl Drop for Z3Stack {
 }
 
 // ── Free functions ────────────────────────────────────────────────────────────
+
+/// Bounded so a host with a genuinely exhausted/misbehaving Docker address
+/// pool fails loudly after exhausting the full 100-value space
+/// `derive_subnet_for_attempt` can produce, rather than looping forever.
+const MAX_SUBNET_RETRY_ATTEMPTS: u32 = 20;
+
+/// This config's `env_id`, if it's eligible for subnet retry-on-conflict —
+/// i.e. it opted in (non-empty `subnet_cache_dir`), its Compose project is
+/// the `z3-sim-<env_id>` shape `env_id::compose_project_for_env` produces
+/// (not `Z3Config::from_contract`'s network-named projects, and not a caller
+/// that built a `Z3Config` by hand with something else), and it actually has
+/// a subnet override to retry (`compose_env_overrides` carries
+/// `Z3_SIM_SUBNET`). `None` means `up_with_subnet_retry` makes exactly one
+/// attempt, unconditionally — today's pre-existing behavior.
+fn subnet_retry_env_id(config: &Z3Config) -> Option<String> {
+    if config.subnet_cache_dir.as_os_str().is_empty() {
+        return None;
+    }
+    let env_id = config.compose_project.strip_prefix("z3-sim-")?;
+    config
+        .compose_env_overrides
+        .iter()
+        .any(|(k, _)| k == "Z3_SIM_SUBNET")
+        .then(|| env_id.to_string())
+}
+
+/// Whether `stderr` from a failed `docker compose up` looks like Docker
+/// rejected the requested subnet as overlapping another network's address
+/// pool — the one failure mode `up_with_subnet_retry` retries; any other
+/// compose failure (a bad image reference, a syntax error, Docker not
+/// running at all) is returned to the caller unchanged.
+///
+/// Matches more than one phrasing deliberately: empirically (this repo, this
+/// machine, Docker Desktop on macOS) the actual error was "cannot create
+/// network ...: networks have overlapping IPv4" — not the "Pool overlaps
+/// with other one on this address space" wording seen elsewhere (a
+/// different internal code path, address-pool bookkeeping rather than an
+/// existing network object) — so this checks for either, case-insensitively,
+/// rather than assuming one exact string across Docker versions/platforms.
+fn is_subnet_conflict(stderr: &str) -> bool {
+    let s = stderr.to_ascii_lowercase();
+    s.contains("pool overlaps") || s.contains("overlapping ipv4") || s.contains("overlapping ip")
+}
+
+/// Reads the subnet-derivation attempt number a previous `bring_up` recorded
+/// as successful for this environment (see
+/// `env_id::subnet_attempt_cache_path`). Missing file, unreadable, or
+/// unparseable content all degrade to attempt `0` — the same starting point
+/// as an environment that has never hit a conflict — rather than failing the
+/// run over what is evidence, not a correctness dependency.
+fn read_cached_subnet_attempt(path: &Path) -> u32 {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+/// Records `attempt` as this environment's resolved subnet choice, so the
+/// next `bring_up` (a later `z3sim run`, or `scripts/dev/regtest-reset.sh`
+/// bringing the same environment back up after a wipe) starts from the same
+/// subnet instead of re-trying attempt 0 and re-discovering the same
+/// conflict. Best-effort: a write failure here does not fail the (already
+/// successful) `bring_up` — it only means the next attempt starts back at 0.
+fn write_cached_subnet_attempt(path: &Path, attempt: u32) {
+    if let Some(parent) = path.parent() {
+        if std::fs::create_dir_all(parent).is_err() {
+            return;
+        }
+    }
+    let _ = std::fs::write(path, attempt.to_string());
+}
+
+/// Replaces the `Z3_SIM_SUBNET`/`Z3_SIM_ZAINO_IP` entries in
+/// `env_overrides` in place with `env_id`'s subnet for `attempt` — every
+/// other entry (ports) is left untouched. Shared by every place this crate
+/// retries a Docker subnet conflict: `Z3Stack::apply_subnet_attempt` (for
+/// `docker compose up`) and `run_bootstrap_script_with_subnet_retry` (for
+/// `regtest-init.sh`, which creates this environment's network/volumes
+/// itself, before `Z3Stack::bring_up` ever runs).
+fn apply_subnet_attempt_to(
+    env_overrides: &mut [(String, String)],
+    env_id: &str,
+    attempt: u32,
+) -> Result<(), Z3Error> {
+    let subnet = env_id::derive_subnet_for_attempt(env_id, attempt)?;
+    for (key, value) in env_overrides.iter_mut() {
+        if key == "Z3_SIM_SUBNET" {
+            *value = subnet.subnet.clone();
+        } else if key == "Z3_SIM_ZAINO_IP" {
+            *value = subnet.zaino_ip.clone();
+        }
+    }
+    Ok(())
+}
 
 /// The `docker compose` argument list shared by every invocation this crate
 /// makes: the env file plus the `-p` project flag (which takes precedence
@@ -1091,6 +1328,151 @@ mod tests {
                 ("Z3_SIM_ZAINO_IP".to_string(), "10.195.0.10".to_string()),
             ]
         );
+        // Retry-on-conflict is opt-in — for_run alone must not enable it.
+        assert_eq!(cfg.subnet_cache_dir, PathBuf::new());
+    }
+
+    // ── subnet retry-on-conflict ─────────────────────────────────────────────
+
+    #[test]
+    fn subnet_retry_env_id_requires_opt_in_cache_dir() {
+        let mut cfg = Z3Config::for_run(
+            "run-1",
+            PathBuf::from("/tmp/logs"),
+            "a1b2c3d4",
+            PathBuf::from("external/z3"),
+        )
+        .unwrap();
+        assert_eq!(subnet_retry_env_id(&cfg), None, "not opted in yet");
+
+        cfg.subnet_cache_dir = PathBuf::from("configs/local");
+        assert_eq!(subnet_retry_env_id(&cfg), Some("a1b2c3d4".to_string()));
+    }
+
+    #[test]
+    fn subnet_retry_env_id_none_for_from_contract_config() {
+        // from_contract configs (mainnet/testnet) have no z3-sim-<env_id>
+        // project shape and no Z3_SIM_SUBNET override — never eligible, even
+        // if a caller mistakenly set subnet_cache_dir on one.
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join(contract::CONTRACT_FILENAME),
+            r#"
+contract_version: "1.0.0"
+networks:
+  regtest:
+    z3_network: "Regtest"
+    compose_project: "z3-regtest"
+    external_network: "z3-regtest"
+    rpc_auth:
+      mode: username_password
+      credential_env_vars:
+        user: Z3_REGTEST_RPC_ROUTER_USER
+        password: Z3_REGTEST_RPC_ROUTER_PASSWORD
+    ports:
+      rpc_router: {container: 8181, host: 8181}
+      zaino_json_rpc: {container: 8237, host: 28237}
+"#,
+        )
+        .unwrap();
+        let mut cfg = Z3Config::from_contract(
+            dir.path().to_path_buf(),
+            "regtest",
+            "run-1",
+            PathBuf::from("/tmp/logs"),
+        )
+        .unwrap();
+        cfg.subnet_cache_dir = PathBuf::from("configs/local");
+        assert_eq!(subnet_retry_env_id(&cfg), None);
+    }
+
+    #[test]
+    fn is_subnet_conflict_matches_known_docker_wordings() {
+        // "overlapping IPv4" is what this exact Docker Desktop/macOS setup
+        // produced empirically; "Pool overlaps" is documented Docker daemon
+        // wording seen on other platforms/versions. Match both.
+        assert!(is_subnet_conflict(
+            "Error response from daemon: cannot create network abc123 (br-abc123): \
+             conflicts with network def456 (br-def456): networks have overlapping IPv4"
+        ));
+        assert!(is_subnet_conflict(
+            "Error response from daemon: Pool overlaps with other one on this address space"
+        ));
+        assert!(!is_subnet_conflict(
+            "Error response from daemon: manifest for zfnd/zebra:9.9.9 not found"
+        ));
+        assert!(!is_subnet_conflict(""));
+    }
+
+    #[test]
+    fn cached_subnet_attempt_round_trips() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("subnet-attempt-a1b2c3d4");
+        assert_eq!(
+            read_cached_subnet_attempt(&path),
+            0,
+            "missing file defaults to attempt 0"
+        );
+        write_cached_subnet_attempt(&path, 7);
+        assert_eq!(read_cached_subnet_attempt(&path), 7);
+        write_cached_subnet_attempt(&path, 3);
+        assert_eq!(
+            read_cached_subnet_attempt(&path),
+            3,
+            "overwrites, not appends"
+        );
+    }
+
+    #[test]
+    fn read_cached_subnet_attempt_ignores_garbage_content() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("subnet-attempt-a1b2c3d4");
+        std::fs::write(&path, "not a number").unwrap();
+        assert_eq!(read_cached_subnet_attempt(&path), 0);
+    }
+
+    #[test]
+    fn write_cached_subnet_attempt_creates_parent_directories() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("nested").join("subnet-attempt-a1b2c3d4");
+        write_cached_subnet_attempt(&path, 5);
+        assert_eq!(read_cached_subnet_attempt(&path), 5);
+    }
+
+    #[test]
+    fn apply_subnet_attempt_replaces_only_subnet_keys_leaves_ports_untouched() {
+        let mut cfg = Z3Config::for_run(
+            "run-1",
+            PathBuf::from("/tmp/logs"),
+            "a1b2c3d4",
+            PathBuf::from("external/z3"),
+        )
+        .unwrap();
+        let ports_before: Vec<_> = cfg
+            .compose_env_overrides
+            .iter()
+            .filter(|(k, _)| k != "Z3_SIM_SUBNET" && k != "Z3_SIM_ZAINO_IP")
+            .cloned()
+            .collect();
+        let mut stack = Z3Stack::new(cfg.clone(), None);
+        stack.apply_subnet_attempt("a1b2c3d4", 5).unwrap();
+        cfg = stack.config.clone();
+
+        let ports_after: Vec<_> = cfg
+            .compose_env_overrides
+            .iter()
+            .filter(|(k, _)| k != "Z3_SIM_SUBNET" && k != "Z3_SIM_ZAINO_IP")
+            .cloned()
+            .collect();
+        assert_eq!(ports_before, ports_after, "ports must be untouched");
+
+        let expected = env_id::derive_subnet_for_attempt("a1b2c3d4", 5).unwrap();
+        assert!(cfg
+            .compose_env_overrides
+            .contains(&("Z3_SIM_SUBNET".to_string(), expected.subnet)));
+        assert!(cfg
+            .compose_env_overrides
+            .contains(&("Z3_SIM_ZAINO_IP".to_string(), expected.zaino_ip)));
     }
 
     #[test]
@@ -1166,11 +1548,13 @@ mod tests {
         assert!(contents.contains("Z3_REGTEST_RPC_ROUTER_HOST_PORT=8340"));
         // Untouched line preserved.
         assert!(contents.contains("Z3_ZEBRA_IMAGE=foo"));
-        // Not written — neither regtest-init.sh nor regtest-miner-setup.sh
-        // reads these; only docker compose interpolation needs them, and
-        // that's already covered by compose_env_overrides / process env.
-        assert!(!contents.contains("Z3_SIM_SUBNET"));
-        assert!(!contents.contains("Z3_SIM_ZAINO_IP"));
+        // MUST be written: regtest-init.sh sources this file directly
+        // (`set -a; . "$ENV_FILE"`), which would otherwise clobber a
+        // correct process-env subnet with whatever stale value the file
+        // already held — see this function's own doc comment for the live
+        // failure this caused before these two lines were added.
+        assert!(contents.contains("Z3_SIM_SUBNET=10.195.0.0/24"));
+        assert!(contents.contains("Z3_SIM_ZAINO_IP=10.195.0.10"));
     }
 
     #[test]
@@ -1224,6 +1608,133 @@ mod tests {
             .unwrap();
 
         assert_eq!(std::fs::read_to_string(&out_file).unwrap().trim(), "hello");
+    }
+
+    #[tokio::test]
+    async fn run_init_script_with_subnet_retry_recovers_after_two_conflicts() {
+        // A fake regtest-init.sh: fails with a subnet-conflict-shaped error
+        // on its first two invocations (tracked via a counter file, since
+        // each retry attempt is a fresh process), succeeds on the third —
+        // proving the retry loop itself without needing real Docker.
+        let dir = tempfile::TempDir::new().unwrap();
+        let script = dir.path().join("fake-regtest-init.sh");
+        let counter = dir.path().join("attempts");
+        std::fs::write(&counter, "0").unwrap();
+        std::fs::write(
+            &script,
+            format!(
+                r#"#!/usr/bin/env bash
+n=$(cat {counter})
+n=$((n + 1))
+echo "$n" > {counter}
+if [ "$n" -le 2 ]; then
+    echo "Error response from daemon: Pool overlaps with other one on this address space" >&2
+    exit 1
+fi
+exit 0
+"#,
+                counter = counter.display()
+            ),
+        )
+        .unwrap();
+
+        // Real Z3Config pointed at a temp compose_dir with its own
+        // .env.regtest, so this test also proves the file gets rewritten
+        // (not just the process env) before each attempt — the actual bug
+        // this mechanism exists to fix. Seed the file with a WRONG, stale
+        // Z3_SIM_SUBNET, mirroring the real checkout state that caused the
+        // live failure: if the file were only synced once (or never), every
+        // attempt would source this stale value instead of the retried one.
+        let compose_dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(compose_dir.path().join("scripts")).unwrap();
+        std::fs::write(
+            compose_dir.path().join(".env.regtest"),
+            "COMPOSE_PROJECT_NAME=stale\nZ3_SIM_SUBNET=10.1.2.0/24\nZ3_SIM_ZAINO_IP=10.1.2.10\n",
+        )
+        .unwrap();
+        let cache_dir = tempfile::TempDir::new().unwrap();
+        let mut cfg = Z3Config::for_run(
+            "run-1",
+            PathBuf::from("/tmp/logs"),
+            "a1b2c3d4",
+            compose_dir.path().to_path_buf(),
+        )
+        .unwrap();
+        cfg.subnet_cache_dir = cache_dir.path().to_path_buf();
+
+        cfg.run_init_script_with_subnet_retry(&script)
+            .await
+            .unwrap();
+
+        assert_eq!(std::fs::read_to_string(&counter).unwrap().trim(), "3");
+        let expected = env_id::derive_subnet_for_attempt("a1b2c3d4", 2).unwrap();
+        assert!(cfg
+            .compose_env_overrides
+            .contains(&("Z3_SIM_SUBNET".to_string(), expected.subnet.clone())));
+        // The file itself must reflect the winning subnet, not the stale
+        // seeded value — this is the specific bug fixed here.
+        let env_file_contents =
+            std::fs::read_to_string(compose_dir.path().join(".env.regtest")).unwrap();
+        assert!(
+            env_file_contents.contains(&format!("Z3_SIM_SUBNET={}", expected.subnet)),
+            "expected .env.regtest to hold the winning subnet: {env_file_contents}"
+        );
+        assert!(
+            !env_file_contents.contains("10.1.2.0/24"),
+            "stale seeded subnet must have been overwritten: {env_file_contents}"
+        );
+        let cache_path = env_id::subnet_attempt_cache_path(cache_dir.path(), "a1b2c3d4");
+        assert_eq!(
+            read_cached_subnet_attempt(&cache_path),
+            2,
+            "expected the winning attempt (2) to be cached"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_init_script_with_subnet_retry_propagates_non_subnet_errors_immediately() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let script = dir.path().join("fake-regtest-init.sh");
+        let counter = dir.path().join("attempts");
+        std::fs::write(&counter, "0").unwrap();
+        std::fs::write(
+            &script,
+            format!(
+                r#"#!/usr/bin/env bash
+n=$(cat {counter})
+n=$((n + 1))
+echo "$n" > {counter}
+echo "unrelated failure: image not found" >&2
+exit 1
+"#,
+                counter = counter.display()
+            ),
+        )
+        .unwrap();
+
+        let compose_dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(compose_dir.path().join(".env.regtest"), "").unwrap();
+        let cache_dir = tempfile::TempDir::new().unwrap();
+        let mut cfg = Z3Config::for_run(
+            "run-1",
+            PathBuf::from("/tmp/logs"),
+            "a1b2c3d4",
+            compose_dir.path().to_path_buf(),
+        )
+        .unwrap();
+        cfg.subnet_cache_dir = cache_dir.path().to_path_buf();
+
+        let err = cfg
+            .run_init_script_with_subnet_retry(&script)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, Z3Error::BootstrapScript { .. }));
+        assert_eq!(
+            std::fs::read_to_string(&counter).unwrap().trim(),
+            "1",
+            "a non-subnet-conflict error must not be retried"
+        );
     }
 
     #[test]
@@ -1368,6 +1879,7 @@ networks:
             health_check_timeout_secs: 180,
             resource_sample_interval_secs: 5,
             compose_env_overrides: Vec::new(),
+            subnet_cache_dir: PathBuf::new(),
         };
         let stack = Z3Stack::new(config, None);
         assert!(matches!(
@@ -1390,6 +1902,7 @@ networks:
             health_check_timeout_secs: 180,
             resource_sample_interval_secs: 5,
             compose_env_overrides: Vec::new(),
+            subnet_cache_dir: PathBuf::new(),
         };
         let stack = Z3Stack::new(config, None);
         assert!(stack.check_preconditions().is_ok());

@@ -98,13 +98,17 @@ pub async fn setup(
         .map_err(|e| RunnerError::Setup(format!("failed to resolve environment id: {e}")))?;
     let run_lock = run_lock::acquire(&resolved_env_id, &opts.run_lock_dir)
         .map_err(|e| RunnerError::Setup(e.to_string()))?;
-    let z3_config = Z3Config::for_run(
+    let mut z3_config = Z3Config::for_run(
         run_id,
         run_dir.component_logs_dir(),
         &resolved_env_id,
         opts.compose_dir.clone(),
     )
     .map_err(|e| RunnerError::Setup(format!("failed to derive environment config: {e}")))?;
+    // Opt into subnet retry-on-conflict (see Z3Config::subnet_cache_dir) —
+    // same directory env-id/reset-epoch/run-lock already use for per-`env_id`
+    // gitignored local state.
+    z3_config.subnet_cache_dir = opts.run_lock_dir.clone();
     let rpc_url = z3_config.rpc_url.clone();
     let basic_auth = z3_config.basic_auth.clone();
 

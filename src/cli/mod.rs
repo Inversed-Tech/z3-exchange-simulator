@@ -440,8 +440,12 @@ async fn print_versions_command(args: &PrintVersionsArgs) -> Result<(), CliError
         env_id::resolve_env_id(&env_id_cache_path, false).map_err(CliError::Z3)?;
     let _run_lock = run_lock::acquire(&resolved_env_id, &run_lock_dir).map_err(CliError::Z3)?;
     let log_dir = PathBuf::from("configs/local/bootstrap-logs");
-    let z3_config = Z3Config::for_run("bootstrap", log_dir, &resolved_env_id, compose_dir)
+    let mut z3_config = Z3Config::for_run("bootstrap", log_dir, &resolved_env_id, compose_dir)
         .map_err(CliError::Z3)?;
+    // Opt into subnet retry-on-conflict (see Z3Config::subnet_cache_dir) —
+    // same directory env-id/reset-epoch/run-lock already use for per-`env_id`
+    // gitignored local state.
+    z3_config.subnet_cache_dir = run_lock_dir;
 
     z3_config
         .ensure_wallet_bootstrapped()

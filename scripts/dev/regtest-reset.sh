@@ -67,6 +67,15 @@
 #                          not a stale literal. Falls back to the pre-Track-2
 #                          literal z3-regtest only if no env_id has been
 #                          cached yet (no z3sim run has happened here).
+#
+# Note: this script also derives and exports Z3_SIM_SUBNET/Z3_SIM_ZAINO_IP
+# for its own COMPOSE invocations, mirroring the subnet Z3Config::for_run
+# passes as process env on the Rust side (env_id::derive_subnet_for_attempt)
+# — without this, the network Docker actually creates here falls back to a
+# subnet shared across every environment on the host, reopening the exact
+# collision risk Track 2 exists to close. Not settable directly; picked up
+# from this environment's own cached resolved-subnet-attempt file (see
+# env_id::subnet_attempt_cache_path) if one exists, else attempt 0.
 
 set -euo pipefail
 
@@ -116,6 +125,54 @@ COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-$(default_project_name)}"
 COMPOSE="docker compose --env-file .env.regtest -p ${COMPOSE_PROJECT_NAME}"
 if ! docker info > /dev/null 2>&1; then
     COMPOSE="sudo -E $COMPOSE"
+fi
+
+# This project's env_id, if COMPOSE_PROJECT_NAME is the z3-sim-<env_id> shape
+# (the pre-Track-2 z3-regtest literal, or some other manual override, has no
+# env_id-scoped identity — subnet retry/caching and the reset-epoch file
+# below both degrade to their un-scoped fallback in that case).
+case "$COMPOSE_PROJECT_NAME" in
+    z3-sim-????????)
+        ENV_ID="${COMPOSE_PROJECT_NAME#z3-sim-}"
+        ;;
+    *)
+        ENV_ID=""
+        ;;
+esac
+
+# Mirrors env_id::derive_subnet_for_attempt exactly (src/z3/env_id.rs) — same
+# low-drift-risk duplication tradeoff as default_project_name() above.
+derive_subnet_for_attempt() {  # env_id attempt -> prints "SUBNET ZAINO_IP"
+    local id="$1" attempt="$2" byte_hex byte octet
+    byte_hex="${id:4:2}"
+    byte=$((16#$byte_hex))
+    octet=$(( 100 + ((byte + attempt) % 100) ))
+    printf '10.%d.0.0/24 10.%d.0.10' "$octet" "$octet"
+}
+
+# Export the same Z3_SIM_SUBNET/Z3_SIM_ZAINO_IP the Rust `z3sim run`/
+# `print-versions` path always passes as process env on every `docker
+# compose` invocation it makes (Z3Config::for_run -> compose_env_overrides,
+# src/z3/mod.rs) — without this, $COMPOSE below falls back to
+# docker-compose.regtest.override.yml's shared default (172.28.0.0/16)
+# regardless of this environment's actual derived subnet, silently
+# re-introducing the collision risk Track 2 exists to close. Reads back
+# whatever subnet attempt `Z3Stack::bring_up` last resolved as successful for
+# this SAME env_id (see env_id::subnet_attempt_cache_path) — defaulting to
+# attempt 0, the same starting point a brand-new environment uses — so a
+# reset brings the environment back up on the SAME subnet it was already
+# using, not silently back to attempt 0's.
+if [ -n "$ENV_ID" ]; then
+    SUBNET_ATTEMPT_FILE="${REPO_ROOT}/configs/local/subnet-attempt-${ENV_ID}"
+    SUBNET_ATTEMPT="0"
+    if [ -f "$SUBNET_ATTEMPT_FILE" ]; then
+        SUBNET_ATTEMPT="$(tr -d '[:space:]' < "$SUBNET_ATTEMPT_FILE")"
+        case "$SUBNET_ATTEMPT" in
+            ''|*[!0-9]*) SUBNET_ATTEMPT="0" ;;
+        esac
+    fi
+    read -r Z3_SIM_SUBNET Z3_SIM_ZAINO_IP <<< "$(derive_subnet_for_attempt "$ENV_ID" "$SUBNET_ATTEMPT")"
+    export Z3_SIM_SUBNET Z3_SIM_ZAINO_IP
 fi
 
 # Preview exactly what is about to be destroyed, BEFORE the --yes gate below —
@@ -239,23 +296,16 @@ log "==> Bringing the stack back up..."
 # one and a --fresh-env one) must never read or write each other's reset
 # provenance.
 #
-# Derived from the AUTHORITATIVE ${COMPOSE_PROJECT_NAME} actually used above
-# — NOT by re-reading resolved_env_id()/the env-id cache file a second time
-# — so this stays correct even when a caller overrode COMPOSE_PROJECT_NAME
-# directly rather than letting default_project_name() derive it from the
-# cache: the reset-epoch file must always match whatever project this
-# invocation actually reset, not whatever env_id happens to be cached right
-# now. A project name that isn't the z3-sim-<env_id> shape (the pre-Track-2
-# z3-regtest literal, or some other manual override) has no env_id-scoped
-# identity to key this off, so it falls back to the shared legacy filename.
-case "$COMPOSE_PROJECT_NAME" in
-    z3-sim-????????)
-        ENV_ID="${COMPOSE_PROJECT_NAME#z3-sim-}"
-        ;;
-    *)
-        ENV_ID=""
-        ;;
-esac
+# ENV_ID here is the SAME variable derived once, near the top of this
+# script, from the AUTHORITATIVE ${COMPOSE_PROJECT_NAME} actually used
+# throughout — not re-derived here — so this stays correct even when a
+# caller overrode COMPOSE_PROJECT_NAME directly rather than letting
+# default_project_name() derive it from the cache: the reset-epoch file must
+# always match whatever project this invocation actually reset, not whatever
+# env_id happens to be cached right now. A project name that isn't the
+# z3-sim-<env_id> shape (the pre-Track-2 z3-regtest literal, or some other
+# manual override) has no env_id-scoped identity to key this off, so it
+# falls back to the shared legacy filename.
 if [ -n "$ENV_ID" ]; then
     RESET_EPOCH_FILE="${REPO_ROOT}/configs/local/reset-epoch-${ENV_ID}"
 else
